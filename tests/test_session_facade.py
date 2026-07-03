@@ -91,3 +91,10 @@ async def test_default_tools_are_builtin_7(tmp_path: Path):
     assert sorted(session.agent.registry.names) == sorted(
         ["read", "bash", "edit", "write", "grep", "find", "ls"]
     )
+
+
+async def test_model_property_reflects_set_model(tmp_path: Path):
+    session = await make(tmp_path, [done_msg()])
+    assert session.model == "fake"
+    session.set_model("openai/gpt-5.2")
+    assert session.model == "openai/gpt-5.2"

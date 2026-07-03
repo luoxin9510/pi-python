@@ -82,3 +82,14 @@ def test_invalid_known_entry_midfile_raises(tmp_path: Path):
         f.write('{"type":"message","id":"y","parentId":null,"timestamp":"t","message":{}}\n')
     with pytest.raises(ValidationError):  # 缺字段的已知类型不许被静默吞掉
         SessionStore.open(store.path)
+
+
+def test_entry_type_on_model_and_dict():
+    from pipython.session.store import entry_type
+
+    m = MessageEntry(
+        id="aaaa0001", parent_id=None, timestamp="t", message={"role": "user", "content": "hi"}
+    )
+    assert entry_type(m) == "message"
+    assert entry_type({"type": "thinking_level_change", "id": "x"}) == "thinking_level_change"
+    assert entry_type({"noType": 1}) is None

@@ -1,6 +1,8 @@
 import time
 from pathlib import Path
 
+import pytest
+
 from pipython.tools.base import ToolContext
 from pipython.tools.bash import bash_tool
 
@@ -51,3 +53,23 @@ async def test_runs_in_cwd(tmp_path: Path):
     (tmp_path / "marker.txt").touch()
     r = await bash_tool.execute(p(command="ls"), ToolContext(cwd=tmp_path))
     assert "marker.txt" in r.content
+
+
+async def test_cancel_kills_process_tree(tmp_path: Path):
+    import asyncio
+    import subprocess
+
+    marker = f"pi-python-cancel-{tmp_path.name}"
+    task = asyncio.create_task(
+        bash_tool.execute(
+            p(command=f"sleep 30; echo {marker} & sleep 30; echo {marker}"),
+            ToolContext(cwd=tmp_path),
+        )
+    )
+    await asyncio.sleep(0.3)  # 让子进程真正跑起来
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.2)  # 给 SIGKILL 一点收尸时间
+    out = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True)
+    assert out.stdout.strip() == ""  # 进程组已死，无孤儿
