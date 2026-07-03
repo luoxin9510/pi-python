@@ -1,4 +1,5 @@
 """Tool abstraction: ToolResult/ToolContext data types, Tool protocol, @tool decorator."""
+
 import inspect
 from dataclasses import dataclass, field
 from pathlib import Path

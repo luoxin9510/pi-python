@@ -1,4 +1,5 @@
 """ID and timestamp helpers. uuid7 self-implemented (RFC 9562) — no third dep."""
+
 import os
 import secrets
 import threading

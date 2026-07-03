@@ -2,7 +2,9 @@ from .base import ToolContext, ToolError, tool
 
 
 @tool
-async def read(path: str, offset: int = 0, limit: int = 2000, ctx: ToolContext | None = None) -> str:
+async def read(
+    path: str, offset: int = 0, limit: int = 2000, ctx: ToolContext | None = None
+) -> str:
     """Read a text file with line numbers. offset is 0-based line index."""
     assert ctx is not None  # FunctionTool 总会注入；断言供 pyright 收窄
     p = (ctx.cwd / path).resolve()

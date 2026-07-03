@@ -1,5 +1,9 @@
 from pipython.ai.types import (
-    AssistantMessage, TextContent, ToolCallContent, ToolResultMessage, Usage,
+    AssistantMessage,
+    TextContent,
+    ToolCallContent,
+    ToolResultMessage,
+    Usage,
 )
 
 
@@ -12,7 +16,10 @@ def test_tool_result_serializes_camelcase():
 
 def test_assistant_roundtrip_with_toolcall():
     m = AssistantMessage(
-        content=[TextContent(text="hi"), ToolCallContent(id="tc1", name="ls", arguments={"path": "."})],
+        content=[
+            TextContent(text="hi"),
+            ToolCallContent(id="tc1", name="ls", arguments={"path": "."}),
+        ],
         usage=Usage(input_tokens=1, output_tokens=2, cost=None),
     )
     d = m.model_dump(by_alias=True)
@@ -23,5 +30,6 @@ def test_assistant_roundtrip_with_toolcall():
 def test_extra_fields_survive_roundtrip():
     d = {"role": "user", "content": "x", "customField": 1}
     from pipython.ai.types import UserMessage
+
     m = UserMessage.model_validate(d)
     assert m.model_dump(by_alias=True)["customField"] == 1

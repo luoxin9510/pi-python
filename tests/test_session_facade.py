@@ -17,9 +17,15 @@ def done_msg():
 
 
 async def make(tmp_path, script, **kw):
-    return await create_agent_session(AgentSessionConfig(
-        model="fake", cwd=tmp_path, session_dir=tmp_path / "sessions",
-        client=FakeClient(script=script), **kw))
+    return await create_agent_session(
+        AgentSessionConfig(
+            model="fake",
+            cwd=tmp_path,
+            session_dir=tmp_path / "sessions",
+            client=FakeClient(script=script),
+            **kw,
+        )
+    )
 
 
 async def drain(session, text="go"):
@@ -83,4 +89,5 @@ async def test_compact_folds_llm_context(tmp_path: Path):
 async def test_default_tools_are_builtin_7(tmp_path: Path):
     session = await make(tmp_path, [done_msg()])
     assert sorted(session.agent.registry.names) == sorted(
-        ["read", "bash", "edit", "write", "grep", "find", "ls"])
+        ["read", "bash", "edit", "write", "grep", "find", "ls"]
+    )
