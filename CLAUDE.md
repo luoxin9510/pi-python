@@ -36,10 +36,24 @@ pi-python 是 [earendil-works/pi](https://github.com/earendil-works/pi)（TypeSc
   允许的直接编辑仅限：琐碎修补（typo、import 顺序）、合并冲突处置、文档。
 - **实现交给 Sonnet 5 subagent**（Agent 工具，`model: "sonnet"`）：每个任务书
   必须包含——目标、涉及文件、spec 相关章节摘录、完成定义（含要通过的测试）。
+- **测试工作交给最便宜的模型**（Agent 工具，`model: "haiku"`，Haiku 4.5）：编
+  写测试用例、跑测试套件、整理失败报告都派 Haiku subagent；测试失败的**修复**
+  属于实现工作，回到 Sonnet 5。
 - **审核也由 subagent 做**：实现完成后派**独立的**审核 subagent（不能是实现者
   本身）对照 spec 与三原则评审 diff；orchestrator 只裁决审核结论，不亲自逐行
   评审。
 - 互相独立的实现任务并行派发；有依赖的串行。
+
+## 实际测试优先（重要）
+
+开发过程中**尽可能多用实际运行验证**，不接受"看代码应该没问题"式的静态断言：
+
+- 每个任务完成的定义包含**真实执行**：跑通新增/相关测试，并实际运行一段使用该
+  能力的脚本或 example 观察行为。
+- 测试风格偏**真实集成**：工具测试用真实文件系统（`tmp_path`）与真实子进程
+  （`bash`/`rg`），session 测试读写真实 JSONL 文件；唯一允许的替身是 LLM API
+  （FakeClient，见 spec §7）——不 mock 文件系统、不 mock 子进程。
+- 里程碑处用真实 API 跑一次验收 example（spec §7.4），眼见为实后才算过。
 
 ## 常用命令
 
