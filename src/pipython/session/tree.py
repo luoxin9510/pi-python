@@ -18,7 +18,11 @@ def current_path(entries: Sequence[Entry], leaf_id: str | None) -> list[Entry]:
     by_id = {entry_id(e): e for e in entries if entry_id(e) and not isinstance(e, SessionHeader)}
     path: list[Entry] = []
     cursor: str | None = leaf_id
+    seen: set[str] = set()
     while cursor is not None:
+        if cursor in seen:
+            raise ValueError(f"parentId cycle detected at {cursor!r}")
+        seen.add(cursor)
         if cursor not in by_id:
             raise ValueError(f"broken parent chain at {cursor!r}")
         node = by_id[cursor]

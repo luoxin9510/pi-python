@@ -26,6 +26,12 @@ def test_broken_chain_raises():
         current_path([e("b2", "missing")], "b2")
 
 
+def test_cycle_raises():
+    entries = [e("a1", "b2"), e("b2", "a1")]  # 损坏 session：parentId 成环
+    with pytest.raises(ValueError, match="cycle"):
+        current_path(entries, "a1")
+
+
 def test_find_entry_missing_raises():
     with pytest.raises(KeyError):
         find_entry([e("a1", None)], "zz")
