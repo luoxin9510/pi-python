@@ -26,6 +26,15 @@ async def test_read_missing_is_error_not_raise(tmp_path: Path):
     assert r.is_error and "nope.txt" in r.content
 
 
+async def test_read_large_file_truncation_notice(tmp_path: Path):
+    (tmp_path / "big.txt").write_text("".join(f"L{i}\n" for i in range(2500)))
+    r = await read_tool.execute(read_tool.params_model(path="big.txt"), ToolContext(cwd=tmp_path))
+    lines = r.content.splitlines()
+    assert lines[0] == "1\tL0" and lines[1999] == "2000\tL1999"
+    assert len(lines) == 2001  # 2000 内容行 + 1 行截断提示
+    assert "more lines" in lines[-1] and "offset=2000" in lines[-1]
+
+
 async def test_ls_lists_entries(tmp_path: Path):
     (tmp_path / "d").mkdir()
     (tmp_path / "f.txt").touch()

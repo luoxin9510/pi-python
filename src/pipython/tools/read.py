@@ -10,7 +10,11 @@ async def read(path: str, offset: int = 0, limit: int = 2000, ctx: ToolContext |
         raise ToolError(f"File not found: {path}")
     lines = p.read_text(errors="replace").splitlines()
     window = lines[offset : offset + limit]
-    return "\n".join(f"{offset + i + 1}\t{line}" for i, line in enumerate(window))
+    out = "\n".join(f"{offset + i + 1}\t{line}" for i, line in enumerate(window))
+    if limit >= 2000 and offset + limit < len(lines):
+        remaining = len(lines) - offset - limit
+        out += f"\n... ({remaining} more lines, use offset={offset + limit} to continue)"
+    return out
 
 
 read_tool = read
