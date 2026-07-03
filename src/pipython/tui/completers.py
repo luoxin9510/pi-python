@@ -38,7 +38,7 @@ def _walk_with_pathspec(cwd: Path) -> list[str]:
     gitignore = cwd / ".gitignore"
     spec = None
     if gitignore.is_file():
-        spec = pathspec.PathSpec.from_lines("gitwildmatch", gitignore.read_text().splitlines())
+        spec = pathspec.GitIgnoreSpec.from_lines(gitignore.read_text().splitlines())
     results: list[str] = []
     for root, dirs, files in os.walk(cwd):
         rel_root = Path(root).relative_to(cwd)
@@ -71,7 +71,7 @@ class PiCompleter(Completer):
 
     def get_completions(self, document: Document, complete_event: CompleteEvent):
         text = document.text_before_cursor
-        if document.text.startswith("/") and "\n" not in text:
+        if document.text.startswith("/") and "\n" not in document.text:
             frag = text[1:]
             for name, desc in sorted(self.commands.items()):
                 if name.startswith(frag):

@@ -53,3 +53,11 @@ def test_slash_completion_with_meta():
     got = completions(completer, "/mo")
     assert got == ["/model"]
     assert completions(completer, "hello /mo") == []  # 仅行首
+
+
+def test_slash_completion_suppressed_in_multiline():
+    completer = PiCompleter(commands={"model": "切换模型", "tree": "查看会话树"})
+    # 多行缓冲：光标位于内嵌换行之前（"/model" 末尾），不应触发斜杠补全
+    doc = Document(text="/model\nsecond line", cursor_position=6)
+    got = [c.text for c in completer.get_completions(doc, CompleteEvent())]
+    assert got == []
