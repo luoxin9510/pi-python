@@ -251,6 +251,12 @@ find / ls`。**行为语义照抄 pi**（实战验证过），实现为地道 Py
   持、`forkFrom()` 跨文件 fork、compaction 自动触发算法、thinking/toolcall 级
   细粒度增量事件、bash 全量输出转存临时文件（`fullOutputPath`，阶段一截断即
   丢）。
+- **pi 会话互通的阶段一边界（终审裁定，2026-07-03）**：阶段一达成 **envelope
+  级互通**——真实 pi v3 文件可经 `SessionStore.open` 加载（entry 字段兼容、未
+  知类型透传、目录/文件命名一致），并有真实文件兼容测试锁定。**message body
+  的强类型互通**（pi 的数组式 content、`Usage.input/output` 字段名、cost 对象
+  展开）与 **resume 已有会话**（`AgentSession.open()`）列入阶段二——阶段一的
+  门面只创建新会话，`_parse_message` 仅需解析自产格式。
 - litellm 作为唯一重依赖：版本**钉精确版**（对齐 pi "依赖是受审代码"的立场），
   升级走显式 PR；其 cost/价格表对新模型可能滞后，usage 的 cost 字段允许缺省为
   `None`，不因价格表缺失报错。
