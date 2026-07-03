@@ -102,7 +102,7 @@ class SessionStore:
 
     @classmethod
     def open(cls, path: Path) -> "SessionStore":
-        lines = [x for x in path.read_text().splitlines() if x.strip()]
+        lines = [x for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
         entries: list[Entry] = []
         for i, line in enumerate(lines):
             try:
