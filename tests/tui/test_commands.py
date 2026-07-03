@@ -71,6 +71,15 @@ async def test_tree_shows_structure_and_leaf(tmp_path):
     assert "first question"[:20] in text and "←" in text
 
 
+async def test_tree_shows_model_change_target(tmp_path):
+    ctx = await make_ctx(tmp_path)
+    reg = build_registry()
+    await dispatch(reg, ctx, "/model somemodel/xyz")
+    await dispatch(reg, ctx, "/tree")
+    text = ctx.console.export_text()
+    assert "model_change → xyz" in text
+
+
 async def test_branch_prefix_match_and_errors(tmp_path):
     ctx = await make_ctx(tmp_path, script=[done()])
     await drain(ctx.app.session, "hello")

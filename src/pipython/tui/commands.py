@@ -18,6 +18,7 @@ from rich.tree import Tree
 from pipython import (
     AgentSession,
     MessageEntry,
+    ModelChangeEntry,
     SessionHeader,
     current_path,
     entry_id,
@@ -52,6 +53,8 @@ def _label(e) -> str:
     eid = (entry_id(e) or "????????")[:8]
     if isinstance(e, MessageEntry):
         return f"{eid} {e.message.get('role', '?')}: {summarize_message_dict(e.message)}"
+    if isinstance(e, ModelChangeEntry):
+        return f"{eid} model_change → {e.model_id}"
     return f"{eid} {entry_type(e) or '?'}"
 
 
