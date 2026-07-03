@@ -10,6 +10,17 @@ dependencies = [
     "pydantic==2.13.4",
 ]
 
+[project.optional-dependencies]
+tui = [
+    "prompt_toolkit==3.0.52",
+    "rich==15.0.0",
+    "rapidfuzz==3.14.5",
+    "pathspec==1.1.1",
+]
+
+[project.scripts]
+pipython = "pipython.tui:main"
+
 [dependency-groups]
 dev = ["pytest", "pytest-asyncio", "ruff", "pyright"]
 
