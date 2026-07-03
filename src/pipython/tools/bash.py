@@ -43,8 +43,15 @@ async def bash(command: str, timeout: float = 120.0, ctx: ToolContext | None = N
     except asyncio.TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        await proc.wait()
-        raise ToolError(f"Command timed out after {timeout}s: {command}") from None
+        with contextlib.suppress(asyncio.TimeoutError):  # SIGKILL 后极端不可中断 IO 兜底
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        partial = "".join(tail)
+        if truncated:
+            partial = "[... output truncated ...]\n" + partial
+        msg = f"Command timed out after {timeout}s: {command}"
+        if partial:  # 对齐上游 bash.ts：超时也返回挂起前的 partial output
+            msg = f"{partial}\n{msg}"
+        raise ToolError(msg) from None
 
     out = "".join(tail)
     if truncated:

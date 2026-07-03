@@ -28,6 +28,14 @@ async def test_timeout_kills_process_tree(tmp_path: Path):
     assert time.monotonic() - start < 5
 
 
+async def test_timeout_includes_partial_output(tmp_path: Path):
+    r = await bash_tool.execute(
+        p(command="echo before-hang && sleep 30", timeout=0.5), ToolContext(cwd=tmp_path)
+    )
+    assert r.is_error and "timed out" in r.content.lower()
+    assert "before-hang" in r.content
+
+
 async def test_streaming_truncation_keeps_tail(tmp_path: Path):
     r = await bash_tool.execute(
         p(
