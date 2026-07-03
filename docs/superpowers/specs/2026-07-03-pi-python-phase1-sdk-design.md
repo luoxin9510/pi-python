@@ -1,7 +1,7 @@
 # pi-python 阶段一设计：Python Coding Agent SDK
 
 - 日期：2026-07-03
-- 状态：已由维护者逐段评审通过
+- 状态：已由维护者逐段评审通过；已通过独立 subagent 审核并修订（rev 2）
 - 移植基线：[earendil-works/pi](https://github.com/earendil-works/pi) `upstream/main` @ `21cb3807`（v0.80.3，2026-06-30）
 - License：MIT，双署名（原作者 Mario Zechner + 本仓库维护者）
 
@@ -66,7 +66,7 @@ pi-python/
 │   │   └── registry.py         #   注册/查找/调度
 │   ├── session/                # ← pi 的 "sessions 即数据"
 │   │   ├── store.py            #   JSONL 读写
-│   │   ├── tree.py             #   树状历史：fork / navigate
+│   │   ├── tree.py             #   树状历史：branch()、当前路径重建
 │   │   └── compaction.py       #   上下文压缩
 │   └── __init__.py             #   顶层 API：create_agent_session() 等
 ├── tests/
@@ -93,15 +93,19 @@ session = await create_agent_session(AgentSessionConfig(
     system_prompt=None,                  # None → 内置默认 coding prompt
     tools=None,                          # None → 全部内置 7 工具
     session_dir=None,                    # None → ~/.pi-python/sessions/
+    max_turns=50,                        # 安全阀，见 §4.4
 ))
 
 async for event in session.prompt("修复 tests/test_foo.py 里的失败用例"):
     ...  # 流式事件
 
 session.set_model("openai/gpt-5.2")      # 中途切模型（pi 特色）
-session.fork()                            # 从当前节点分叉
-session.navigate(entry_id)                # 回到历史节点
+session.branch(entry_id)                  # 叶子指针移回历史节点，续写即分叉
 ```
+
+命名对齐上游：`branch(entry_id)` 对应上游 `SessionManager.branch()`（同一
+JSONL 文件内移动叶子指针）；上游另有 `forkFrom()`（另开新文件、写
+`parentSession`），属阶段二，不做。
 
 ### 4.2 三个核心抽象
 
@@ -114,21 +118,41 @@ session.navigate(entry_id)                # 回到历史节点
    模型不再调工具。每步发事件。**Agent 不知道 session 文件的存在**（对齐 pi：
    agent 包不依赖 coding-agent 包）。
 3. **AgentSession（门面 + `session/`）**：包装 Agent，**以事件订阅者身份**把每
-   条 entry 落盘 JSONL；提供 fork/navigate/compaction。持久化不侵入 loop。
+   条 entry 落盘 JSONL；提供 `branch()` 与 `compact()`（阶段一的全部树操作，
+   见 §5）。持久化不侵入 loop。
 
 ### 4.3 事件模型
 
 阶段一事件子集：`agent_start / message_start / text_delta / tool_call /
 tool_result / message_end / agent_end / error`。
-`tool_call` 处理器可返回 deny 否决执行——这是权限门控的唯一钩子（对应 pi
-"extension 拦截 tool_call" 的哲学）。
+（上游另有 thinking/toolcall 级增量事件；阶段一事件层不呈现 thinking 增量，但
+session 落盘的 assistant message 中 `ThinkingContent` 照存，不丢数据。）
+
+**订阅点与 deny 契约（权限门控的唯一钩子）：**
+
+- 订阅挂在 **AgentSession 门面**上（`session.on(...)`）。**`session.on()` 就
+  是把处理器注册进 Agent 持有的同一份底层总线**——不是镜像转发、没有中间层复
+  制，因此门面层注册的 deny 与裸 `Agent` 上注册的效力完全相同。
+- `tool_call` 处理器按注册顺序执行（同步或 async 均可）；返回 `None` 放行，返
+  回 `Deny(reason: str)`（库提供的 frozen dataclass）即否决，**首个 Deny 短路**
+  后续处理器。
+- 否决后该工具不执行，模型收到
+  `ToolResult(is_error=True, content="Tool call denied: {reason}")` 回灌，
+  session 照常落盘这条被拒结果（审计可见）。
+- 其余事件的处理器返回值一律忽略——deny 语义只存在于 `tool_call`。
 
 ### 4.4 错误处理
 
 - 工具执行失败**不抛出**：错误文本作为 `ToolResult(is_error=True)` 回灌给模型
   自行纠错（pi 同款行为）。
-- litellm 网络错误：指数退避重试。
-- `max_turns`（默认 50）触顶：强制停止，发 `agent_end(reason="max_turns")`。
+- litellm 网络错误：**只保留一层重试**——自实现指数退避（可配次数），调用
+  litellm 时显式 `num_retries=0` 关掉其内建重试，避免两层叠加导致超长挂起。
+- `max_turns`（默认 50，`AgentSessionConfig` 字段，`prompt()` 可按次覆盖）：
+  **一轮 = 一次 assistant 响应及其引发的全部工具执行**（借上游
+  `turn_start`/`turn_end` 的边界定义作内部计数语义，**不**对外新增这两个事件
+  类型，§4.3 的事件子集即全集）。触顶强制停止，发
+  `agent_end(reason="max_turns")`。注意：上游核心并无此熔断，这是本移植**主动
+  新增**的生产安全阀，不是照抄。
 
 ## 5. Session：JSONL 格式与树状历史
 
@@ -149,34 +173,44 @@ tool_result / message_end / agent_end / error`。
 
 **机制：**
 
-1. **树 = `parentId` 链。** 追加 O(1)；fork = 叶子指针移回历史节点后继续追加；
-   文件只追加、永不重写，天然崩溃安全。
+1. **树 = `parentId` 链。** 追加 O(1)；`branch(entry_id)` = 叶子指针移回历史
+   节点后继续追加；文件只追加、永不重写，天然崩溃安全。
 2. **当前路径重建**：加载时全量读入，从最后一条 entry 沿 `parentId` 回溯到根；
-   其余为休眠分支，`navigate()` 切换。
+   其余为休眠分支，`branch()` 切换。
 3. **entry 类型（阶段一子集）**：`session` / `message`（内嵌完整 message 对
-   象，含 user、assistant、tool_result）/ `model_change` / `compaction`。
+   象，含 user、assistant、toolResult 角色）/ `model_change` / `compaction`。
    **未知类型加载时原样保留、不报错**——承接 pi 的 `appendEntry()` 自定义状态扩
-   展性，保证向前兼容。
-4. **Compaction 是 entry 不是重写**：追加
-   `{"type":"compaction","summary":...,"parentId":...}`，加载器用 summary 替代
-   其祖先链；历史原文永在。
-5. **字段命名保持 pi 的 camelCase**（`parentId`、`modelId`）——文件是数据交换格
-   式而非代码，逐字段兼容才可能与 pi 会话互通。Pydantic alias 映射，代码内属性
-   仍为 snake_case。写入行级 flush。
+   展性，保证向前兼容。实现提示：这意味着不能只靠一个 Pydantic discriminated
+   union——先按 `type` 分派，已知类型强校验，未知类型存原始 dict。
+4. **Compaction 是 entry 不是重写**（字段对齐上游 `CompactionEntry`）：
+   ```jsonl
+   {"type":"compaction","id":...,"parentId":...,"summary":"...","firstKeptEntryId":"...","tokensBefore":12345}
+   ```
+   加载语义与上游 `buildContextEntries()` 一致：**只折叠 `firstKeptEntryId`
+   之前的祖先为 summary；`firstKeptEntryId` 到 compaction entry 之间的原文全部
+   保留**。历史原文永在文件里。缺 `firstKeptEntryId`/`tokensBefore` 的
+   compaction 视为格式错误——这两个字段是与 pi 会话互通的必要条件。
+5. **字段命名保持 pi 的 camelCase**（`parentId`、`modelId`、`toolResult`）——文
+   件是数据交换格式而非代码，逐字段兼容才可能与 pi 会话互通。Pydantic alias 映
+   射，代码内属性仍为 snake_case。写入行级 flush。
+6. **阶段一 compaction 范围明确收窄**：只做 entry 格式、加载折叠语义、手动
+   `session.compact()` API（summary 由调用方或一次显式 LLM 调用生成）。**自动
+   触发**（token 阈值监测、触发策略、summary prompt 工程）不在阶段一，记入
+   §9——避免把"一周的活"藏在"一天的模块名"里。
 
 ## 6. 内置工具集行为规格
 
 7 个工具与上游 `allToolNames` 精确对齐：`read / bash / edit / write / grep /
 find / ls`。**行为语义照抄 pi**（实战验证过），实现为地道 Python：
 
-| 工具 | 关键语义 | 实现要点 |
+| 工具 | 关键语义（参数面照抄上游 schema） | 实现要点 |
 |---|---|---|
-| `read` | 行号输出、offset/limit、大文件截断 | `pathlib` |
+| `read` | 行号输出、offset/limit、大文件截断。**阶段一仅文本**：上游支持图片附件（jpg/png/gif/webp/bmp），属多模态，明确排除、记入 §9 | `pathlib` |
 | `write` | 覆盖写，自动建父目录 | `pathlib` |
-| `edit` | 精确串替换，**要求唯一匹配**，不唯一即报错回灌 | 上游另有 diff 变体（`EditToolOptions`），阶段一不做，记为后续跟进 |
-| `bash` | 超时（默认可配）、输出截断、非零退出码回灌不抛出 | `asyncio.subprocess` |
-| `grep` | 正则内容搜索 | 优先系统 `rg`，降级纯 Python |
-| `find` | 文件名/glob 查找 | 同上 |
+| `edit` | **`{path, edits: [{oldText, newText}, ...]}` 数组式多处替换**（对齐上游 `editSchema`）：每处均相对**原文**定位（非增量应用）、不得重叠/嵌套、每个 `oldText` 要求唯一匹配，违反即整体报错回灌 | 上游另有 diff 变体（`EditToolOptions`），阶段一不做 |
+| `bash` | 超时（默认可配）、输出截断、非零退出码回灌不抛出。**超时/中止须杀整棵进程树**（对齐上游 `killProcessTree`） | `asyncio.subprocess` + `start_new_session=True`，超时 `os.killpg`；**边读边截**（防 `yes` 类无限输出把内存吃满；注意 stream reader 的 limit 参数） |
+| `grep` | 参数：`pattern`（必填，regex 或 literal）、`path`、`glob`、`ignoreCase`、`literal`、`context`、`limit`（默认 100） | 优先系统 `rg`，降级纯 Python |
+| `find` | 参数：`pattern`（必填，glob）、`path`、`limit`（默认 1000） | 同上 |
 | `ls` | 目录列表 | `pathlib` |
 
 所有失败以 `ToolResult(is_error=True)` 回灌。路径解析以 `cwd` 为基准。
@@ -187,8 +221,9 @@ find / ls`。**行为语义照抄 pi**（实战验证过），实现为地道 Py
    Protocol，测试注入脚本化 **FakeClient**（预设逐轮返回），确定性覆盖多轮、
    deny 否决、错误回灌、max_turns。
 2. **工具单测**：pytest + `tmp_path`，逐条覆盖第 6 节行为规格。
-3. **Session 单测**：round-trip、fork/navigate、compaction、未知 entry 透传、
-   半行损坏容错；外加**兼容性测试：加载一份真实 pi v3 session 样本**。
+3. **Session 单测**：round-trip、`branch()` 分叉与当前路径重建、compaction 折
+   叠语义、未知 entry 透传、半行损坏容错；外加**兼容性测试：加载一份真实 pi
+   v3 session 样本**。
 4. **验收 demo**：`examples/fix_failing_test.py` + 内置小型样例仓库（带故意失
    败的测试），agent 自主 grep→read→edit→bash 到测试转绿。真实 API，CI 中为
    手动/可选 job。
@@ -201,7 +236,7 @@ find / ls`。**行为语义照抄 pi**（实战验证过），实现为地道 Py
 | Python | 3.11+ |
 | 运行时依赖 | `litellm`、`pydantic>=2`（仅此两个） |
 | 质量 | `ruff`（lint+format）、`pyright`、`pytest` + `pytest-asyncio` |
-| CI | GitHub Actions：lint + typecheck + 单测，矩阵 3.11/3.12/3.13 |
+| CI | GitHub Actions：lint + typecheck + 单测，矩阵 3.11/3.12/3.13；**必须安装 `ripgrep`**——grep/find 的 rg 优先路径（生产主路径）必须被真实测到，纯 Python 降级路径另测 |
 | 文档 | README：与 pi 的关系声明、快速上手、三原则 |
 | 合规 | LICENSE = MIT，保留 Mario Zechner 原始版权行 + 维护者行 |
 
@@ -210,5 +245,12 @@ find / ls`。**行为语义照抄 pi**（实战验证过），实现为地道 Py
 - 基线钉死 `21cb3807`（v0.80.3）；后续对照上游升级以此为锚点。
 - 语义对齐"骨架"而非代码形态：7 工具语义、session v3 线格式、事件否决钩子、极
   简内核边界。
-- 已知上游动向（不在阶段一）：`orchestrator`（experimental 多实例编排 +
-  radius.pi.dev 在场服务）、edit 的 diff 变体。
+- 已知上游能力/动向（明确不在阶段一，后续按需跟进）：`orchestrator`
+  （experimental 多实例编排 + radius.pi.dev 在场服务）、edit 的 diff 变体、
+  edit 的空白规整模糊匹配容错（阶段一只做精确匹配）、`read` 的图片/多模态支
+  持、`forkFrom()` 跨文件 fork、compaction 自动触发算法、thinking/toolcall 级
+  细粒度增量事件、bash 全量输出转存临时文件（`fullOutputPath`，阶段一截断即
+  丢）。
+- litellm 作为唯一重依赖：版本**钉精确版**（对齐 pi "依赖是受审代码"的立场），
+  升级走显式 PR；其 cost/价格表对新模型可能滞后，usage 的 cost 字段允许缺省为
+  `None`，不因价格表缺失报错。
