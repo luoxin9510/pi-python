@@ -86,14 +86,16 @@ class SessionStore:
 
     @classmethod
     def create(cls, *, session_dir: Path, cwd: Path) -> "SessionStore":
-        dirname = str(cwd).replace("/", "-") + "--"
+        # pi 真实格式（session-manager.ts:464）：cwd 的每个 "/" 换 "-"，再前缀 "-"、
+        # 后缀 "--"；对 /a/b 产出 "--a-b--"（双前导横线，与 ~/.pi/agent/sessions 互通）
+        dirname = "-" + str(cwd).replace("/", "-") + "--"
         session_id = ids.new_session_id()
         ts = ids.iso_now().replace(":", "-").replace(".", "-")
         path = session_dir / dirname / f"{ts}_{session_id}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         header = SessionHeader(id=session_id, timestamp=ids.iso_now(), cwd=str(cwd))
         store = cls(path, [header])
-        with path.open("w") as f:
+        with path.open("w", encoding="utf-8") as f:
             f.write(_dump(header) + "\n")
             f.flush()
         return store
@@ -119,6 +121,6 @@ class SessionStore:
         eid = entry_id(e)
         if eid is not None:
             self.leaf_id = eid
-        with self.path.open("a") as f:
+        with self.path.open("a", encoding="utf-8") as f:
             f.write(_dump(e) + "\n")
             f.flush()

@@ -11,7 +11,7 @@ from pipython.session.store import (
 
 def test_dir_and_filename_convention(tmp_path: Path):
     store = SessionStore.create(session_dir=tmp_path, cwd=Path("/a/b"))
-    assert store.path.parent.name == "-a-b--"
+    assert store.path.parent.name == "--a-b--"  # pi 真实格式：session-manager.ts:464
     assert store.path.suffix == ".jsonl" and "_" in store.path.stem
 
 
@@ -49,6 +49,17 @@ def test_corrupt_last_line_tolerated(tmp_path: Path):
         f.write('{"type":"message","id":"brok')  # 模拟进程被杀
     loaded = SessionStore.open(store.path)
     assert loaded.leaf_id == "aaaa0001" and len(loaded.entries) == 2
+
+
+def test_append_idless_passthrough_keeps_leaf(tmp_path: Path):
+    store = SessionStore.create(session_dir=tmp_path, cwd=Path("/a/b"))
+    store.append(
+        MessageEntry(
+            id="aaaa0001", parent_id=None, timestamp="t", message={"role": "user", "content": "hi"}
+        )
+    )
+    store.append({"type": "custom_note"})  # 无 id 的 passthrough dict
+    assert store.leaf_id == "aaaa0001"  # leaf_id 不被清空
 
 
 def test_compaction_requires_fields():
