@@ -1,6 +1,7 @@
 import asyncio
 import re
 import shutil
+from pathlib import Path
 
 from pydantic import BaseModel
 
@@ -27,7 +28,8 @@ class GrepTool:
 
     async def execute(self, params: GrepParams, ctx: ToolContext) -> ToolResult:
         try:
-            lines = await self._rg(params, ctx) if _HAS_RG else self._pure(params, ctx)
+            cwd = ctx.cwd.resolve()
+            lines = await self._rg(params, cwd) if _HAS_RG else self._pure(params, cwd)
             if not lines:
                 return ToolResult(content="No matches found.")
             capped = lines[: params.limit]
@@ -40,7 +42,7 @@ class GrepTool:
         except Exception as e:
             return ToolResult(content=f"{type(e).__name__}: {e}", is_error=True)
 
-    async def _rg(self, p: GrepParams, ctx: ToolContext) -> list[str]:
+    async def _rg(self, p: GrepParams, cwd: Path) -> list[str]:
         args = ["rg", "-n", "--no-heading"]
         if p.ignore_case:
             args.append("-i")
@@ -52,17 +54,17 @@ class GrepTool:
             args += ["-g", p.glob]
         args += [p.pattern, p.path]
         proc = await asyncio.create_subprocess_exec(
-            *args, cwd=ctx.cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *args, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         out, err = await proc.communicate()
         if proc.returncode not in (0, 1):  # 1 = no matches
             raise RuntimeError(err.decode(errors="replace").strip())
         return out.decode(errors="replace").splitlines()
 
-    def _pure(self, p: GrepParams, ctx: ToolContext) -> list[str]:
+    def _pure(self, p: GrepParams, cwd: Path) -> list[str]:
         flags = re.IGNORECASE if p.ignore_case else 0
         rx = re.compile(re.escape(p.pattern) if p.literal else p.pattern, flags)
-        root = (ctx.cwd / p.path).resolve()
+        root = (cwd / p.path).resolve()
         files = (
             [root]
             if root.is_file()
@@ -76,7 +78,7 @@ class GrepTool:
                 continue
             for i, line in enumerate(text.splitlines(), 1):
                 if rx.search(line):
-                    results.append(f"{f.relative_to(ctx.cwd)}:{i}:{line}")
+                    results.append(f"{f.relative_to(cwd)}:{i}:{line}")
         return results
 
 

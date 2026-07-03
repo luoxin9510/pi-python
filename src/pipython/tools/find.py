@@ -23,7 +23,8 @@ class FindTool:
 
     async def execute(self, params: FindParams, ctx: ToolContext) -> ToolResult:
         try:
-            root = (ctx.cwd / params.path).resolve()
+            cwd = ctx.cwd.resolve()
+            root = (cwd / params.path).resolve()
             if _HAS_RG:
                 proc = await asyncio.create_subprocess_exec(
                     "rg",
@@ -31,7 +32,7 @@ class FindTool:
                     "-g",
                     params.pattern,
                     str(root),
-                    cwd=ctx.cwd,
+                    cwd=cwd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -39,7 +40,7 @@ class FindTool:
                 paths = out.decode(errors="replace").splitlines()
             else:
                 paths = [str(f) for f in sorted(root.rglob(params.pattern)) if f.is_file()]
-            rels = [str(Path(x).resolve().relative_to(ctx.cwd)) for x in paths]
+            rels = [str(Path(x).resolve().relative_to(cwd)) for x in paths]
             if not rels:
                 return ToolResult(content="No files found.")
             return ToolResult(content="\n".join(rels[: params.limit]))

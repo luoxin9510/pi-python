@@ -62,3 +62,24 @@ async def test_grep_no_match_message(repo, mode):
 async def test_find_glob(repo, mode):
     r = await find_tool.execute(f(pattern="**/*.py"), ToolContext(cwd=repo))
     assert "src/a.py" in r.content and "b.ts" not in r.content
+
+
+@pytest.fixture
+def symlinked_repo(tmp_path: Path) -> Path:
+    """cwd 含符号链接组件（如 macOS 的 /tmp → /private/tmp）的回归场景。"""
+    real = tmp_path / "real"
+    (real / "src").mkdir(parents=True)
+    (real / "src/a.py").write_text("def hello():\n    return 'Hello World'\n")
+    link = tmp_path / "symlink"
+    link.symlink_to(real)
+    return link
+
+
+async def test_grep_symlinked_cwd(symlinked_repo, mode):
+    r = await grep_tool.execute(g(pattern="hello"), ToolContext(cwd=symlinked_repo))
+    assert not r.is_error and "a.py" in r.content and "ValueError" not in r.content
+
+
+async def test_find_symlinked_cwd(symlinked_repo, mode):
+    r = await find_tool.execute(f(pattern="**/*.py"), ToolContext(cwd=symlinked_repo))
+    assert not r.is_error and "src/a.py" in r.content and "ValueError" not in r.content
