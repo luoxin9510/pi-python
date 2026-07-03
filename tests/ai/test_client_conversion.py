@@ -39,6 +39,16 @@ def test_merge_tool_call_deltas_by_index():
     assert calls[1].name == "ls" and calls[1].arguments == {}
 
 
+def test_merge_name_split_across_fragments():
+    chunks = [
+        {"index": 0, "id": "t1", "function": {"name": "gr", "arguments": '{"pat'}},
+        {"index": 0, "id": None, "function": {"name": "ep", "arguments": 'tern": "x"}'}},
+    ]
+    calls = merge_tool_call_deltas(chunks)
+    assert calls[0].name == "grep"
+    assert calls[0].arguments == {"pattern": "x"}
+
+
 def test_merge_bad_json_becomes_empty_args_with_raw():
     chunks = [{"index": 0, "id": "t1", "function": {"name": "ls", "arguments": "{oops"}}]
     calls = merge_tool_call_deltas(chunks)

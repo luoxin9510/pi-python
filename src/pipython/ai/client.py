@@ -65,7 +65,7 @@ def merge_tool_call_deltas(chunks: list[dict]) -> list[ToolCallContent]:
             slot["id"] = c["id"]
         fn = c.get("function") or {}
         if fn.get("name"):
-            slot["name"] += "" if slot["name"] else fn["name"]
+            slot["name"] += fn["name"]
         if fn.get("arguments"):
             slot["args"] += fn["arguments"]
     calls = []
