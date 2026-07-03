@@ -1,3 +1,5 @@
+from pydantic import BaseModel
+
 from ..ai.types import CamelModel
 from .base import ToolContext, ToolError, ToolResult
 
@@ -19,7 +21,7 @@ class EditTool:
         "against the original file, not incrementally; edits must not overlap; each "
         "oldText must appear exactly once."
     )
-    params_model = EditParams
+    params_model: type[BaseModel] = EditParams
 
     async def execute(self, params: EditParams, ctx: ToolContext) -> ToolResult:
         try:

@@ -1,11 +1,12 @@
 from pathlib import Path
+from typing import cast
 
 from pipython.tools.base import ToolContext
-from pipython.tools.edit import edit_tool
+from pipython.tools.edit import EditParams, edit_tool
 
 
-def p(**kw):
-    return edit_tool.params_model(**kw)
+def p(**kw) -> EditParams:
+    return cast(EditParams, edit_tool.params_model(**kw))
 
 
 async def test_multi_edit_against_original(tmp_path: Path):
