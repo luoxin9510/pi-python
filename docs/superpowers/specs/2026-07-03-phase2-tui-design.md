@@ -1,7 +1,7 @@
 # pi-python 阶段二设计：交互式 TUI/CLI
 
 - 日期：2026-07-03
-- 状态：已由维护者逐段评审通过；已按独立 subagent 审核修订（rev 2：PR-0 前置
+- 状态：已由维护者逐段评审通过；已按独立 subagent 审核修订（rev 3：PR-0 前置(含 entry_type、AgentSession.model)、退出路径三条汇一、Live 清理；rev 2：PR-0 前置
   补丁、SIGINT 机制、中断分场景、补全边界/异步化、/clear 会话替换、/tree 摘要
   规则、FakeClient 脚本对齐、降级行为）
 - 前置：阶段一 SDK（main @ `80e4ba6`，spec 见 `2026-07-03-pi-python-phase1-sdk-design.md`）
@@ -39,8 +39,12 @@ TUI 代码合入：
 1. **导出 session 层公开符号**：`/tree`/`/branch` 需要而 `pipython.__init__`
    未导出的——`SessionStore`、`SessionHeader`、`MessageEntry`、
    `ModelChangeEntry`、`CompactionEntry`、`Entry`、`entry_id`、
-   `entry_parent_id`、`current_path`、`find_entry`。这些对生产用户审计会话同样
-   有用，属正当公开面扩容。
+   `entry_parent_id`、**`entry_type`（新增 helper，dict/模型双表示统一取
+   type）**、`current_path`、`find_entry`。这些对生产用户审计会话同样有用，属
+   正当公开面扩容。
+1b. **`AgentSession.model` 只读属性**（返回 `self.agent.model`）：`/model` 无
+   参回显需要；初始模型不写 model_change entry、无法从 store 反推，且 `Agent`
+   类型不公开——没有这个 getter 实现者只能违规伸手 `session.agent.model`。
 2. **修 bash 工具的中止缺口（阶段一遗留 bug）**：`bash.py` 的 `os.killpg` 只挂
    在 `except asyncio.TimeoutError` 上；`task.cancel()`（本阶段 Ctrl+C 路径）
    抛的是 `asyncio.CancelledError`，现有代码不杀进程树、子进程变孤儿——违反阶
@@ -87,18 +91,37 @@ pipython = "pipython.tui:main"
 **回合制主循环**（输入期/输出期不重叠，无需 patch_stdout）：
 
 ```python
-while True:
-    text = await prompt_session.prompt_async(...)   # 输入期
-    if text.startswith("/"): await dispatch(text); continue
-    task = asyncio.create_task(consume(app.session.prompt(text)))  # 输出期
-    loop.add_signal_handler(signal.SIGINT, task.cancel)  # 关键机制，见下
-    try:
-        await task
-    except asyncio.CancelledError:
-        console.print("[interrupted]")
-    finally:
-        loop.remove_signal_handler(signal.SIGINT)
+try:
+    while True:
+        try:
+            text = await prompt_session.prompt_async(...)   # 输入期
+        except EOFError:            # Ctrl+D（空缓冲）→ 退出
+            break
+        if text.startswith("/"):
+            await dispatch(text)
+            if app.should_quit:     # /quit handler 置位，此处检查跳出
+                break
+            continue
+        task = asyncio.create_task(consume(app.session.prompt(text)))  # 输出期
+        loop.add_signal_handler(signal.SIGINT, task.cancel)  # 关键机制，见下
+        try:
+            await task
+        except asyncio.CancelledError:
+            console.print("[interrupted]")
+        finally:
+            loop.remove_signal_handler(signal.SIGINT)
+except KeyboardInterrupt:
+    pass  # handler 摘除后到 pt 重新接管前的窄窗口兜底，不留 traceback
+finally:
+    console.print(f"session: {app.session.store.path}")   # 退出统一出口
 ```
+
+- **退出路径三条汇一**：Ctrl+D → `EOFError` → break；`/quit` →
+  `app.should_quit=True` → break；窄窗口 SIGINT → 最外层兜底。session 文件路
+  径在统一出口打印。
+- `consume()` 内的 `rich.Live` 必须用 `with` 上下文管理——取消时
+  `CancelledError` 穿出也能保证 `__exit__` 恢复光标/清行，Ctrl+C 后终端不残留
+  半个预览区。
 
 **SIGINT 机制（Ctrl+C 承诺的地基，显式规定）**：输出期没有 prompt_toolkit 在
 跑，默认 SIGINT 会以 `KeyboardInterrupt` 炸穿事件循环的同步栈、**注入不到协程
