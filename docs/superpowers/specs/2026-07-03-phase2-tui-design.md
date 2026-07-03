@@ -42,6 +42,9 @@ TUI 代码合入：
    `entry_parent_id`、**`entry_type`（新增 helper，dict/模型双表示统一取
    type）**、`current_path`、`find_entry`。这些对生产用户审计会话同样有用，属
    正当公开面扩容。
+1a. **导出消息类型与协议**（计划审核发现 TUI 生产代码必需）：
+   `AssistantMessage`、`TextContent`、`ThinkingContent`、`ToolCallContent`、
+   `ToolResultMessage`、`UserMessage`、`Usage`、`ModelClient`。
 1b. **`AgentSession.model` 只读属性**（返回 `self.agent.model`）：`/model` 无
    参回显需要；初始模型不写 model_change entry、无法从 store 反推，且 `Agent`
    类型不公开——没有这个 getter 实现者只能违规伸手 `session.agent.model`。
