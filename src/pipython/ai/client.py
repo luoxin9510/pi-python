@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .types import AssistantMessage, Message, TextContent, ToolCallContent, Usage
+from .types import AssistantMessage, Message, TextContent, ThinkingContent, ToolCallContent, Usage
 
 
 @dataclass(frozen=True)
@@ -114,11 +114,14 @@ class LiteLLMClient:
         assert response is not None
 
         texts: list[str] = []
+        thinking: list[str] = []
         tc_chunks: list[dict] = []
         usage = None
         async for chunk in response:
             # 下面对 delta 混用属性/下标访问：依赖 litellm 的 SafeAttributeModel 兼容层
             delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.get("reasoning_content"):
+                thinking.append(delta["reasoning_content"])
             if delta and delta.get("content"):
                 texts.append(delta["content"])
                 yield ClientTextDelta(text=delta["content"])
@@ -143,6 +146,8 @@ class LiteLLMClient:
                     cost=cost,
                 )
         content: list = []
+        if thinking:
+            content.append(ThinkingContent(thinking="".join(thinking)))
         if texts:
             content.append(TextContent(text="".join(texts)))
         content.extend(merge_tool_call_deltas(tc_chunks))
