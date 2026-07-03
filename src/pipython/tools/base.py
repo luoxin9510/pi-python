@@ -28,6 +28,10 @@ class Tool(Protocol):
     def execute(self, params: Any, ctx: ToolContext) -> Awaitable[ToolResult]: ...
 
 
+class ToolError(Exception):
+    pass
+
+
 @dataclass
 class FunctionTool:
     name: str
@@ -39,7 +43,12 @@ class FunctionTool:
         kwargs = {k: getattr(params, k) for k in type(params).model_fields}
         if "ctx" in inspect.signature(self._fn).parameters:
             kwargs["ctx"] = ctx
-        return ToolResult(content=str(await self._fn(**kwargs)))
+        try:
+            return ToolResult(content=str(await self._fn(**kwargs)))
+        except ToolError as e:
+            return ToolResult(content=str(e), is_error=True)
+        except Exception as e:  # 任何意外异常也不外抛（spec §4.4）
+            return ToolResult(content=f"{type(e).__name__}: {e}", is_error=True)
 
 
 def tool(fn: Callable[..., Awaitable[str]]) -> FunctionTool:
