@@ -543,6 +543,51 @@ class TestTerminalIOProtocol:
             assert term.rows == 30
 
 
+class TestWriteFlushesStdout:
+    """Bug fix (evidence: ``.superpowers/sdd/task-17-report.md`` "Task 17
+    (resumed)"): line-buffered tty stdout silently drops any frame lacking a
+    trailing newline — ordinary keystroke echo and the ``[interrupted]``
+    shrink-frame (cursor moves + erase-line only, no ``\\n``) never render
+    on a real terminal, because ``RealTerminal.write`` never called
+    ``sys.stdout.flush()``. Every ``write()`` must flush immediately after,
+    including the restore writes issued from ``stop()``."""
+
+    def test_write_flushes_after_each_write(self):
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
+
+            flushes_before = env.stdout.flush.call_count
+            term.write("partial frame, no trailing newline")
+
+            assert env.stdout.flush.call_count == flushes_before + 1
+            # flush must come after the write it belongs to, not before.
+            write_call_index = len(env.stdout.method_calls) - 1
+            assert env.stdout.method_calls[write_call_index][0] == "flush"
+            assert env.stdout.method_calls[write_call_index - 1] == (
+                "write",
+                ("partial frame, no trailing newline",),
+                {},
+            )
+
+    def test_stop_restore_writes_each_flush(self):
+        """stop() issues several restore writes (bracketed paste disable,
+        Kitty/modifyOtherKeys disable, show cursor) — each one must flush,
+        not just the last."""
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
+            writes_before_stop = env.stdout.write.call_count
+            flushes_before_stop = env.stdout.flush.call_count
+
+            term.stop()
+
+            writes_during_stop = env.stdout.write.call_count - writes_before_stop
+            flushes_during_stop = env.stdout.flush.call_count - flushes_before_stop
+            assert writes_during_stop > 0
+            assert flushes_during_stop == writes_during_stop
+
+
 class TestResizeHandler:
     """Important 3: ``on_resize(cb)`` wraps ``cb`` in a zero-arg,
     upstream-shaped adapter (``Callable[[], None]``) rather than passing it

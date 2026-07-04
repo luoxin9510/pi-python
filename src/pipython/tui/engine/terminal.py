@@ -367,6 +367,16 @@ class RealTerminal(TerminalIO):
 
     def write(self, data: str) -> None:
         sys.stdout.write(data)
+        # Python's stdout on a real tty is line-buffered: a frame's bytes
+        # only reach the terminal if the frame happens to contain "\n".
+        # Node's process.stdout.write (upstream terminal.ts:455) has no such
+        # buffering, so upstream never needs this — but a newline-less
+        # diff-only frame (plain keystroke echo, or a shrink-only
+        # "[interrupted]" frame) would otherwise sit unflushed until some
+        # later frame happens to carry a newline, or the process exits. See
+        # .superpowers/sdd/task-17-report.md "Task 17 (resumed)" for the
+        # real-tmux e2e evidence this was diagnosed from.
+        sys.stdout.flush()
 
     @property
     def columns(self) -> int:
