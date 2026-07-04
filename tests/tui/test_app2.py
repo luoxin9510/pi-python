@@ -208,6 +208,37 @@ def screen_text(term: RecordingTerm) -> str:
     return "\n".join(term.screen())
 
 
+def _editor_row_index(term: RecordingTerm) -> int:
+    """Index of the editor's own content row in the current screen. The
+    editor is always focused (module docstring: "editor ... always
+    focused, always at the bottom"), so its rendered row is the one and
+    only row carrying the reverse-video cursor marker (``\\x1b[7m``,
+    editor.py's own cursor-rendering escape, not used anywhere else in this
+    port -- confirmed unique). Locating it this way (rather than "the last
+    non-blank row") matters because the editor renders inside a bordered
+    box: the row *below* its content is a horizontal-rule border, itself
+    non-blank. Used to tell "the editor's own draft" apart from "a
+    persisted transcript line" when both could otherwise contain the same
+    substring (see the mid-turn-submit test below)."""
+    rows = term.screen()
+    idxs = [i for i, r in enumerate(rows) if "\x1b[7m" in r]
+    assert idxs, "expected exactly one row carrying the cursor marker"
+    return idxs[-1]
+
+
+_CSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _visible_text(row: str) -> str:
+    """Strip ANSI CSI sequences (SGR styling, cursor-position escapes) from
+    a rendered row so plain substring checks aren't defeated by e.g. the
+    reverse-video cursor marker landing *inside* a word (editor.py embeds
+    it at the cursor's exact grapheme position, which can split a literal
+    substring like "first" into "\\x1b[7mf\\x1b[0mirst" when the cursor sits
+    at column 0)."""
+    return _CSI_RE.sub("", row)
+
+
 # =============================================================================
 # SteppedFakeClient (see module docstring note 4)
 # =============================================================================
@@ -644,6 +675,84 @@ async def test_slash_clear_mid_turn_does_not_swap_session_under_running_turn(tmp
         session_dir = tmp_path / "sessions"
         jsonl_files = list(session_dir.rglob("*.jsonl"))
         assert len(jsonl_files) == 1, "no session swap should have happened"
+
+
+# =============================================================================
+# Task 16 fix round 2 (re-review): a mid-turn submit must not masquerade as
+# accepted. Pre-fix, `_on_submit` echoed the text into the transcript and
+# pushed it into editor history BEFORE the single-flight busy check -- even
+# though `Editor._submit_value` (editor.py) had already cleared the buffer on
+# Enter. The text therefore looked "accepted" (echoed, in history) but never
+# reached the model, and the draft itself was gone. Fixed: the echo +
+# add_to_history now happen only when not busy; when busy, the exact
+# submitted text is restored into the editor via `editor.set_text(text)`
+# (cursor lands at the end, `set_text`'s own default) instead of being
+# dropped. Full upstream queueing (`restoreQueuedMessagesToEditor`) is a
+# phase-4 parity item, not built here -- this is a minimal correctness fix.
+# =============================================================================
+
+
+async def test_submit_mid_turn_restores_draft_and_leaves_history_untouched(tmp_path, stdin_pipe):
+    client = SteppedFakeClient(
+        script=[
+            AssistantMessage(content=[TextContent(text="partial "), TextContent(text="more text")]),
+            done("second reply"),
+        ]
+    )
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
+        send(stdin_pipe, "first turn")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "partial" in full_ops_text(term))
+
+        # Attempt a second submit while the first turn is still in flight.
+        send(stdin_pipe, "lost message")
+        send(stdin_pipe, "\r")
+
+        # The exact text must be restored verbatim into the editor buffer.
+        await wait_until(
+            lambda: "lost message" in _visible_text(term.screen()[_editor_row_index(term)])
+        )
+        # It must NOT have been echoed as a separate transcript line -- only
+        # the editor's own row shows it, nothing above it does.
+        editor_idx = _editor_row_index(term)
+        assert "lost message" not in _visible_text("\n".join(term.screen()[:editor_idx]))
+
+        # It must NOT have entered history either: Home (cursor -> column 0)
+        # then Up (history recall) on the now-restored single-line draft must
+        # surface the *real* previous submission ("first turn"), never the
+        # dropped mid-turn text.
+        send(stdin_pipe, "\x1b[H")
+        send(stdin_pipe, "\x1b[A")
+        await wait_until(
+            lambda: "first turn" in _visible_text(term.screen()[_editor_row_index(term)])
+        )
+        assert "lost message" not in _visible_text(term.screen()[_editor_row_index(term)])
+
+        # Down arrow restores the exact draft captured when Up was pressed,
+        # proving the history probe itself didn't mutate/lose it either.
+        send(stdin_pipe, "\x1b[B")
+        await wait_until(
+            lambda: "lost message" in _visible_text(term.screen()[_editor_row_index(term)])
+        )
+
+        # The running turn itself is completely undisturbed by any of this.
+        await wait_until(lambda: "more text" in full_ops_text(term))
+        # Wait for the turn to actually finish (loader gone), not just for
+        # its last text delta to have arrived -- otherwise the busy gate
+        # could still be up when we resubmit next, turning this into
+        # another (silently swallowed) restore instead of a real resubmit.
+        await wait_until(lambda: not any(ch in screen_text(term) for ch in DEFAULT_FRAMES))
+
+        # Once idle, submitting again (the very draft that was restored)
+        # works normally: echoed into the transcript, sent to the model.
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: len(client.calls) >= 2)
+        assert client.calls[-1][-1].content == "lost message"
+        await wait_until(lambda: "second reply" in full_ops_text(term))
+        final_editor_idx = _editor_row_index(term)
+        assert "lost message" in _visible_text("\n".join(term.screen()[:final_editor_idx]))
 
 
 # =============================================================================

@@ -62,6 +62,21 @@ review write-up):
   phase 2's own busy semantics, instead of racing a second command against
   the running turn (e.g. ``/clear`` swapping ``app_state.session`` out from
   under an in-flight ``session.prompt()`` iteration).
+
+Task 16 fix round 2 — re-review finding addressed here (see
+``.superpowers/sdd/task-16-report.md``'s "Fix round 2" section for the full
+write-up):
+
+- **Mid-turn submit no longer masquerades as accepted.** ``_on_submit`` used
+  to echo the text into the transcript and call ``editor.add_to_history``
+  *before* the busy gate, even though ``Editor._submit_value`` had already
+  cleared the buffer on Enter — a submit made while a turn was running
+  therefore looked accepted (echoed, recorded in history) but never reached
+  the model, and the draft was gone. The busy branch now restores the text
+  into the editor instead (``editor.set_text(text)``, cursor at the end),
+  and the echo/``add_to_history`` calls only run once the gate is clear.
+  Full upstream queueing (``restoreQueuedMessagesToEditor``) is a phase-4
+  parity item, not built here — this is a minimal correctness fix.
 """
 
 from __future__ import annotations
@@ -274,9 +289,7 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
         nonlocal turn_task
         if not text:
             return
-        editor.add_to_history(text)
-        _append(text)
-        # Important finding 2 (task-16 fix round 1): slash commands now
+        # Important finding 2 (task-16 fix round 1): slash commands
         # serialize with turns under the exact same single-flight gate
         # plain-text turns already used — a command submitted while a turn
         # is in flight is ignored (not queued), matching phase 2's
@@ -285,7 +298,20 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
         # turn's still-iterating `session.prompt()` generator.
         busy = turn_task is not None and not turn_task.done()
         if busy:
+            # Fix round 2 (task-16 re-review): the echo + add_to_history
+            # calls used to happen BEFORE this busy check, even though
+            # `Editor._submit_value` had already cleared the buffer on
+            # Enter — the text looked "accepted" (echoed into the
+            # transcript, recorded in history) but never reached the model,
+            # and the draft was destroyed. Restore it into the editor
+            # instead (cursor lands at the end, `set_text`'s own default)
+            # so nothing is lost and nothing pretends to be accepted. Full
+            # upstream queueing (`restoreQueuedMessagesToEditor`) is a
+            # phase-4 parity item, not built here.
+            editor.set_text(text)
             return
+        editor.add_to_history(text)
+        _append(text)
         if text.startswith("/"):
             asyncio.create_task(_run_command(text))
         else:
