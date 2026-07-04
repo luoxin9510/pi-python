@@ -1,0 +1,7 @@
+[
+  {"role": "assistant", "content": [
+    {"type": "text", "text": "let me look"},
+    {"type": "toolCall", "id": "t1", "name": "ls", "arguments": {"path": "."}}]},
+  {"role": "assistant", "content": [
+    {"type": "text", "text": "# Result\n\nI saw the files."}]}
+]
