@@ -199,9 +199,12 @@ def _grapheme_width(cluster: str) -> int:
         return 0
 
     cp = ord(base[0])
-    # Regional indicator symbols are often rendered full-width even in
-    # isolation (e.g. mid-stream); keep width conservative (ported from
-    # utils.ts:189-194).
+    # Defensive duplicate: an isolated regional-indicator code point is
+    # already caught by _is_rgi_emoji above (single-codepoint fallback,
+    # category "So") and returns 2 there. This branch is unreachable in
+    # practice but kept as belt-and-braces in case that fallback's
+    # unicodedata category check ever misses a regional-indicator code
+    # point — both paths yield width 2.
     if 0x1F1E6 <= cp <= 0x1F1FF:
         return 2
 
@@ -334,7 +337,7 @@ class _AnsiCodeTracker:
                 continue
 
             if code in (38, 48):
-                if i + 2 < len(parts) and parts[i + 1] == "5" and parts[i + 2] != "":
+                if i + 2 < len(parts) and parts[i + 1] == "5":
                     color_code = f"{parts[i]};{parts[i + 1]};{parts[i + 2]}"
                     if code == 38:
                         self.fg_color = color_code
@@ -342,7 +345,7 @@ class _AnsiCodeTracker:
                         self.bg_color = color_code
                     i += 3
                     continue
-                if i + 4 < len(parts) and parts[i + 1] == "2" and parts[i + 4] != "":
+                if i + 4 < len(parts) and parts[i + 1] == "2":
                     color_code = ";".join(parts[i : i + 5])
                     if code == 38:
                         self.fg_color = color_code
@@ -747,7 +750,7 @@ def truncate_to_width(s: str, width: int, ellipsis: str = "…") -> str:
         clipped_text, clipped_width = _truncate_fragment_to_width(ellipsis, width)
         if clipped_width == 0:
             return ""
-        return f"{clipped_text}{_RESET}" if has_ansi else clipped_text
+        return f"{_RESET}{clipped_text}{_RESET}" if has_ansi else clipped_text
 
     target_width = width - ellipsis_width
     kept, _kept_width = _truncate_fragment_to_width(s, target_width)

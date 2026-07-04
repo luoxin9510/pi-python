@@ -237,3 +237,29 @@ def test_wrap_osc8_no_sequences_on_lines_outside_the_hyperlink():
     close_count = len(re.findall(r"\x1b\]8;;\x1b\\", lines[0]))
     assert open_count == 1
     assert close_count == 1
+
+
+# [FIX-ROUND-1] Regression tests for the fix wave against upstream utils.ts.
+
+
+def test_truncate_wide_ellipsis_on_styled_input_brackets_resets():
+    # Upstream truncate-to-width.test.ts:32 expects the ellipsis bracketed by
+    # a leading AND trailing reset when the source text carries ANSI codes
+    # (finalizeTruncatedResult always resets around the ellipsis for styled
+    # input; this port narrows that to has_ansi-only, but must still be
+    # symmetric — not trailing-reset-only).
+    assert truncate_to_width("\x1b[31mabcdef\x1b[0m", 2, "🙂") == "\x1b[0m🙂\x1b[0m"
+
+
+def test_wrap_preserves_malformed_256_color_code_as_single_group():
+    # SGR "38;5;<empty>" must be swallowed as one 3-param extended-color
+    # group (upstream utils.ts:419 treats an empty trailing param as
+    # "present", not "absent"). If the tracker fails to consume all three
+    # parts atomically, the stray "5" is misread as the "blink" SGR code.
+    text = "\x1b[38;5;m" + "a" * 20
+    wrapped = wrap_text_with_ansi(text, 5)
+
+    assert len(wrapped) > 1
+    for line in wrapped[1:]:
+        assert line.startswith("\x1b[38;5;m")
+        assert "\x1b[5m" not in line
