@@ -38,7 +38,8 @@ Phase 2 adds an interactive CLI on top of the same SDK: a `pipython` command
 that streams the agent's replies into your terminal's normal scrollback, with
 a live input line at the bottom (rich for output, prompt_toolkit for input).
 It is an optional extra — the SDK stays two-dependency (`litellm` +
-`pydantic`).
+`pydantic`). The TUI is POSIX-only (macOS/Linux); it is not supported on
+Windows.
 
 ### Install
 

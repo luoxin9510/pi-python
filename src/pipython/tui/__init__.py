@@ -26,6 +26,13 @@ def _parse_args(argv: list[str] | None):
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":
+        # loop.add_signal_handler（app.py 的 SIGINT 处理）在 Windows 上
+        # NotImplementedError；给一行干净提示而不是一路跑到那里才崩（issue #5）。
+        print(
+            "pipython's TUI is POSIX-only (macOS/Linux); Windows is not supported", file=sys.stderr
+        )
+        return 1
     args = _parse_args(argv)
     if not _tui_deps_available():
         print(
