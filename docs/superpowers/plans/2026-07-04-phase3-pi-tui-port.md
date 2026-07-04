@@ -68,7 +68,7 @@
   - `truncate_to_width(s: str, width: int, ellipsis: str = "…") -> str`
   - `apply_background_to_line(line: str, bg: str, width: int) -> str`
 
-**上游规范源**：`utils.ts`（重点 1-120 行分类正则与 visibleWidth、wrapTextWithAnsi 全函数）；上游测试 `test/wrap-text-ansi.test.ts` 等 utils 相关用例。
+**上游规范源**：`utils.ts`（重点 1-120 行分类正则与 visibleWidth、wrapTextWithAnsi 全函数）；上游测试 `test/wrap-ansi.test.ts`（折行 + OSC-8 续行用例）。
 
 - [ ] **Step 1: 依赖入库** `uv add --optional tui markdown-it-py linkify-it-py wcwidth regex`，把解析出的版本改成 `==` 钉版，`uv sync --extra tui`。
 - [ ] **Step 2: [TEST] 写金标准测试**（含 CJK/emoji 专项，spec §7.3）：
@@ -180,7 +180,7 @@ def test_apply_background_pads_to_width():
 
 **上游规范源**：`keys.ts`（重点 CSI-u 解析区段 550-700 行与 legacy 表）；测试翻译源 `test/keys.test.ts`（614 行）。
 
-- [ ] **Step 1: [TEST-PORT] 翻译 keys.test.ts 适用用例**（legacy 方向键/功能键/Ctrl 组合、CSI-u 带修饰、flag-4 alternate、UTF-8 文本键）。上游 native-modifiers 相关用例跳过并列清单。
+- [ ] **Step 1: [TEST-PORT] 翻译 keys.test.ts 适用用例**（legacy 方向键/功能键/Ctrl 组合、CSI-u 带修饰、flag-4 alternate、UTF-8 文本键；该文件无 native-modifiers 用例，无需跳过清单）。
 - [ ] **Step 2: 确认失败。**
 - [ ] **Step 3: [PORT] 实现 parse_key/key_id。**
 - [ ] **Step 4: 四道门。**
@@ -224,7 +224,7 @@ def test_apply_background_pads_to_width():
   - `TerminalIO(Protocol)`: `write(data: str)`、`columns: int`、`rows: int`——**引擎全部输出走它**；测试注入 `RecordingTerm`（见 Task 7 conftest）
   - `RealTerminal(TerminalIO)`：`start()`（termios raw + 探测 kitty：发 `CSI ? u` 收应答/超时 200ms，照 terminal.ts 探测次序；启用 bracketed paste/kitty flags）、`stop()`（**finally 级还原**：termios、kitty 标志弹栈、显示光标——异常路径必须还原，注册 atexit 兜底）、`kitty_enabled: bool`、`on_resize(cb)`（SIGWINCH）
   - 光标寻址原语：`move_to_row(delta: int)`、`erase_line()`、`hide_cursor()/show_cursor()`（ANSI 串常量随类导出，供 tui.py 用）
-- 真实终端行为进 e2e（Task 17）；本任务单测覆盖：raw 进出的 termios 调用序列（mock termios 模块——**这是全项目唯一允许 mock 的系统边界**，因 CI 无 pty 可控回读）、kitty 应答/超时解析纯函数化拆出直测。
+- 真实终端行为进 e2e（Task 17）；本任务单测覆盖：raw 进出的 termios 调用序列（mock termios 模块——**这是全项目唯一允许 mock 的系统边界**，因 CI 无 pty 可控回读）、kitty 应答/超时解析纯函数化拆出直测。本任务测试不需要任何渲染桩。
 
 **上游规范源**：`terminal.ts`（531 行全量；native-modifiers 调用点按 spec §5 裁决跳过）。
 
@@ -241,15 +241,16 @@ def test_apply_background_pads_to_width():
 - Test: `tests/tui/engine/conftest.py`（`RecordingTerm`：实现 TerminalIO，记录 write 的 ANSI 操作序列并可回放成虚拟屏幕）、`tests/tui/engine/test_diff_render.py`
 
 **Interfaces:**
-- Produces:
-  - `Component(Protocol)`: `render(width: int) -> list[str]`
-  - `Focusable(Protocol, Component)`: `handle_input(frame: str) -> None`、`focus()/unfocus()`、`is_focused() -> bool`
+- Produces（**契约照上游真实形状**，tui.ts:64-79 与 ~104-107）:
+  - `Component(Protocol)`: `render(width: int) -> list[str]`、`invalidate() -> None`（必需）、可选 `handle_input(data: str) -> None`（吃**原始帧字符串**——把帧解析成 KeyEvent 是组件自己的事，见 Task 11）
+  - `Focusable(Protocol)`: **仅一个可写属性 `focused: bool`**（上游没有 focus()/unfocus() 方法；TUI 直接读写 `.focused`，组件在自己的 render 里检查它决定是否内嵌 CURSOR_MARKER，见 Task 8）
+  - `CURSOR_MARKER = "\x1b_pi:c\x07"`（零宽 APC 序列常量，本任务定义、Task 8 消费）
   - `Container(Component)`: `add_child/remove_child/clear`，render 拼接子行
-  - `TUI(term: TerminalIO)`: `set_root(c: Component)`、`request_render(force: bool = False)`（`loop.call_soon` 归并，多次调用一帧执行）、`do_render()`（测试可直调同步跑）、`set_focus(c)`、`start()/stop()`
-  - 差分语义（照 tui.ts）：新旧行数组比对 → 光标寻址首个差异行 → 只重写差异行（含尾部缩短时擦除）；**增长向下扩展**（expandForLines：滚动历史保留的机制本体，绝不清屏重画）；`clear_on_shrink` 选项。
+  - `TUI(term: TerminalIO)`: `set_root(c: Component)`、`request_render(force: bool = False)`（`loop.call_soon` 归并，多次调用一帧执行）、`do_render()`（测试可直调同步跑）、`set_focus(c: Component | None)`（翻转新旧组件的 `.focused` 并转发输入帧给焦点组件的 handle_input）、`start()/stop()`
+  - 差分语义（照 tui.ts）：新旧行数组比对 → 光标寻址首个差异行 → 只重写差异行（含尾部缩短时擦除）；**增长向下扩展、绝不清屏重画**（滚动历史保留——注意：该逻辑**内联在 doRender 里**的 `maxLinesRendered`/`bufferLength`/`previousViewportTop` 簿记中，没有独立函数；上游 `expandForLines` 是 kitty 图片专用 helper，与此无关，勿被名字误导）；`clear_on_shrink` 选项。
 - Consumes: Task 6 `TerminalIO`
 
-**上游规范源**：`tui.ts` 差分核心区段（约 640-780 行 doRender/expandForLines/光标行簿记）。
+**上游规范源**：`tui.ts` 的 `doRender` 实际在 **1254-1620 行**（367 行大函数）。**筛读警告**：其中大量交织 kitty 图片合成分支（`getKittyImageReservedRows`/`deleteKittyImages`/`collectKittyImageIds` 等）——图片是 spec 非目标，**只抄纯差分/viewport 逻辑，图片分支整段跳过**。
 
 - [ ] **Step 1: [TEST] 差分行为测试**（RecordingTerm 断言操作序列）：
 
@@ -277,13 +278,13 @@ def test_request_render_coalesces(term, tui, event_loop):
 
 **Interfaces:**
 - Produces（追加到 TUI）：
-  - `show_overlay(c: Component, *, anchor_row: int | None = None) -> OverlayHandle`、`OverlayHandle.close()`；overlay 渲染叠加在主行数组之上（照 tui.ts overlayLines 合成）
-  - 焦点链：overlay 打开自动夺焦、关闭还焦给此前焦点者；嵌套 overlay 栈式还原（照 tui.ts focus-restore 状态机）
-  - `on_resize()`：SIGWINCH → previous_viewport_top 修正 + 全量重绘
-  - 硬件光标：`set_hardware_cursor(row: int, col: int)`——渲染尾把真实光标移到该点（IME 候选窗跟随；照 hardwareCursorRow 簿记）
-- Consumes: Task 7 全部
+  - `show_overlay(c: Component, *, anchor_row: int | None = None) -> OverlayHandle`、`OverlayHandle.close()`；overlay 渲染叠加在主行数组之上（照 tui.ts `compositeOverlays`）
+  - 焦点链：overlay 打开自动夺焦、关闭还焦给此前焦点者（读写 `.focused`，Task 7 契约）；嵌套 overlay 栈式还原（照 tui.ts focus-restore 状态机）
+  - `on_resize()`：SIGWINCH → previous_viewport_top 修正 + 全量重绘（**回调注册在 terminal.ts 侧**，Python 对应挂在 Task 6 RealTerminal.on_resize，TUI 订阅）
+  - **硬件光标 = CURSOR_MARKER 提取机制（照上游，非组件自报坐标）**：聚焦组件在自己 render 输出里内嵌 `CURSOR_MARKER`（Task 7 常量）；`do_render` 在 **overlay 合成与 viewport 计算完成后**的最终行数组里 `extract_cursor_position()` 找 marker → 算行列 → 从行里剥掉 marker → 把真实终端光标定位到该点（IME 候选窗跟随）。浮层/滚动场景因"先合成后找"而天然正确——这是上游架构，禁止改成组件自算屏幕坐标。
+- Consumes: Task 7 全部、Task 6 `on_resize`
 
-**上游规范源**：`tui.ts` overlay/焦点区段（约 366-620 行）与 resize/光标区段（约 690-720、1050-1160 行）。
+**上游规范源**：`tui.ts` overlay/焦点状态机 366-620 行；`compositeOverlays` 1050-1160 行；resize 感知逻辑在 `doRender` 内 1258-1352 行；CURSOR_MARKER 注释 118-120 行与 `extractCursorPosition`；SIGWINCH 注册见 `terminal.ts` 134-155 行。
 
 - [ ] **Step 1: [TEST]**：overlay 显示/关闭的行合成；夺焦/还焦（含嵌套两层 overlay 先开后关、后开先关两序）；resize 后全量重绘；hardware cursor 的落点 ANSI 断言。每条写全。
 - [ ] **Step 2: 确认失败。** — [ ] **Step 3: [PORT] 实现。** — [ ] **Step 4: 四道门。**
@@ -340,16 +341,17 @@ def test_request_render_coalesces(term, tui, event_loop):
 
 **Interfaces:**
 - Produces:
-  - `Editor(bindings: KeyBindings = DEFAULT..., on_submit: Callable[[str], None] | None = None)`
+  - `Editor(bindings: KeyBindings = DEFAULT..., on_submit: Callable[[str], None] | None = None)`——实现 Task 7 的 Component 契约：`render/invalidate/handle_input(data: str)` + `focused: bool` 属性
+  - **输入分层（Task 7 契约的桥接点，明确写死）**：`handle_input(data: str)` 是对外入口（TUI 转发原始帧）——内部先判 bracketed paste 帧→`handle_paste`，否则 `parse_key`（Task 4）→ `handle_key(e: KeyEvent)`；`handle_key` 是**内部方法但保持公开**（测试直接驱动它，绕过帧编码）
   - 状态面：`text: str`、`cursor: tuple[int, int]`（行,字素列）、`set_text(s)`
   - `handle_key(e: KeyEvent) -> None`（本任务动作子集：字符插入、backspace/delete、左右上下、home/end、行首尾、`newline` 动作、`submit` 动作→on_submit）
   - `handle_paste(text: str) -> None`（整段插入）
-  - render：多行 + 光标行反显块 + 按宽软折行（视觉行 ≠ 逻辑行，照 editor.ts 布局逻辑）；`cursor_screen_pos(width) -> tuple[int,int]`（供 TUI 硬件光标）
-- Consumes: Task 4 KeyEvent、Task 5 bindings、Task 1 utils、Task 7 Component/Focusable
+  - render：多行 + 按宽软折行（视觉行 ≠ 逻辑行，照 editor.ts 布局逻辑）；**`focused` 为真时在光标字素处内嵌 `CURSOR_MARKER`**（Task 7 常量；Task 8 的 TUI 负责提取定位——editor 不算屏幕坐标）
+- Consumes: Task 4 KeyEvent/parse_key、Task 5 bindings、Task 1 utils、Task 7 Component/Focusable/CURSOR_MARKER
 
 **上游规范源**：`editor.ts`（缓冲/光标/渲染区段）；测试翻译源 `editor.test.ts` **编辑与光标移动域**的用例。
 
-- [ ] **Step 1: [TEST-PORT] 翻译 editor.test.ts 中「插入/删除/移动/软折行/光标定位」域用例**（预计 30+ 条；上游依赖 kill-ring/undo/补全的用例留给 Task 12/13，跳过清单列报告）。另补 CJK 光标列宽用例（"中文" 上 backspace/左移的字素级行为）≥5 条，写全。
+- [ ] **Step 1: [TEST-PORT] 翻译 editor.test.ts 指定域用例**——本任务认领的 describe 域（行号为该文件实际位置）：`public state accessors`(287)、`Backslash+Enter newline workaround`(315)、`Kitty CSI-u handling`(373)、`Unicode text editing behavior`(399)、`Grapheme-aware text wrapping`(702)、`Word wrapping`(835)、`Character jump`(2824)、`Sticky column`(3045)。（`Prompt history navigation`/`Kill ring`/`Undo`/`Paste marker` 归 Task 12，`Autocomplete` 归 Task 13——三方清单互斥完备，不许重复不许漏。）另补 CJK 光标列宽用例（"中文" 上 backspace/左移的字素级行为）≥5 条，写全。
 - [ ] **Step 2: 确认失败。** — [ ] **Step 3: [PORT] 实现本域。** — [ ] **Step 4: 四道门。**
 - [ ] **Step 5: Commit** `feat(tui): editor core — buffer, cursor, editing, soft wrap`
 
@@ -367,7 +369,7 @@ def test_request_render_coalesces(term, tui, event_loop):
 
 **上游规范源**：`editor.ts` 对应区段；`editor.test.ts` kill-ring/undo/history 域。
 
-- [ ] **Step 1: [TEST-PORT] 翻译对应域用例**（预计 25+ 条），写全。
+- [ ] **Step 1: [TEST-PORT] 翻译本任务认领域**：`Prompt history navigation`(42)、`Kill ring`(1158)、`Undo`(1555)、`Paste marker atomic behavior`(3547)（预计 25+ 条），写全。
 - [ ] **Step 2: 确认失败。** — [ ] **Step 3: [PORT] 实现。** — [ ] **Step 4: 四道门。**
 - [ ] **Step 5: Commit** `feat(tui): editor kill ring, undo, history, paste as single undo unit`
 
@@ -381,15 +383,19 @@ def test_request_render_coalesces(term, tui, event_loop):
 - Test: `tests/tui/components/test_editor_autocomplete.py`
 
 **Interfaces:**
-- Produces:
-  - `AutocompleteProvider(Protocol)`: `trigger(text: str, cursor: tuple[int,int]) -> bool`、`candidates(text, cursor) -> list[str]`、`apply(text, cursor, choice) -> tuple[str, tuple[int,int]]`
-  - Editor 追加：`set_autocomplete(provider, tui: TUI)`——触发时 `tui.show_overlay(SelectList(...))`（editor 直接持有 SelectList，照上游 createAutocompleteList 结构）；Tab/上下/Enter/Esc 在浮层开启时改道浮层；选中经 `provider.apply` 回写缓冲
-  - `EditorComponent(Protocol)`（editor_protocol.py，74 行对应物）：`render/handle_key/handle_paste/text/cursor_screen_pos`——app 层依赖此 Protocol 而非具体 Editor（三原则"一切可注入"）
+- Produces（**契约照上游真实形状** autocomplete.ts:241-270 与 editor-component.ts）:
+  - `AutocompleteItem(value: str, label: str)`（dataclass）
+  - `AutocompleteProvider(Protocol)`——**异步可取消**（上游是 Promise+AbortSignal+防抖，不许简化成同步）：
+    `async def get_suggestions(self, lines: list[str], cursor_line: int, cursor_col: int, *, force: bool = False, is_cancelled: Callable[[], bool] = ...) -> tuple[list[AutocompleteItem], str]`（返回候选与 prefix）；
+    `def apply_completion(self, lines, cursor_line, cursor_col, item: AutocompleteItem, prefix: str) -> tuple[list[str], int, int]`；
+    可选 `trigger_characters: str`
+  - Editor 追加：`set_autocomplete_provider(provider, tui: TUI)`——**防抖 + 取消 token 照 editor.ts**（`autocompleteDebounceTimer`/`autocompleteStartToken` 语义：新键入使旧请求作废）；触发时 `tui.show_overlay(SelectList(...))`（editor 直接持有 SelectList，照 createAutocompleteList）；Tab/上下/Enter/Esc 浮层开启时改道；选中经 `apply_completion` 回写
+  - `EditorComponent(Protocol)`（editor_protocol.py）——**忠实对照 editor-component.ts 的可插拔面**（该文件存在的唯一目的是允许自定义编辑器实现，三原则同款）：`get_text()/set_text(s)/handle_input(data)/render/invalidate/focused` + 可选 hook `on_submit/on_change/add_to_history(s)/insert_text_at_cursor(s)/set_autocomplete_provider(...)`；app 层依赖此 Protocol 而非具体 Editor
 - Consumes: Task 10 SelectList、Task 8 overlay、Task 11/12
 
 **上游规范源**：`editor.ts` 补全区段（约 2050-2150 行）+ `editor-component.ts`；`editor.test.ts` 补全域。
 
-- [ ] **Step 1: [TEST-PORT] + [TEST]**：翻译补全域用例；另写浮层键改道、apply 回写光标、Esc 关闭还焦 ≥6 条。写全。
+- [ ] **Step 1: [TEST-PORT] + [TEST]**：翻译 `Autocomplete` 域用例（editor.test.ts:2092 起，含防抖/取消语义）；另写浮层键改道、apply_completion 回写光标、Esc 关闭还焦、新键入作废旧请求（is_cancelled 早退）≥8 条。写全。
 - [ ] **Step 2: 确认失败。** — [ ] **Step 3: [PORT] 实现。** — [ ] **Step 4: 四道门。**
 - [ ] **Step 5: Commit** `feat(tui): editor autocomplete via overlay select list; editor protocol`
 
@@ -421,8 +427,8 @@ def test_request_render_coalesces(term, tui, event_loop):
 - Test: `tests/tui/components/test_autocomplete_providers.py`
 
 **Interfaces:**
-- Produces: `PathProvider(file_list_getter: Callable[[], list[str]])`（`@` 触发，engine.fuzzy 过滤）与 `CommandProvider(commands: dict[str,str])`（行首 `/` 触发）——均实现 Task 13 `AutocompleteProvider`；`CombinedProvider([...])` 按触发优先取一。
-- Consumes: Task 13 Protocol、Task 5 fuzzy、现有 `build_file_list`
+- Produces: `PathProvider(file_list: Callable[[], Awaitable[list[str]]])`（`@` 触发；**异步桥接现有 `async def build_file_list`**——get_suggestions 本身就是 async，直接 await，配 is_cancelled 早退；engine.fuzzy 过滤）与 `CommandProvider(commands: dict[str,str])`（行首 `/` 触发，同步数据放进 async 契约即可）——均实现 Task 13 异步 `AutocompleteProvider`；`CombinedProvider([...])` 按触发优先取一。
+- Consumes: Task 13 Protocol/AutocompleteItem、Task 5 fuzzy、现有 `build_file_list`（async）
 
 **上游规范源**：`autocomplete.ts`（786 行，取 Provider 语义；pt 相关皮不移）。
 
@@ -436,7 +442,7 @@ def test_request_render_coalesces(term, tui, event_loop):
 
 **Files:**
 - Create: `src/pipython/tui/app2.py`
-- Modify: `src/pipython/tui/commands.py`（渲染出口抽象：新增 `Sink(Protocol)`：`emit(component_or_text)`；现有 rich console 路径包成 `RichSink` 保持旧行为——旧 TUI 不破）
+- Modify: `src/pipython/tui/commands.py`——**工作量提示：不是纯包装**。现有五个 handler 直接内联 `ctx.console.print/rule`，其中 `_tree` 构造 rich Tree（dim/bold-green/← 叶标）。改法：`CommandContext` 增加可选 `sink: Sink | None = None`（`Sink(Protocol)`: `emit_text(s: str, style: str = "")`、`emit_lines(lines: list[str])`）；每个 handler 开头 `out = ctx.sink or RichSink(ctx.console)`，全部输出走 out；**`_tree` 需要新写一套纯 ANSI 树渲染**（├──/└── 前缀 + ANSI dim/bold-green + ← 叶标，输出 list[str] 走 emit_lines，rich Tree 路径保留在 RichSink 分支之外照旧）——sink 为 None 时行为与现状逐字节一致（旧 TUI 测试不许变红）
 - Test: `tests/tui/test_app2.py`（FakeClient 驱动，RecordingTerm 断言）
 
 **Interfaces:**
@@ -452,11 +458,11 @@ def test_request_render_coalesces(term, tui, event_loop):
 ### Task 17: e2e 迁移与新场景
 
 **Files:**
-- Modify: `tests/e2e/test_tui_tmux.py`（迁移到 `pipython --engine=pi` 临时旗标——本任务在 `__init__.py` 加隐藏旗标路由 app2，默认仍旧 TUI）、`src/pipython/tui/__init__.py`
-- Test: 新增 `tests/e2e/test_tui_tmux_engine.py`
+- Modify: `src/pipython/tui/__init__.py`（加 `--engine {legacy,pi}` argparse 旗标，默认 legacy，pi 路由 app2）
+- Test: 新增 `tests/e2e/test_tui_tmux_engine.py`。**`tests/e2e/test_tui_tmux.py` 全程一行不改**（默认引擎的 e2e 覆盖必须存活到 Task 18）。
 
 **Interfaces:**
-- Produces: 新 e2e 集（旧集不动）：既有 5 场景对 `--engine=pi` 重演 + 三条新场景（spec §7.4）：补全浮层出现并选中回写；**滚动历史保留**（三轮对话后 `capture -S -` 断言第一轮 user 回显仍在）；编辑器多行提交（Ctrl+J 组多行）。全部轮询式断言。
+- Produces: 新 e2e 文件（旧文件零改动）：既有 5 场景对 `--engine=pi` **重写副本**进新文件 + 三条新场景（spec §7.4）：补全浮层出现并选中回写；**滚动历史保留**（三轮对话后 `capture -S -` 断言第一轮 user 回显仍在）；编辑器多行提交（Ctrl+J 组多行）。全部轮询式断言。
 
 - [ ] **Step 1: 加 `--engine=pi` 旗标**（argparse choice，默认 legacy）。
 - [ ] **Step 2: [TEST] 写新 e2e**（tmux_util 复用；每场景写全断言）。
@@ -499,4 +505,4 @@ def test_request_render_coalesces(term, tui, event_loop):
 - [ ] §6 组件与接线 → Task 9-16
 - [ ] §7 测试策略四层 → Task 各 [TEST]/[TEST-PORT] + Task 17
 - [ ] §8 旁路开发/末位删除 → Global Constraints + Task 16-18
-- [ ] §9 风险防线逐条 → Task 1（宽度金标准）、5（CJK 词移）、7/8（差分拆分）、3（粘贴洪泛）、14（markdown 适配）
+- [ ] §9 风险防线逐条 → Task 1（宽度金标准）、5（CJK 词移）、7/8（tui.ts 差分核心独立拆分）、3（粘贴洪泛）、14（markdown 适配）、6+19（终端兼容矩阵：能力协商+维护者终端实测）、11-13（editor 体量与 editor.test.ts 4051 行按域分批）、19（IME 手动验收）
