@@ -36,6 +36,25 @@ async def test_build_file_list_fallback_pathspec(repo):
     assert "node_modules/junk.js" not in files and ".gitignore" in files
 
 
+async def test_build_file_list_fallback_sorted(tmp_path: Path):
+    # 乱序创建，验证非 git fallback walk 输出确定性排序（issue #3）——OS/文件系统
+    # 的 scandir 顺序不可依赖，输出必须与创建顺序无关，始终字典序。
+    for name in ["zeta.txt", "alpha.txt", "mu.txt", "beta.txt"]:
+        (tmp_path / name).touch()
+    files = await build_file_list(tmp_path)
+    assert files == sorted(files)
+    assert files == ["alpha.txt", "beta.txt", "mu.txt", "zeta.txt"]
+
+
+async def test_build_file_list_fallback_limit_honored(tmp_path: Path):
+    # caller limit 小于文件总数时，必须精确返回排序后的前 limit 个（issue #3）。
+    names = [f"file{i:02d}.txt" for i in range(12)]
+    for name in names:
+        (tmp_path / name).touch()
+    files = await build_file_list(tmp_path, limit=10)
+    assert files == sorted(names)[:10]
+
+
 async def test_at_fuzzy_completion(repo):
     completer = PiCompleter(commands={})
     completer.file_list = await build_file_list(repo)
