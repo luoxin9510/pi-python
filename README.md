@@ -80,7 +80,7 @@ below.
 |---|---|
 | `/help` | List all registered commands with their descriptions |
 | `/model [id]` | No argument: show the current model. With an argument: switch the session's model to that litellm id |
-| `/clear` | Start a new session (new JSONL file); the old session's file is left on disk |
+| `/clear` | Start a new session (new JSONL file) that keeps the current model — any `/model` switch survives `/clear`; the old session's file is left on disk |
 | `/tree` | Render the session's entry tree (`rich.Tree`), highlighting the path to the current leaf and marking it with `←` |
 | `/branch <id-prefix>` | Branch to the entry whose id starts with the given prefix; errors on no match or an ambiguous (multi-match) prefix |
 | `/quit` | Quit (equivalent to Ctrl+D) |

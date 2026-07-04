@@ -65,6 +65,20 @@ async def test_clear_swaps_session(tmp_path):
     assert ctx.app.session.store.path != old.store.path
 
 
+async def test_clear_inherits_current_model(tmp_path, monkeypatch):
+    # /clear 曾闭包捕获启动时的 model，/model 切换后 /clear 会静默地把会话
+    # 拉回启动模型（issue #2）；期望语义是继承 /clear 发生时的当前模型。
+    monkeypatch.setattr("pipython.session_facade.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    app = await app_module._build_app(
+        "fake/model", tmp_path, client_factory=lambda _model: FakeClient(script=[])
+    )
+    ctx = CommandContext(console=Console(record=True, width=100), app=app)
+    reg = build_registry()
+    await dispatch(reg, ctx, "/model other/model")
+    await dispatch(reg, ctx, "/clear")
+    assert ctx.app.session.model == "other/model"
+
+
 async def test_quit_sets_flag(tmp_path):
     ctx = await make_ctx(tmp_path)
     await dispatch(build_registry(), ctx, "/quit")
