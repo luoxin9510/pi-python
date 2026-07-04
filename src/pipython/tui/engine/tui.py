@@ -251,11 +251,17 @@ class _OverlayEntry:
     index doesn't already have."""
 
     def __init__(
-        self, component: Component, pre_focus: Component | None, anchor_row: int | None
+        self,
+        component: Component,
+        pre_focus: Component | None,
+        anchor_row: int | None,
+        *,
+        non_capturing: bool = False,
     ) -> None:
         self.component = component
         self.pre_focus = pre_focus
         self.anchor_row = anchor_row
+        self.non_capturing = non_capturing
 
 
 class OverlayHandle:
@@ -387,23 +393,54 @@ class TUI:
 
     # -- overlay stack (tui.ts:509-580, 411-417) ----------------------------
 
-    def show_overlay(self, component: Component, *, anchor_row: int | None = None) -> OverlayHandle:
+    def show_overlay(
+        self,
+        component: Component,
+        *,
+        anchor_row: int | None = None,
+        non_capturing: bool = False,
+    ) -> OverlayHandle:
         """tui.ts:509-580 ``showOverlay``, narrowed to this port's simplified
-        signature (``anchor_row`` only — no ``OverlayOptions`` anchor
-        enum/margins/width/maxHeight/visible-callback/nonCapturing; see
-        module docstring). Records the currently-focused component as the
-        new entry's ``pre_focus`` *before* moving focus (tui.ts:512-517),
-        then steals focus via the existing ``set_focus`` (Task 7 contract:
-        reads/writes ``.focused``) and requests a render so the overlay
-        actually appears without the caller needing to call ``do_render()``
-        itself (tui.ts:518-519's ``terminal.hideCursor()``/
-        ``requestRender()`` — the immediate ``hideCursor()`` call is skipped
-        as a redundant nicety: this port's own ``_position_hardware_cursor``
-        already converges to the right hidden/shown state by the end of the
-        render ``request_render()`` triggers here)."""
-        entry = _OverlayEntry(component=component, pre_focus=self._focused, anchor_row=anchor_row)
+        signature (``anchor_row`` plus ``non_capturing`` only — no
+        ``OverlayOptions`` anchor enum/margins/width/maxHeight/
+        visible-callback; see module docstring). Records the
+        currently-focused component as the new entry's ``pre_focus``
+        *before* moving focus (tui.ts:512-517), then steals focus via the
+        existing ``set_focus`` (Task 7 contract: reads/writes ``.focused``)
+        and requests a render so the overlay actually appears without the
+        caller needing to call ``do_render()`` itself (tui.ts:518-519's
+        ``terminal.hideCursor()``/``requestRender()`` — the immediate
+        ``hideCursor()`` call is skipped as a redundant nicety: this port's
+        own ``_position_hardware_cursor`` already converges to the right
+        hidden/shown state by the end of the render ``request_render()``
+        triggers here).
+
+        Fix round 1 (Critical finding 1): ``non_capturing`` ports upstream's
+        ``OverlayOptions.nonCapturing`` (tui.ts:205-206 "If true, don't
+        capture keyboard focus when shown"; tui.ts:503 ``if
+        (!options?.nonCapturing && this.isOverlayVisible(entry)) {
+        this.setFocus(component); }``). When ``True``, ``show_overlay``
+        skips ``set_focus`` entirely — the caller's previously-focused
+        component (e.g. an ``Editor`` showing a passive autocomplete
+        ``SelectList`` overlay that has no ``handle_input`` of its own)
+        keeps focus and keeps receiving ``TUI.handle_input``. Without this,
+        focus silently steals onto a component with no ``handle_input`` at
+        all, and ``TUI.handle_input``'s ``getattr(component, "handle_input",
+        None)`` probe finds nothing to call — every subsequent keystroke
+        vanishes into a permanent no-op (the real production deadlock this
+        option exists to prevent; see ``tests/tui/engine/test_overlay_focus.py``'s
+        ``TestNonCapturingOverlay`` and ``editor.py``'s own
+        ``_apply_autocomplete_suggestions``, which now passes
+        ``non_capturing=True`` here)."""
+        entry = _OverlayEntry(
+            component=component,
+            pre_focus=self._focused,
+            anchor_row=anchor_row,
+            non_capturing=non_capturing,
+        )
         self._overlay_stack.append(entry)
-        self.set_focus(component)
+        if not non_capturing:
+            self.set_focus(component)
         self.request_render()
         return OverlayHandle(self, entry)
 

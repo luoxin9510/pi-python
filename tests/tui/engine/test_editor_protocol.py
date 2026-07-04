@@ -17,9 +17,9 @@ Required vs. optional split (editor-component.ts:11-74), and why only the
 required half is a *formal* Protocol member here:
 
 - **Required** (``getText``/``setText``/``handleInput``/``render``/
-  ``invalidate`` + the ``Focusable`` mixin's ``focused``) — ported 1:1 as
-  ``EditorComponent``'s six formal members below, and checked via
-  ``isinstance()`` against ``@runtime_checkable``.
+  ``invalidate``) — ported 1:1 as ``EditorComponent``'s five formal
+  members below, and checked via ``isinstance()`` against
+  ``@runtime_checkable``.
 - **Optional** (``onSubmit``/``onChange``/``addToHistory``/
   ``insertTextAtCursor``/``getExpandedText``/``setAutocompleteProvider``/
   ``borderColor``/``setPaddingX``/``setAutocompleteMaxVisible``) — **not**
@@ -32,12 +32,28 @@ required half is a *formal* Protocol member here:
   declared member as mandatory — so baking the optional hooks into the
   Protocol would make ``isinstance(minimal_editor, EditorComponent)``
   falsely reject a legitimate minimal implementation that only supports
-  the six required members. This file instead checks the optional hooks'
+  the five required members. This file instead checks the optional hooks'
   *presence on this port's concrete ``Editor``* via plain ``getattr``
   probing (matching the job description's "including optional hooks
   presence: insert_text_at_cursor/get_expanded_text/set_autocomplete_provider"
   instruction, and ``tui.py``'s own ``is_focusable``-style dynamic-probe
   convention), never via Protocol ``isinstance``.
+
+Fix round 1 (Important finding 4, correcting the original RED-phase
+docstring above): ``focused`` is **not**, and never was, part of
+upstream's ``EditorComponent`` — ``editor-component.ts:11 export interface
+EditorComponent extends Component`` extends only ``Component``
+(tui.ts:64-88), which has no ``focused`` field at all. ``Focusable``
+(tui.ts:104-107, this port's ``engine.tui.Focusable``) is a wholly
+separate interface upstream never mixes into ``EditorComponent`` — it is
+orthogonal, not a sixth required member. The original version of this file
+(and of ``editor_protocol.py`` itself) cited "the Focusable mixin's
+focused" as one of "the six formal members", which was a false citation:
+nothing in ``editor-component.ts`` ever requires it. GREEN's original
+implementation is corrected here to drop ``focused`` from
+``EditorComponent`` entirely, narrowing it to five required members; see
+``TestEditorComponentProtocolShape::test_focused_is_not_required_by_editor_component``
+and ``_MinimalEditorComponent``'s own updated docstring below.
 
 Naming note for GREEN (flag, do not silently "fix" by guessing): the
 brief's literal Protocol hook name is ``add_to_history`` (snake_case of
@@ -84,16 +100,27 @@ def tui(term: "RecordingTerm") -> TUI:
 
 
 class _MinimalEditorComponent:
-    """A from-scratch class satisfying only ``EditorComponent``'s six
-    *required* members — no ``Editor`` inheritance at all. Exists to prove
-    the Protocol is genuinely structural (per this repo's "一切皆可注入"
-    principle: any object shaped right satisfies it, not just this port's
-    own ``Editor``) and that the *optional* hooks are correctly excluded
-    from the ``isinstance()``-checked surface (see module docstring)."""
+    """A from-scratch class satisfying only ``EditorComponent``'s five
+    *required* members — no ``Editor`` inheritance at all, and deliberately
+    **no ``focused`` attribute either** (fix round 1, Important finding 4:
+    ``editor-component.ts:11 export interface EditorComponent extends
+    Component`` — ``Component`` itself, tui.ts:64-88, has no ``focused``
+    field at all; ``Focusable`` (tui.ts:104-107) is a wholly separate
+    interface upstream never mixes into ``EditorComponent``. The original
+    version of this fixture set ``self.focused = False`` and the module
+    docstring cited "the Focusable mixin's focused" as one of the six
+    "required" members — that citation was itself wrong: ``focused`` was
+    never part of ``EditorComponent`` upstream, so requiring it here was an
+    over-constraint with no upstream basis).
+
+    Exists to prove the Protocol is genuinely structural (per this repo's
+    "一切皆可注入" principle: any object shaped right satisfies it, not
+    just this port's own ``Editor``) and that the *optional* hooks (and,
+    as of this fix, ``focused``) are correctly excluded from the
+    ``isinstance()``-checked surface (see module docstring)."""
 
     def __init__(self) -> None:
         self._text = ""
-        self.focused = False
 
     def get_text(self) -> str:
         return self._text
@@ -114,11 +141,7 @@ class _MinimalEditorComponent:
 class _MissingHandleInput:
     """Same as ``_MinimalEditorComponent`` but missing ``handle_input`` —
     must NOT satisfy ``isinstance(..., EditorComponent)``, proving the
-    Protocol actually gates on all six required members rather than
-    silently passing anything with a ``focused`` attribute."""
-
-    def __init__(self) -> None:
-        self.focused = False
+    Protocol actually gates on all five required members."""
 
     def get_text(self) -> str:
         return ""
@@ -134,7 +157,7 @@ class _MissingHandleInput:
 
 
 class TestEditorComponentProtocolShape:
-    """The Protocol itself: runtime_checkable, six required members,
+    """The Protocol itself: runtime_checkable, five required members,
     structural (not nominal — no inheritance required)."""
 
     def test_editor_component_is_runtime_checkable(self) -> None:
@@ -154,7 +177,7 @@ class TestEditorComponentProtocolShape:
 
     def test_minimal_from_scratch_class_satisfies_editor_component(self) -> None:
         """Structural typing: a class with no relationship to ``Editor``
-        whatsoever, but the right six members, must satisfy the Protocol —
+        whatsoever, but the right five members, must satisfy the Protocol —
         this is the entire reason ``editor_protocol.py`` exists (per
         editor-component.ts's own stated purpose, quoted in the module
         docstring): so the app layer can accept *any* conforming editor,
@@ -164,9 +187,44 @@ class TestEditorComponentProtocolShape:
     def test_class_missing_a_required_member_does_not_satisfy_editor_component(self) -> None:
         """Negative control for the test above: dropping just
         ``handle_input`` must flip the isinstance check to False -
-        confirms the Protocol actually enforces all six required members
-        rather than e.g. only checking for ``focused``."""
+        confirms the Protocol actually enforces all five required members."""
         assert not isinstance(_MissingHandleInput(), EditorComponent)
+
+    def test_focused_is_not_required_by_editor_component(self) -> None:
+        """Fix round 1 (Important finding 4): ``editor-component.ts:11
+        export interface EditorComponent extends Component`` — ``Component``
+        (tui.ts:64-88) has no ``focused`` field; ``Focusable``
+        (tui.ts:104-107) is a separate interface upstream never mixes into
+        ``EditorComponent``. A minimal implementation with genuinely no
+        ``focused`` attribute at all — not even set to ``False`` — must
+        still satisfy ``isinstance(..., EditorComponent)``. Before this
+        fix, ``EditorComponent`` wrongly declared ``focused: bool`` as a
+        formal (``isinstance``-mandatory) Protocol member, which would
+        have rejected exactly this fixture."""
+        minimal = _MinimalEditorComponent()
+        assert not hasattr(minimal, "focused"), (
+            "test fixture bug: _MinimalEditorComponent should not define 'focused'"
+        )
+        assert isinstance(minimal, EditorComponent)
+
+    def test_editor_still_has_focused_via_its_own_focusable_implementation(self) -> None:
+        """``Focusable`` is orthogonal to, not part of, ``EditorComponent`` —
+        this port's concrete ``Editor`` still genuinely has a ``focused``
+        attribute (required by ``engine.tui.Focusable``/``is_focusable``,
+        which the real ``TUI.set_focus`` reads and writes), it's just no
+        longer gated through ``EditorComponent`` itself. Both facts hold at
+        once: an editor can lack ``focused`` and still satisfy
+        ``EditorComponent`` (test above), and this port's own ``Editor``
+        happens to have it anyway via a wholly separate contract."""
+        from pipython.tui.engine.tui import is_focusable
+
+        editor = Editor()
+        assert isinstance(editor, EditorComponent)
+        # `Focusable` (engine/tui.py) is not @runtime_checkable — it's
+        # probed structurally via `is_focusable`/`hasattr`, exactly like
+        # `tui.py`'s own set_focus does, never via isinstance.
+        assert is_focusable(editor)
+        assert hasattr(editor, "focused")
 
 
 class TestEditorSatisfiesEditorComponent:

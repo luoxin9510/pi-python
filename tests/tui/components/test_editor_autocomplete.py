@@ -109,6 +109,7 @@ mismatch is a translation error):
 from __future__ import annotations
 
 import asyncio
+import gc
 import re
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -228,6 +229,25 @@ def _make_tui() -> TUI:
     return TUI(RecordingTerm())
 
 
+def _make_wired_tui(editor: Editor) -> TUI:
+    """Fix round 1: a real ``TUI`` with ``editor`` set as *both* root and
+    focus, so a test can drive input through the actual production path
+    (``tui.handle_input``) instead of calling ``editor.handle_input``
+    directly. Before the Critical-1 fix (``show_overlay``'s
+    ``non_capturing`` option), routing through ``tui.handle_input`` while
+    an autocomplete overlay was open would silently no-op forever — every
+    test in ``TestAutocompleteViaTuiHandleInput`` below, and every
+    conversion of an existing ``TestAutocomplete``/``TestAutocompleteKeyRerouting``
+    case to this helper, is a real regression guard against that exact
+    deadlock reappearing (calling ``editor.handle_input`` directly, as
+    every pre-fix-round-1 test in this file did, bypasses ``TUI`` entirely
+    and so could never have caught it)."""
+    tui = TUI(RecordingTerm())
+    tui.set_root(editor)
+    tui.set_focus(editor)
+    return tui
+
+
 # =============================================================================
 # The 18 upstream `it()` blocks, editor.test.ts:2092-2822, ported 1:1.
 # =============================================================================
@@ -265,9 +285,15 @@ class TestAutocomplete:
         assert editor.text == "Work"
 
     async def test_shows_menu_when_force_file_has_multiple_suggestions(self) -> None:
-        """editor.test.ts:2134."""
-        tui = _make_tui()
+        """editor.test.ts:2134. Converted (fix round 1) to drive input
+        through ``tui.handle_input`` rather than ``editor.handle_input``
+        directly — see ``_make_wired_tui``'s docstring: this is a real
+        regression guard for the Critical-1 focus-stealing deadlock (before
+        the fix, ``tui.handle_input`` would have silently no-op'd the
+        moment the menu opened, since focus would have been stolen onto
+        the passive ``SelectList`` overlay)."""
         editor = Editor()
+        tui = _make_wired_tui(editor)
 
         async def get_suggestions(
             lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
@@ -286,15 +312,16 @@ class TestAutocomplete:
         editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
 
         for ch in "src":
-            editor.handle_input(ch)
+            tui.handle_input(ch)
         assert editor.text == "src"
 
-        editor.handle_input("\t")
+        tui.handle_input("\t")
         await flush_autocomplete()
         assert editor.text == "src"
         assert editor.is_showing_autocomplete() is True
+        assert editor.focused is True, "the editor must stay focused while the menu is open"
 
-        editor.handle_input("\t")
+        tui.handle_input("\t")
         assert editor.text == "src/"
         assert editor.is_showing_autocomplete() is False
 
@@ -896,9 +923,14 @@ class TestAutocompleteKeyRerouting:
         behavior: this port's ``SelectList`` has no ``handle_input`` of its
         own (task-10 deviation 3 — the editor calls ``move_down()``/
         ``move_up()`` directly), so this test also pins down that the
-        editor, not ``SelectList``, owns the key-to-movement translation."""
-        tui = _make_tui()
+        editor, not ``SelectList``, owns the key-to-movement translation.
+
+        Converted (fix round 1) to drive input through ``tui.handle_input``
+        — see ``_make_wired_tui``'s docstring: a real regression guard for
+        the Critical-1 focus-stealing deadlock (arrows navigating an open
+        menu is exactly the input that would have silently vanished)."""
         editor = Editor()
+        tui = _make_wired_tui(editor)
 
         async def get_suggestions(
             lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
@@ -913,13 +945,14 @@ class TestAutocompleteKeyRerouting:
 
         editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
 
-        editor.handle_input("\t")  # force-Tab: opens the menu, "one" highlighted
+        tui.handle_input("\t")  # force-Tab: opens the menu, "one" highlighted
         await flush_autocomplete()
         assert editor.is_showing_autocomplete() is True
+        assert editor.focused is True
 
-        editor.handle_input("\x1b[B")  # Down -> "two"
-        editor.handle_input("\x1b[B")  # Down -> "three"
-        editor.handle_input("\t")  # Tab applies whatever is now selected
+        tui.handle_input("\x1b[B")  # Down -> "two"
+        tui.handle_input("\x1b[B")  # Down -> "three"
+        tui.handle_input("\t")  # Tab applies whatever is now selected
 
         assert editor.text == "three"
         assert editor.is_showing_autocomplete() is False
@@ -928,9 +961,12 @@ class TestAutocompleteKeyRerouting:
         """``SelectList.move_up()`` wraps from index 0 to the last item
         (select-list.ts:115-118, ported per task-10). Pressing Up on a
         freshly-opened menu (selection at index 0) must reach the *last*
-        item, not clamp or no-op."""
-        tui = _make_tui()
+        item, not clamp or no-op.
+
+        Converted (fix round 1) to drive input through ``tui.handle_input``
+        — see ``_make_wired_tui``'s docstring."""
         editor = Editor()
+        tui = _make_wired_tui(editor)
 
         async def get_suggestions(
             lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
@@ -945,12 +981,12 @@ class TestAutocompleteKeyRerouting:
 
         editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
 
-        editor.handle_input("\t")
+        tui.handle_input("\t")
         await flush_autocomplete()
         assert editor.is_showing_autocomplete() is True
 
-        editor.handle_input("\x1b[A")  # Up from index 0 wraps to the last item
-        editor.handle_input("\t")
+        tui.handle_input("\x1b[A")  # Up from index 0 wraps to the last item
+        tui.handle_input("\t")
 
         assert editor.text == "three"
 
@@ -958,9 +994,14 @@ class TestAutocompleteKeyRerouting:
         """Distinct from ported test 10 (backspacing a slash command to
         empty incidentally hides the menu) — this is a direct Esc-cancel
         on an otherwise-untouched buffer: editor.ts:654-657's
-        ``tui.select.cancel`` reroute inside the "menu open" guard."""
-        tui = _make_tui()
+        ``tui.select.cancel`` reroute inside the "menu open" guard.
+
+        Converted (fix round 1) to drive input through ``tui.handle_input``
+        — see ``_make_wired_tui``'s docstring: Escape closing the menu is
+        exactly the input path that used to deadlock once focus had been
+        (wrongly) stolen onto the overlay."""
         editor = Editor()
+        tui = _make_wired_tui(editor)
 
         async def get_suggestions(
             lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
@@ -974,13 +1015,15 @@ class TestAutocompleteKeyRerouting:
 
         editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
 
-        editor.handle_input("\t")
+        tui.handle_input("\t")
         await flush_autocomplete()
         assert editor.is_showing_autocomplete() is True
+        assert editor.focused is True
 
-        editor.handle_input("\x1b")  # Escape
+        tui.handle_input("\x1b")  # Escape
         assert editor.is_showing_autocomplete() is False
         assert editor.text == ""
+        assert editor.focused is True, "closing the menu must leave the editor focused"
 
     async def test_apply_completion_writes_back_cursor_exactly(self) -> None:
         """None of the 18 ported cases assert ``editor.cursor`` after an
@@ -1193,6 +1236,190 @@ class TestAutocompleteKeyRerouting:
         assert item.description is None
 
 
+class TestAutocompleteViaTuiHandleInput:
+    """Fix round 1 (Critical finding 1) — RED-first regression coverage
+    driving every step of the autocomplete lifecycle through
+    ``tui.handle_input`` (the *real* production input path — a real
+    ``TUI``'s own ``handle_input`` forwards to whatever it currently
+    considers focused), never ``editor.handle_input`` directly.
+
+    Before the fix, ``tui.show_overlay`` unconditionally stole TUI-level
+    focus onto the autocomplete ``SelectList`` overlay the moment the menu
+    opened. ``SelectList`` has no ``handle_input`` of its own (task-10
+    deviation 3), so ``TUI.handle_input``'s ``getattr(component,
+    "handle_input", None)`` probe found nothing callable and silently
+    no-op'd — forever, since nothing ever moved focus back. Every one of
+    the tests below (open the menu, assert the editor is still the
+    focused component, navigate, apply, escape, and type through) fails
+    at the ``assert editor.focused is True`` step (or hangs/no-ops on the
+    next keystroke) against the pre-fix code, and is the reason none of
+    the many pre-existing ``editor.handle_input``-driven tests in this
+    file ever caught the bug: they bypass ``TUI`` entirely."""
+
+    async def test_open_menu_via_tui_handle_input_keeps_editor_focused(self) -> None:
+        term = RecordingTerm()
+        tui = TUI(term)
+        editor = Editor()
+        tui.set_root(editor)
+        tui.set_focus(editor)
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            if not force:
+                return [], ""
+            return [
+                AutocompleteItem(value="alpha", label="alpha"),
+                AutocompleteItem(value="beta", label="beta"),
+            ], ""
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        tui.handle_input("\t")  # force-Tab, routed through the real TUI
+        await flush_autocomplete()
+
+        assert editor.is_showing_autocomplete() is True
+        assert editor.focused is True, (
+            "opening the autocomplete overlay must not steal focus from the editor"
+        )
+
+        tui.do_render()
+        screen_text = "\n".join(term.screen())
+        assert "alpha" in screen_text
+        assert "beta" in screen_text
+
+    async def test_escape_via_tui_handle_input_closes_menu_and_editor_stays_focused(self) -> None:
+        editor = Editor()
+        tui = _make_wired_tui(editor)
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            if not force:
+                return [], ""
+            return [
+                AutocompleteItem(value="alpha", label="alpha"),
+                AutocompleteItem(value="beta", label="beta"),
+            ], ""
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        tui.handle_input("\t")
+        await flush_autocomplete()
+        assert editor.is_showing_autocomplete() is True
+
+        tui.handle_input("\x1b")  # Escape, via tui.handle_input
+        assert editor.is_showing_autocomplete() is False
+        assert editor.focused is True
+
+    async def test_arrows_via_tui_handle_input_navigate_the_menu(self) -> None:
+        editor = Editor()
+        tui = _make_wired_tui(editor)
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            if not force:
+                return [], ""
+            return [
+                AutocompleteItem(value="one", label="one"),
+                AutocompleteItem(value="two", label="two"),
+                AutocompleteItem(value="three", label="three"),
+            ], ""
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        tui.handle_input("\t")
+        await flush_autocomplete()
+        assert editor.is_showing_autocomplete() is True
+
+        tui.handle_input("\x1b[B")  # Down -> "two"
+        tui.handle_input("\x1b[B")  # Down -> "three"
+        tui.handle_input("\x1b[A")  # Up -> "two"
+        tui.handle_input("\t")  # Apply whatever is currently selected
+
+        assert editor.text == "two"
+        assert editor.is_showing_autocomplete() is False
+
+    async def test_enter_via_tui_handle_input_applies_selection(self) -> None:
+        editor = Editor()
+        tui = _make_wired_tui(editor)
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            if not force:
+                return [], ""
+            return [
+                AutocompleteItem(value="one", label="one"),
+                AutocompleteItem(value="two", label="two"),
+            ], ""
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        tui.handle_input("\t")
+        await flush_autocomplete()
+        assert editor.is_showing_autocomplete() is True
+
+        tui.handle_input("\x1b[B")  # Down -> "two"
+        tui.handle_input("\r")  # Enter applies the highlighted item
+
+        assert editor.text == "two"
+        assert editor.is_showing_autocomplete() is False
+
+    async def test_typing_via_tui_handle_input_requeries_the_menu(self) -> None:
+        """editor.ts:1109-1139's "update or re-trigger autocomplete on
+        further typing" path, driven through the real TUI: typing more
+        characters while the menu is open must re-query the provider (not
+        merely append to the buffer with a stale, unfiltered menu still
+        showing) — and every one of these keystrokes has to actually reach
+        the editor, which is exactly what a focus-stealing overlay would
+        prevent."""
+        editor = Editor()
+        tui = _make_wired_tui(editor)
+        query_log: list[str] = []
+
+        all_files = [
+            AutocompleteItem(value="readme.md", label="readme.md"),
+            AutocompleteItem(value="requirements.txt", label="requirements.txt"),
+            AutocompleteItem(value="src/", label="src/"),
+        ]
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            text = lines[0] if lines else ""
+            prefix = text[:cursor_col]
+            should_match = force or prefix.startswith(".") or True
+            query_log.append(prefix)
+            if not should_match:
+                return [], ""
+            filtered = [f for f in all_files if f.value.startswith(prefix)]
+            return (filtered, prefix) if filtered else ([], "")
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        tui.handle_input("\t")  # force-Tab: opens the menu unfiltered
+        await flush_autocomplete()
+        assert editor.is_showing_autocomplete() is True
+        calls_after_open = len(query_log)
+
+        tui.handle_input("r")
+        await flush_autocomplete()
+        assert editor.text == "r"
+        assert editor.is_showing_autocomplete() is True
+        assert len(query_log) > calls_after_open, "typing through tui.handle_input must re-query"
+
+        tui.handle_input("e")
+        await flush_autocomplete()
+        assert editor.text == "re"
+        assert editor.is_showing_autocomplete() is True
+
+        tui.handle_input("\t")  # applies "readme.md" (the only remaining match)
+        assert editor.text == "readme.md"
+        assert editor.is_showing_autocomplete() is False
+
+
 class TestAutocompleteOverlayIntegration:
     """task-13-brief.md: "触发时 tui.show_overlay(SelectList(...))" — real
     TUI + RecordingTerm, asserting menu visibility/content via ``screen()``
@@ -1306,17 +1533,35 @@ class TestAutocompleteOverlayIntegration:
         tui.do_render()
         assert "beta.txt" not in "\n".join(term.screen())
 
-    async def test_overlay_steals_focus_and_escape_restores_it(self) -> None:
-        """Per the brief, autocomplete's menu goes through
-        ``tui.show_overlay`` (task-8's already-implemented, already-tested
-        overlay stack — see ``tests/tui/engine/test_overlay_focus.py``).
-        ``show_overlay`` always steals TUI-level focus from whatever was
-        focused before (``tui.py``'s ``show_overlay``/``set_focus``), and
-        ``OverlayHandle.close()`` always restores it. Since the brief
-        mandates this exact mechanism (not an inline-rendered list the way
-        upstream's own Editor does it), this focus-steal/restore is a
-        forced consequence of tui.py's existing, tested behavior — not a
-        GREEN implementation choice."""
+    async def test_overlay_does_not_steal_focus_and_editor_keeps_handling_input(self) -> None:
+        """Fix round 1 (Critical finding 1) supersedes this test's original
+        premise. The original version of this test asserted
+        ``editor.focused is False`` while the menu was open, reasoning that
+        ``tui.show_overlay`` "always steals TUI-level focus... this
+        focus-steal/restore is a forced consequence of tui.py's existing,
+        tested behavior — not a GREEN implementation choice." That reasoning
+        was itself the bug: with focus stolen onto the passive
+        ``SelectList`` overlay (which has no ``handle_input`` of its own),
+        ``tui.handle_input`` forwards every subsequent keystroke to a
+        component that cannot do anything with it — a real, permanent input
+        deadlock in production the moment autocomplete opened, wholly
+        invisible to every pre-fix-round-1 test in this file because they
+        all drove input through ``editor.handle_input`` directly, bypassing
+        ``tui.handle_input``'s focus dispatch entirely.
+
+        Upstream itself never has this problem: its own ``autocompleteList``
+        renders inline as part of the (always-focused) ``Editor``'s own
+        component tree (editor.ts:578-581) — it is never a ``tui.show_overlay``
+        overlay at all, so there is no separate "who has TUI focus" question
+        to get wrong. This port's own choice to route the menu through
+        ``tui.show_overlay`` (module docstring deviation 10) needs the
+        equivalent of upstream's ``OverlayOptions.nonCapturing``
+        (tui.ts:205-206) to reproduce that same "the editor is always the
+        one actually handling input" invariant — which is exactly what
+        ``show_overlay(..., non_capturing=True)`` now provides (see
+        ``tui.py``'s ``show_overlay`` docstring and
+        ``tests/tui/engine/test_overlay_focus.py``'s
+        ``TestNonCapturingOverlay``)."""
         term = RecordingTerm()
         tui = TUI(term)
         editor = Editor()
@@ -1336,13 +1581,312 @@ class TestAutocompleteOverlayIntegration:
 
         editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
 
-        editor.handle_input("\t")
+        tui.handle_input("\t")
         await flush_autocomplete()
         assert editor.is_showing_autocomplete() is True
-        assert editor.focused is False, (
-            "tui.show_overlay steals focus from the editor while the menu is open"
+        assert editor.focused is True, (
+            "the editor must keep TUI-level focus while its own autocomplete "
+            "overlay is showing — a non-capturing overlay, per the fix"
         )
 
-        editor.handle_input("\x1b")  # Escape
+        # The real regression check: tui.handle_input must still actually
+        # reach the editor while the menu is open (this is what a stolen-
+        # focus deadlock would break) — navigate, then close via Escape.
+        tui.handle_input("\x1b[B")  # Down -> "two"
+        tui.handle_input("\x1b")  # Escape
         assert editor.is_showing_autocomplete() is False
-        assert editor.focused is True, "closing the overlay must restore the editor's focus"
+        assert editor.focused is True, "the editor was never unfocused, so it stays focused"
+        assert editor.text == "", "Escape must not have applied the selection"
+
+        # And the editor must still be genuinely receiving input afterward.
+        tui.handle_input("x")
+        assert editor.text == "x"
+
+
+class TestAutocompleteStalenessGuard:
+    """Important finding 2 (fix round 1): port upstream's
+    ``isAutocompleteRequestCurrent`` (editor.ts:2250-2264). A resolved
+    autocomplete request must be discarded unless *both* the cancel token
+    matches *and* the buffer's text/cursor are unchanged from the snapshot
+    taken right before the (possibly slow) ``get_suggestions`` call — not
+    just the token. The pre-fix code only checked the token
+    (``if my_token != self._autocomplete_current_token: return``), so a
+    keystroke that doesn't happen to match any trigger condition (and so
+    never bumps the token) can still change the buffer while a request is
+    in flight — the reviewer's concrete scenario: typing "src", pressing
+    force-Tab (a slow provider starts resolving suggestions for "src"),
+    then typing a non-trigger character ("!", which matches none of the
+    default trigger/slash/word-char conditions) *before* the provider
+    resolves. Without the text/cursor re-check, the stale "src" completion
+    still gets applied once the provider finally resolves — but against
+    the *current* buffer/cursor ("src!"), corrupting it: with only 1 char
+    difference between prefix length (3) and the live cursor (4), the
+    generic ``apply_completion`` prefix-strip helper used throughout this
+    file computes ``before = line[: cursor_col - len(prefix)]`` = ``"s"``
+    (one char of "src!", not the full "src") and ``after = line[cursor_col:]``
+    = ``""``, yielding ``"s" + "src/" + "" == "ssrc/"`` — a real,
+    reproducible data-corruption bug, not a hypothetical one."""
+
+    async def test_stale_result_discarded_when_non_trigger_keystroke_changes_text_before_resolve(
+        self,
+    ) -> None:
+        tui = _make_tui()
+        editor = Editor()
+        resolve_event = asyncio.Event()
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            if not force:
+                return [], ""
+            text = lines[0] if lines else ""
+            prefix = text[:cursor_col]
+            await resolve_event.wait()
+            return [AutocompleteItem(value="src/", label="src/")], prefix
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        for ch in "src":
+            editor.handle_input(ch)
+        assert editor.text == "src"
+
+        editor.handle_input("\t")  # force-Tab: starts the slow request for "src"
+        await asyncio.sleep(0)  # let the task start and reach `await resolve_event.wait()`
+
+        # "!" matches none of the default trigger characters ("@#"), the
+        # slash-command-context check, or the word-char trigger pattern —
+        # so it does NOT bump the cancel token, yet it does change the text
+        # the in-flight request's eventual result would get applied against.
+        editor.handle_input("!")
+        assert editor.text == "src!"
+
+        resolve_event.set()
+        await flush_autocomplete()
+
+        assert editor.text == "src!", (
+            "the stale 'src' completion must be discarded, not applied onto "
+            "the now-different 'src!' buffer (the 'ssrc/'-style corruption "
+            "this staleness guard exists to prevent)"
+        )
+        assert editor.is_showing_autocomplete() is False
+
+    async def test_stale_result_discarded_when_cursor_moves_before_resolve(self) -> None:
+        """Same guard, but the text stays identical and only the *cursor*
+        moves before the slow request resolves — upstream's
+        ``isAutocompleteRequestCurrent`` checks cursor line/col in addition
+        to (not instead of) the text, so this must be independently
+        effective even when ``getText()`` alone wouldn't have caught it."""
+        tui = _make_tui()
+        editor = Editor()
+        resolve_event = asyncio.Event()
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            if not force:
+                return [], ""
+            await resolve_event.wait()
+            return [AutocompleteItem(value="X", label="X")], ""
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+        editor.set_text("ab")
+        editor.handle_input("\x01")  # Ctrl+A - start of line
+        for _ in range(2):
+            editor.handle_input("\x1b[C")  # Right, right -> cursor at (0, 2)
+        assert editor.cursor == (0, 2)
+
+        editor.handle_input("\t")  # force-Tab: slow request snapshotting cursor (0, 2)
+        await asyncio.sleep(0)
+
+        editor.handle_input("\x1b[D")  # Left: cursor moves to (0, 1), text unchanged
+        assert editor.text == "ab"
+        assert editor.cursor == (0, 1)
+
+        resolve_event.set()
+        await flush_autocomplete()
+
+        assert editor.text == "ab", "a cursor-only change must also invalidate the stale result"
+        assert editor.is_showing_autocomplete() is False
+
+
+class TestAutocompleteTaskLifecycle:
+    """Important finding 3 (fix round 1): ``_autocomplete_task`` is a real
+    ``asyncio.Task`` (unlike upstream's fire-and-forget ``Promise`` chain,
+    which has no equivalent concept of an unretrieved exception or a
+    process-visible pending-task count) — a provider's own exception must
+    not leak as an unhandled "Task exception was never retrieved" warning,
+    and a request the user has fully abandoned (closed the menu / cleared
+    the buffer) must not keep running forever in the background."""
+
+    async def test_provider_exception_does_not_crash_editor(self) -> None:
+        tui = _make_tui()
+        editor = Editor()
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            raise RuntimeError("boom")
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        editor.handle_input("\t")  # force-Tab: the provider raises while resolving
+        await flush_autocomplete()
+
+        # The editor must still be fully usable after a provider blew up.
+        assert editor.is_showing_autocomplete() is False
+        editor.handle_input("x")
+        assert editor.text == "x"
+
+    async def test_provider_exception_is_retrieved_not_left_unhandled(self) -> None:
+        """Distinct from the "doesn't crash" test above: a raising
+        provider's exception must be *retrieved* (e.g. via a done-callback),
+        not merely swallowed by the fact that nothing awaits the background
+        task directly. Proving the negative (no leaked "exception was never
+        retrieved" warning) requires the task to actually be garbage
+        collected with nothing left holding it — keeping ``editor`` alive
+        (as the "doesn't crash" test does, to prove continued usability)
+        would keep a strong reference to the task via
+        ``editor._autocomplete_task`` forever, so this test drops every
+        reference to ``editor`` itself and forces a collection instead."""
+        tui = _make_tui()
+        editor = Editor()
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            raise RuntimeError("boom")
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        unhandled: list[dict] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+        try:
+            editor.handle_input("\t")  # force-Tab: the provider raises while resolving
+            await flush_autocomplete()
+            del editor  # drop the only strong reference to the finished task
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        assert unhandled == [], f"provider exception leaked as unretrieved: {unhandled}"
+
+    async def test_clearing_text_cancels_still_pending_non_cooperative_task(self) -> None:
+        """A provider that never itself polls ``is_cancelled()`` at all is
+        still a legitimate implementation (the Protocol only says
+        ``is_cancelled`` *may* be consulted) — before this fix, such a
+        provider's request task would keep running/sleeping in the
+        background indefinitely once the user abandoned it (e.g. by
+        clearing the buffer), invisible to ``asyncio.all_tasks()`` until it
+        finally, coincidentally woke up on its own timer. ``set_text``
+        already calls ``_cancel_autocomplete()`` (unchanged); this test
+        pins down that doing so now also reclaims the task itself."""
+        tui = _make_tui()
+        editor = Editor()
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            await asyncio.sleep(10)  # deliberately never checks is_cancelled
+            return [AutocompleteItem(value="x", label="x")], ""
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        baseline = len(asyncio.all_tasks())
+        editor.handle_input("\t")  # force-Tab: starts the never-cooperating request
+        await asyncio.sleep(0)
+        assert len(asyncio.all_tasks()) == baseline + 1, "the request task must have started"
+
+        editor.set_text("")  # abandon autocomplete entirely
+        await asyncio.sleep(0)  # let the cancellation actually propagate
+
+        assert len(asyncio.all_tasks()) == baseline, (
+            "abandoning autocomplete must reclaim a still-pending request task "
+            "even when the provider itself never observes is_cancelled()"
+        )
+
+    async def test_escape_cancels_still_pending_requery_task_that_never_polls_is_cancelled(
+        self,
+    ) -> None:
+        """Same guarantee as above, but via the menu-open Escape path
+        (``tui.select.cancel`` reroute) rather than ``set_text`` — the more
+        common real-world "close the menu" trigger."""
+        tui = _make_tui()
+        editor = Editor()
+        calls = 0
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return [
+                    AutocompleteItem(value="one", label="one"),
+                    AutocompleteItem(value="two", label="two"),
+                ], ""
+            await asyncio.sleep(10)  # deliberately never checks is_cancelled
+            return [AutocompleteItem(value="one", label="one")], "o"
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        editor.handle_input("\t")  # force-Tab: resolves immediately, opens the menu
+        await flush_autocomplete()
+        assert editor.is_showing_autocomplete() is True
+
+        baseline = len(asyncio.all_tasks())
+        editor.handle_input("o")  # re-query while menu open: the never-cooperating request
+        await asyncio.sleep(0)
+        assert len(asyncio.all_tasks()) == baseline + 1
+
+        editor.handle_input("\x1b")  # Escape: close the menu
+        await asyncio.sleep(0)
+
+        assert len(asyncio.all_tasks()) == baseline, (
+            "Escape must reclaim the still-pending re-query task even though "
+            "this provider never itself calls is_cancelled()"
+        )
+
+    async def test_new_trigger_does_not_disrupt_cooperative_is_cancelled_polling(self) -> None:
+        """Guard-rail in the *other* direction: a well-behaved provider that
+        DOES cooperatively poll ``is_cancelled()`` must still observe it and
+        wind down on its own when superseded by a new keystroke — this
+        fix must not force-cancel a task that is actively mid-flight inside
+        a provider's own cooperative wait loop, which would race ahead of
+        its own next ``is_cancelled()`` check and terminate it via
+        ``CancelledError`` before it ever runs its own cleanup path (this
+        is exactly the existing, already-green
+        ``test_aborts_active_at_autocomplete_when_typing_continues`` case,
+        re-asserted here as an explicit lifecycle-policy pin)."""
+        tui = _make_tui()
+        editor = Editor()
+        aborts = 0
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            nonlocal aborts
+            for _ in range(400):
+                if is_cancelled():
+                    aborts += 1
+                    return [], ""
+                await asyncio.sleep(0.005)
+            return [AutocompleteItem(value="@main.ts", label="main.ts")], "@main"
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        editor.handle_input("@")
+        editor.handle_input("m")
+        editor.handle_input("a")
+        editor.handle_input("i")
+        await asyncio.sleep(0.25)
+        editor.handle_input("n")  # supersedes the in-flight cooperative request
+        await asyncio.sleep(0.05)
+
+        assert aborts == 1, (
+            "a cooperatively-cancelling provider must still get to run its own "
+            "abort path — this fix's task.cancel() must only fire on "
+            "cancel/close, never on an ordinary new-trigger supersede"
+        )

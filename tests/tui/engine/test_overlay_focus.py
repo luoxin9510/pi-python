@@ -307,6 +307,122 @@ class TestFocusChain:
         assert root.focused, "Root should regain focus when all overlays close"
 
 
+class TestNonCapturingOverlay:
+    """Fix round 1 (Critical finding 1, citing upstream tui.ts:171-207
+    ``OverlayOptions.nonCapturing`` / tui.ts:503 ``if (!options?.nonCapturing
+    && this.isOverlayVisible(entry)) { this.setFocus(component); }``):
+    ``show_overlay`` must support a way to display an overlay *without*
+    stealing TUI-level focus from whatever was focused before — the
+    mechanism Task 13's autocomplete overlay needs (its passive
+    ``SelectList`` has no ``handle_input`` of its own; the real upstream
+    editor never uses an overlay for its autocomplete list at all, so this
+    port's own choice to route it through ``show_overlay`` — module
+    docstring deviation 10 in ``editor.py`` — needs this port's own
+    equivalent of ``nonCapturing`` to avoid a real deadlock: with focus
+    silently stolen onto a component with no ``handle_input``,
+    ``TUI.handle_input`` forwards every subsequent keystroke nowhere at
+    all, forever)."""
+
+    def test_non_capturing_overlay_does_not_steal_focus(
+        self, term: RecordingTerm, tui: TUI
+    ) -> None:
+        main = FocusableComponent(["main content"], has_cursor=True)
+        tui.set_focus(main)
+        tui.set_root(main)
+        tui.do_render()
+
+        overlay = FocusableComponent(["overlay content"], has_cursor=True)
+        tui.show_overlay(overlay, anchor_row=0, non_capturing=True)
+
+        assert main.focused, "main must keep focus — a non-capturing overlay must not steal it"
+        assert not overlay.focused, "a non-capturing overlay never receives focus at all"
+
+    def test_non_capturing_overlay_still_composites_onto_screen(
+        self, term: RecordingTerm, tui: TUI
+    ) -> None:
+        """Losing focus-stealing must not lose rendering — the overlay
+        still needs to actually appear on screen, just without owning
+        keyboard input."""
+        main = StaticComponent(["main line 1", "main line 2"])
+        tui.set_root(main)
+        tui.do_render()
+
+        overlay = StaticComponent(["overlay content"])
+        tui.show_overlay(overlay, anchor_row=1, non_capturing=True)
+        tui.do_render()
+
+        full_text = "".join(term.screen())
+        assert "overlay content" in full_text
+        assert "main line 1" in full_text
+
+    def test_handle_input_still_reaches_main_while_non_capturing_overlay_open(
+        self, term: RecordingTerm, tui: TUI
+    ) -> None:
+        """The actual production bug this fix closes: with focus stolen
+        onto an overlay that has no ``handle_input`` at all,
+        ``TUI.handle_input`` silently no-ops forever — every keystroke
+        after the overlay opens vanishes, deadlocking real input. A
+        non-capturing overlay must leave ``tui.handle_input`` routing to
+        whatever was already focused, completely unaffected by the
+        overlay's own presence."""
+
+        class InputCapturingComponent(FocusableComponent):
+            def __init__(self, lines: list[str]) -> None:
+                super().__init__(lines)
+                self.received: list[str] = []
+
+            def handle_input(self, data: str) -> None:
+                self.received.append(data)
+
+        main = InputCapturingComponent(["main content"])
+        tui.set_focus(main)
+        tui.set_root(main)
+        tui.do_render()
+
+        # An overlay with NO handle_input at all (like SelectList) — this
+        # is exactly the shape that deadlocks tui.handle_input if focus is
+        # stolen onto it.
+        overlay = StaticComponent(["overlay content"])
+        tui.show_overlay(overlay, anchor_row=0, non_capturing=True)
+
+        tui.handle_input("x")
+        assert main.received == ["x"], (
+            "tui.handle_input must still reach main — a non-capturing "
+            "overlay must never intercept focus/input routing"
+        )
+
+    def test_closing_non_capturing_overlay_does_not_disturb_focus(
+        self, term: RecordingTerm, tui: TUI
+    ) -> None:
+        main = FocusableComponent(["main content"], has_cursor=True)
+        tui.set_focus(main)
+        tui.set_root(main)
+        tui.do_render()
+
+        overlay = FocusableComponent(["overlay content"], has_cursor=True)
+        handle = tui.show_overlay(overlay, anchor_row=0, non_capturing=True)
+        assert main.focused
+
+        handle.close()
+        assert main.focused, "closing a non-capturing overlay must not touch focus at all"
+        assert not overlay.focused
+
+    def test_capturing_is_still_the_default(self, term: RecordingTerm, tui: TUI) -> None:
+        """Backward compatibility: omitting ``non_capturing`` entirely must
+        preserve every existing capturing-overlay test in this file
+        (``TestFocusChain`` above) — the default must remain ``False``."""
+        main = FocusableComponent(["main content"], has_cursor=True)
+        tui.set_focus(main)
+        tui.set_root(main)
+        tui.do_render()
+
+        overlay = FocusableComponent(["overlay content"], has_cursor=True)
+        tui.show_overlay(overlay, anchor_row=0)
+
+        assert overlay.focused, "default show_overlay behavior must still steal focus"
+        assert not main.focused
+
+
 class TestOverlayAnchor:
     """Overlay anchor positioning."""
 

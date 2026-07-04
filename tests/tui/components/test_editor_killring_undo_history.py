@@ -943,7 +943,7 @@ class TestUndo:
             editor.handle_input("\x1b[C")  # Move right 5 (after "hello", before space)
 
         # Programmatic insertion (e.g., clipboard image path)
-        editor.insert_text_at_cursor("/tmp/image.png")  # pyright: ignore[reportAttributeAccessIssue]
+        editor.insert_text_at_cursor("/tmp/image.png")
         assert editor.text == "hello/tmp/image.png world"
 
         # Single undo should restore entire pre-insert state
@@ -964,7 +964,7 @@ class TestUndo:
             editor.handle_input("\x1b[C")  # Move right 5 (after "hello", before space)
 
         # Insert multiline text
-        editor.insert_text_at_cursor("line1\nline2\nline3")  # pyright: ignore[reportAttributeAccessIssue]
+        editor.insert_text_at_cursor("line1\nline2\nline3")
         assert editor.text == "helloline1\nline2\nline3 world"
 
         # Cursor should be at end of inserted text (after "line3", before " world")
@@ -983,14 +983,14 @@ class TestUndo:
         editor.set_text("")
 
         # Insert text with CRLF
-        editor.insert_text_at_cursor("a\r\nb\r\nc")  # pyright: ignore[reportAttributeAccessIssue]
+        editor.insert_text_at_cursor("a\r\nb\r\nc")
         assert editor.text == "a\nb\nc"
 
         editor.handle_input("\x1b[45;5u")  # Undo
         assert editor.text == ""
 
         # Insert text with CR only
-        editor.insert_text_at_cursor("x\ry\rz")  # pyright: ignore[reportAttributeAccessIssue]
+        editor.insert_text_at_cursor("x\ry\rz")
         assert editor.text == "x\ny\nz"
 
     def test_undoes_set_text_to_empty_string(self):

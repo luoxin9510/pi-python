@@ -245,6 +245,46 @@ Task-13 deviations (10+, continuing the numbering above):
     itself is still consumed either way, exactly like upstream. No
     pre-task-13 test exercised literal Tab-as-character insertion (verified
     by search), so this is a behavior *addition*, not a regression.
+
+Fix round 1 (post-task-13 review, four findings — see
+``.superpowers/sdd/task-13-report.md``'s "Fix round 1" section for the full
+RED->GREEN account):
+
+- **Critical: the autocomplete overlay deadlocked the real
+  ``tui.handle_input`` path.** ``_apply_autocomplete_suggestions`` now
+  calls ``tui.show_overlay(self._autocomplete_list, non_capturing=True)``
+  (``engine/tui.py``'s new ``non_capturing`` parameter, porting upstream's
+  ``OverlayOptions.nonCapturing``, tui.ts:205-206/503) instead of letting
+  ``show_overlay`` steal TUI-level focus onto the passive ``SelectList``
+  (which has no ``handle_input`` of its own). Before this fix, every
+  keystroke after the menu opened reached ``TUI.handle_input``, which
+  forwarded to the (now-focused) ``SelectList``, found no callable
+  ``handle_input`` there, and silently no-op'd — forever. This was
+  invisible to every pre-fix-round-1 autocomplete test because they all
+  drove input through ``editor.handle_input`` directly, bypassing
+  ``TUI``'s focus dispatch entirely; see
+  ``tests/tui/components/test_editor_autocomplete.py``'s new
+  ``TestAutocompleteViaTuiHandleInput`` class.
+- **``_run_autocomplete_request`` now re-validates staleness on text
+  *and* cursor, not just the cancel token** (``_is_autocomplete_request_current``,
+  porting upstream's ``isAutocompleteRequestCurrent``, editor.ts:
+  2250-2264). A keystroke that matches no trigger condition never bumps
+  the token, yet can still change the buffer while a request is in
+  flight — without this, a stale result could get applied against
+  whatever the buffer/cursor happen to be *now*, corrupting it (see
+  ``TestAutocompleteStalenessGuard``).
+- **``_autocomplete_task`` lifecycle**: every created task now gets a
+  done-callback (``_on_autocomplete_task_done``) that retrieves — never
+  re-raises — its outcome, so a provider's own exception can never surface
+  as an unhandled "Task exception was never retrieved" warning.
+  ``_cancel_autocomplete`` now also forcibly reclaims
+  (``_cancel_autocomplete_task``) any still-pending task, so a provider
+  that never itself polls ``is_cancelled()`` doesn't keep running forever
+  after the user abandons autocomplete entirely. Deliberately **not**
+  applied to an ordinary re-trigger in ``_request_autocomplete`` — see
+  that method's own docstring for the specific existing-test conflict this
+  would otherwise cause with the cooperative ``is_cancelled()`` polling
+  contract.
 """
 
 from __future__ import annotations
@@ -2005,7 +2045,32 @@ class Editor:
         10). Bumps the cancel token first (invalidating any prior pending/
         in-flight request — see module docstring), then either debounces
         via a real (bounded) ``asyncio.sleep`` or starts the request task
-        immediately."""
+        immediately.
+
+        Fix round 1 (Important finding 3, task lifecycle): every task
+        created here gets a done-callback (``_on_autocomplete_task_done``)
+        so a provider's own exception is always retrieved, never left for
+        Python to report as an unhandled "Task exception was never
+        retrieved" warning at some arbitrary later point. Deliberately does
+        **not** also forcibly ``task.cancel()`` the *previous* task here on
+        an ordinary re-trigger (unlike ``_cancel_autocomplete``, which
+        does) — the previous task is already invalidated cooperatively via
+        the token bump above plus the ``is_cancelled()`` check inside
+        ``_run_autocomplete_request``/the provider's own polling (matching
+        upstream's ``AbortController`` signal, which is likewise advisory,
+        never forcible — JS has no way to forcibly interrupt a pending
+        ``await`` at all). Forcibly cancelling it here instead would race
+        ahead of a well-behaved provider's own next ``is_cancelled()`` poll
+        and terminate it via injected ``CancelledError`` before it ever
+        reaches that check — verified to break
+        ``test_aborts_active_at_autocomplete_when_typing_continues``
+        (``tests/tui/components/test_editor_autocomplete.py``), which
+        asserts the provider's own cooperative-abort counter actually ran,
+        not merely that *something* stopped the request. See
+        ``_cancel_autocomplete_task``'s own docstring for why forcing
+        cancellation is instead reserved for definitive abandonment points
+        (menu close/cancel), where nothing further ever inspects the old
+        task's outcome."""
         if self._autocomplete_provider is None:
             return
 
@@ -2020,7 +2085,45 @@ class Editor:
                 return  # superseded while debouncing
             await self._run_autocomplete_request(my_token, force=force, explicit_tab=explicit_tab)
 
-        self._autocomplete_task = asyncio.ensure_future(_run())
+        task = asyncio.ensure_future(_run())
+        task.add_done_callback(self._on_autocomplete_task_done)
+        self._autocomplete_task = task
+
+    def _cancel_autocomplete_task(self) -> None:
+        """Fix round 1 (Important finding 3, task lifecycle): forcibly
+        reclaim any still-pending autocomplete request task when
+        abandoning autocomplete entirely (``_cancel_autocomplete`` —
+        Escape/``tui.select.cancel``, apply-then-close, backspace-to-empty,
+        ``set_text``, submit, paste, provider swap). Safe here in a way it
+        would not be from an ordinary re-trigger (see
+        ``_request_autocomplete``'s docstring): by the time autocomplete is
+        being torn down completely, nothing further ever inspects this
+        task's own outcome, so pre-empting a provider that never itself
+        checks ``is_cancelled()`` (a legitimate, if less-cooperative,
+        implementation) is a strict improvement — without this, such a
+        provider's task would otherwise keep running (e.g. sleeping)
+        indefinitely in the background even after the user has already
+        moved on."""
+        task = self._autocomplete_task
+        self._autocomplete_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _on_autocomplete_task_done(self, task: asyncio.Task[None]) -> None:
+        """Fix round 1 (Important finding 3): retrieve — but never
+        re-raise — the task's outcome, so neither a provider's own
+        exception nor this editor's own forced cancellation
+        (``_cancel_autocomplete_task``) ever surfaces as an unhandled
+        "Task exception was never retrieved" warning at some arbitrary
+        later point (e.g. garbage collection). This is a fire-and-forget
+        background task by design (module docstring's single-token model);
+        anything relevant about its outcome was already fully consumed —
+        if it ran to completion — by the checks inside
+        ``_run_autocomplete_request``/``_is_autocomplete_request_current``
+        before this callback ever runs."""
+        if task.cancelled():
+            return
+        task.exception()
 
     async def _run_autocomplete_request(
         self, token: int, *, force: bool, explicit_tab: bool
@@ -2028,10 +2131,28 @@ class Editor:
         """editor.ts:2152-2248 ``startAutocompleteRequest`` +
         ``runAutocompleteRequest``, collapsed into one coroutine (this
         port's single-token design needs no separate
-        ``autocompleteRequestTask`` promise-chain — see module docstring)."""
+        ``autocompleteRequestTask`` promise-chain — see module docstring).
+
+        Fix round 1 (Important finding 2): snapshots ``text``/cursor
+        *before* awaiting the (possibly slow) ``get_suggestions`` call, and
+        requires both the token *and* that snapshot to still match once it
+        resolves (``_is_autocomplete_request_current``, porting upstream's
+        ``isAutocompleteRequestCurrent``, editor.ts:2250-2264) — not just
+        the token. A keystroke that doesn't happen to match any trigger
+        condition never bumps the token, yet can still change the buffer
+        while a request is in flight; without this extra check, a stale
+        result would still get applied against whatever the buffer/cursor
+        happen to be *now*, corrupting it (see
+        ``TestAutocompleteStalenessGuard`` in
+        ``tests/tui/components/test_editor_autocomplete.py`` for the
+        concrete reproduction)."""
         provider = self._autocomplete_provider
         if provider is None:
             return
+
+        snapshot_text = self.text
+        snapshot_line = self._cursor_line
+        snapshot_col = self._cursor_col
 
         def is_cancelled() -> bool:
             return token != self._autocomplete_current_token
@@ -2040,8 +2161,10 @@ class Editor:
             self._lines, self._cursor_line, self._cursor_col, force=force, is_cancelled=is_cancelled
         )
 
-        if token != self._autocomplete_current_token:
-            return  # superseded while awaiting
+        if not self._is_autocomplete_request_current(
+            token, snapshot_text, snapshot_line, snapshot_col
+        ):
+            return  # superseded, or the buffer/cursor moved on, while awaiting
 
         if not isinstance(items, list) or not items:
             self._cancel_autocomplete()
@@ -2067,6 +2190,26 @@ class Editor:
         if self._tui is not None:
             self._tui.request_render()
 
+    def _is_autocomplete_request_current(
+        self, token: int, snapshot_text: str, snapshot_line: int, snapshot_col: int
+    ) -> bool:
+        """Fix round 1 (Important finding 2): ports upstream's
+        ``isAutocompleteRequestCurrent`` (editor.ts:2250-2264). ``True``
+        only if the cancel token is unchanged *and* the buffer's text and
+        cursor are exactly what they were when the snapshot was taken
+        (right before the — possibly slow — ``get_suggestions`` call), not
+        just the token: a keystroke can change the buffer without bumping
+        the token at all (e.g. a character that matches none of the
+        trigger/slash/debounce conditions), so the token check alone is
+        not sufficient to catch every case where applying a stale result
+        would corrupt the buffer."""
+        return (
+            token == self._autocomplete_current_token
+            and self.text == snapshot_text
+            and self._cursor_line == snapshot_line
+            and self._cursor_col == snapshot_col
+        )
+
     def _apply_autocomplete_suggestions(
         self, items: list[AutocompleteItem], prefix: str, *, state: str
     ) -> None:
@@ -2081,7 +2224,20 @@ class Editor:
         if self._autocomplete_list is None:
             self._autocomplete_list = SelectList(items, self._AUTOCOMPLETE_MAX_VISIBLE)
             if self._tui is not None:
-                self._autocomplete_overlay = self._tui.show_overlay(self._autocomplete_list)
+                # Fix round 1 (Critical finding 1): non_capturing=True keeps
+                # this editor itself focused (tui.py's show_overlay ports
+                # upstream's OverlayOptions.nonCapturing, tui.ts:205-206/503)
+                # — the SelectList overlay has no handle_input of its own,
+                # so letting show_overlay's default steal TUI-level focus
+                # onto it would make every subsequent tui.handle_input call
+                # forward nowhere at all, permanently. The key-rerouting
+                # block at the top of handle_key (this class, "Autocomplete
+                # menu open") already does all the actual menu
+                # navigation/apply/cancel dispatch — it only ever runs at
+                # all if the editor itself stays the focused component.
+                self._autocomplete_overlay = self._tui.show_overlay(
+                    self._autocomplete_list, non_capturing=True
+                )
         else:
             self._autocomplete_list.set_items(items)
 
@@ -2096,8 +2252,11 @@ class Editor:
         ``clearAutocompleteUi`` collapsed into one (this port has no
         separate debounce-timer-handle/AbortController to tear down — see
         module docstring): bumps the cancel token (marking any in-flight
-        ``is_cancelled`` poller as cancelled) and closes the overlay, if
-        one is open."""
+        ``is_cancelled`` poller as cancelled), forcibly reclaims any
+        still-pending request task (fix round 1, Important finding 3 — see
+        ``_cancel_autocomplete_task``'s own docstring for why this is safe
+        here specifically), and closes the overlay, if one is open."""
+        self._cancel_autocomplete_task()
         self._autocomplete_current_token += 1
         if self._autocomplete_overlay is not None:
             self._autocomplete_overlay.close()
