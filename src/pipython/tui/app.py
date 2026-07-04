@@ -3,13 +3,20 @@ import contextlib
 import json
 import os
 import signal
+from collections.abc import Callable
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from rich.console import Console
 
-from pipython import AgentSessionConfig, AssistantMessage, ModelClient, create_agent_session
+from pipython import (
+    AgentSession,
+    AgentSessionConfig,
+    AssistantMessage,
+    ModelClient,
+    create_agent_session,
+)
 from pipython.testing import FakeClient
 from rich.text import Text
 
@@ -42,14 +49,33 @@ async def _consume(events, console: Console) -> None:
         renderer.finish()  # 取消/异常也清 Live（spec §4）
 
 
-async def run_app(*, model: str, cwd: Path) -> None:
-    console = Console()
+async def _build_app(
+    model: str,
+    cwd: Path,
+    *,
+    client_factory: Callable[[str], ModelClient | None] = make_client,
+) -> AppState:
+    # holder：make_session 的第一次调用发生在 app 存在之前（启动时），此时用
+    # 启动 model；此后每次 /clear 都读 holder 里那份 AppState 的*当前*
+    # session.model——这样 /model 切换后再 /clear 会继承当前模型而不是静默
+    # 退回启动值（issue #2）。
+    holder: list[AppState] = []
 
-    async def make_session():
-        client = make_client(model)
-        return await create_agent_session(AgentSessionConfig(model=model, cwd=cwd, client=client))
+    async def make_session() -> AgentSession:
+        current_model = holder[0].session.model if holder else model
+        client = client_factory(current_model)
+        return await create_agent_session(
+            AgentSessionConfig(model=current_model, cwd=cwd, client=client)
+        )
 
     app = AppState(session=await make_session(), make_session=make_session)
+    holder.append(app)
+    return app
+
+
+async def run_app(*, model: str, cwd: Path) -> None:
+    console = Console()
+    app = await _build_app(model, cwd)
     registry = build_registry()
     completer = PiCompleter(commands={n: c.description for n, c in registry.items()})
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)

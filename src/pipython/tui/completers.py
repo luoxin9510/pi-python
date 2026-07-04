@@ -34,7 +34,7 @@ async def _git_ls_files(cwd: Path) -> list[str] | None:
         return None
 
 
-def _walk_with_pathspec(cwd: Path) -> list[str]:
+def _walk_with_pathspec(cwd: Path, cap: int = _FILE_LIMIT) -> list[str]:
     gitignore = cwd / ".gitignore"
     spec = None
     if gitignore.is_file():
@@ -42,25 +42,32 @@ def _walk_with_pathspec(cwd: Path) -> list[str]:
     results: list[str] = []
     for root, dirs, files in os.walk(cwd):
         rel_root = Path(root).relative_to(cwd)
-        dirs[:] = [
+        # dirs/files 排序：OS 的 scandir 顺序不可依赖，补全建议必须与文件系统/
+        # 平台无关地确定性排序（issue #3），而不是等到最后才排一次。
+        dirs[:] = sorted(
             d
             for d in dirs
             if d != ".git" and not (spec and spec.match_file(str(rel_root / d) + "/"))
-        ]
-        for f in files:
+        )
+        for f in sorted(files):
             rel = str(rel_root / f) if str(rel_root) != "." else f
             if spec and spec.match_file(rel):
                 continue
             results.append(rel)
-            if len(results) >= _FILE_LIMIT:
-                return results
-    return results
+            if len(results) >= cap:
+                return sorted(results)
+    return sorted(results)
 
 
 async def build_file_list(cwd: Path, limit: int = _FILE_LIMIT) -> list[str]:
     files = await _git_ls_files(cwd)
     if files is None:
-        files = await asyncio.get_running_loop().run_in_executor(None, _walk_with_pathspec, cwd)
+        # 内部 walk 的安全上限跟随更小的调用方 limit：避免为一个只要 10 条的
+        # 补全请求去走一整棵大到 5000 条的非 git 目录树（issue #3）。
+        cap = min(_FILE_LIMIT, limit)
+        files = await asyncio.get_running_loop().run_in_executor(
+            None, _walk_with_pathspec, cwd, cap
+        )
     return files[:limit]
 
 

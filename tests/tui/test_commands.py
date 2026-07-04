@@ -65,6 +65,20 @@ async def test_clear_swaps_session(tmp_path):
     assert ctx.app.session.store.path != old.store.path
 
 
+async def test_clear_inherits_current_model(tmp_path, monkeypatch):
+    # /clear 曾闭包捕获启动时的 model，/model 切换后 /clear 会静默地把会话
+    # 拉回启动模型（issue #2）；期望语义是继承 /clear 发生时的当前模型。
+    monkeypatch.setattr("pipython.session_facade.DEFAULT_SESSION_DIR", tmp_path / "sessions")
+    app = await app_module._build_app(
+        "fake/model", tmp_path, client_factory=lambda _model: FakeClient(script=[])
+    )
+    ctx = CommandContext(console=Console(record=True, width=100), app=app)
+    reg = build_registry()
+    await dispatch(reg, ctx, "/model other/model")
+    await dispatch(reg, ctx, "/clear")
+    assert ctx.app.session.model == "other/model"
+
+
 async def test_quit_sets_flag(tmp_path):
     ctx = await make_ctx(tmp_path)
     await dispatch(build_registry(), ctx, "/quit")
@@ -77,6 +91,29 @@ async def test_tree_shows_structure_and_leaf(tmp_path):
     await dispatch(build_registry(), ctx, "/tree")
     text = ctx.console.export_text()
     assert "first question"[:20] in text and "←" in text
+
+
+async def test_tree_dim_off_path_bold_green_on_path(tmp_path):
+    # 分叉出一个节点不在当前路径上，验证 /tree 的样式：路径外 dim，路径上
+    # bold green（issue #4，此前无断言覆盖 src/pipython/tui/commands.py 的
+    # off-path 着色逻辑）。
+    ctx = await make_ctx(tmp_path, script=[done("first reply"), done("second reply")])
+    reg = build_registry()
+    await drain(ctx.app.session, "first question")
+    lines = [json.loads(x) for x in ctx.app.session.store.path.read_text().splitlines()]
+    first_user_id = next(x["id"] for x in lines if x["type"] == "message")
+    await dispatch(reg, ctx, f"/branch {first_user_id[:8]}")
+    await drain(ctx.app.session, "second question")  # 从 first_user_id 分叉出新路径
+    await dispatch(reg, ctx, "/tree")
+
+    def style_of(substr: str) -> str | None:
+        for seg in ctx.console._record_buffer:
+            if substr in seg.text:
+                return str(seg.style)
+        return None
+
+    assert style_of("first reply") == "dim"  # 分叉前的旧回复，已离开当前路径
+    assert style_of("second reply") == "bold green"  # 当前叶子，仍在路径上
 
 
 async def test_tree_shows_model_change_target(tmp_path):
