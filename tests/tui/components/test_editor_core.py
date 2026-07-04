@@ -486,6 +486,7 @@ class TestGraphemeAwareTextWrapping:
     def test_wraps_lines_correctly_when_text_contains_wide_emojis(self):
         """Wraps lines correctly when text contains wide emojis."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 20
@@ -494,25 +495,31 @@ class TestGraphemeAwareTextWrapping:
         editor.set_text("Hello ✅ World")
         lines = editor.render(width)
 
-        # All content lines (between borders) should fit within width
-        assert len(lines) >= 2  # At least top border and content
+        # All content lines (between borders) should fit exactly within width
+        for line in lines[1:-1]:
+            assert visible_width(line) == width
 
     def test_wraps_long_text_with_emojis_at_correct_positions(self):
         """Wraps long text with emojis at correct positions."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 10
 
+        # Each ✅ is 2 columns. "✅✅✅✅✅" = 10 columns, fits exactly.
+        # "✅✅✅✅✅✅" = 12 columns, needs wrap.
         editor.set_text("✅✅✅✅✅✅")
         lines = editor.render(width)
 
-        # Should have 2+ content lines (plus border lines)
-        assert len(lines) >= 3
+        # First line: 5 emojis (10 cols), second line: 1 emoji (2 cols) + padding
+        for line in lines[1:-1]:
+            assert visible_width(line) == width
 
     def test_wraps_cjk_characters_correctly_each_is_2_columns_wide(self):
         """Wraps CJK characters correctly (each is 2 columns wide)."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import _strip_ansi, visible_width
 
         editor = Editor()
         width = 11  # +1 col reserved for cursor
@@ -521,50 +528,76 @@ class TestGraphemeAwareTextWrapping:
         editor.set_text("日本語テスト")
         lines = editor.render(width)
 
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        for line in lines[1:-1]:
+            assert visible_width(line) == width
+
+        # Verify content split correctly
+        content_lines = [_strip_ansi(line).strip() for line in lines[1:-1]]
+        assert len(content_lines) == 2
+        assert content_lines[0] == "日本語テス"  # 5 chars = 10 columns
+        assert content_lines[1] == "ト"  # 1 char = 2 columns (+ padding)
 
     def test_handles_mixed_ascii_and_wide_characters_in_wrapping(self):
         """Handles mixed ASCII and wide characters in wrapping."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 16  # +1 col reserved for cursor
 
+        # "Test ✅ OK 日本" = 4 + 1 + 2 + 1 + 2 + 1 + 4 = 15 columns (fits in width-1=15)
         editor.set_text("Test ✅ OK 日本")
         lines = editor.render(width)
 
-        # Should fit within the width
-        assert len(lines) >= 2
+        # Should fit in one content line
+        content_lines = lines[1:-1]
+        assert len(content_lines) == 1
+        assert visible_width(content_lines[0]) == width
 
     def test_renders_cursor_correctly_on_wide_characters(self):
         """Renders cursor correctly on wide characters."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 20
 
         editor.set_text("A✅B")
+        # Cursor should be at end (after B)
         lines = editor.render(width)
 
-        # Should have rendered lines with cursor marker
-        assert len(lines) >= 2
+        # The cursor (reverse video space) should be visible
+        content_line = lines[1]
+        assert "\x1b[7m" in content_line, "Should have reverse video cursor"
+
+        # Line should still be correct width
+        assert visible_width(content_line) == width
 
     def test_does_not_exceed_terminal_width_with_emoji_at_wrap_boundary(self):
         """Does not exceed terminal width with emoji at wrap boundary."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 11
 
+        # "0123456789✅" = 10 ASCII + 2-wide emoji = 12 columns
+        # Should wrap before the emoji since it would exceed width
         editor.set_text("0123456789✅")
         lines = editor.render(width)
 
-        # Should wrap and not exceed width
-        assert len(lines) >= 2
+        for line in lines[1:-1]:
+            assert visible_width(line) <= width
 
     def test_shows_cursor_at_end_of_line_before_wrap_wraps_on_next_char(self):
-        """Shows cursor at end of line before wrap, wraps on next char."""
+        """Shows cursor at end of line before wrap, wraps on next char.
+
+        Upstream loops this over ``paddingX in [0, 1]`` using a constructor
+        option this port doesn't have (module docstring deviation 1: no
+        ``paddingX`` — always 0, every render reserves exactly 1 column for
+        the cursor). This only exercises the ``paddingX === 0`` branch,
+        which is the only one this port's ``Editor`` can produce.
+        """
         from pipython.tui.components.editor import Editor
 
         editor = Editor()
@@ -575,24 +608,28 @@ class TestGraphemeAwareTextWrapping:
             editor.handle_input(ch)
 
         lines = editor.render(width)
-        assert len(lines) >= 2
+        content_lines = lines[1:-1]
+        assert len(content_lines) == 1, "Should be 1 content line before wrap"
+        assert content_lines[0].endswith("\x1b[7m \x1b[0m"), "Cursor should be at end of line"
 
         # Type 1 more → text wraps to second line
         editor.handle_input("a")
         lines = editor.render(width)
-        assert len(lines) >= 3
+        content_lines = lines[1:-1]
+        assert len(content_lines) == 2, "Should wrap to 2 content lines"
 
     def test_renders_isolated_thai_and_lao_am_clusters_without_width_drift(self):
         """Renders isolated Thai and Lao AM clusters without width drift."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         for text in ["ำabc", "ຳabc"]:
             editor = Editor()
             width = 8
             editor.set_text(text)
 
-            lines = editor.render(width)
-            assert len(lines) >= 2
+            for line in editor.render(width):
+                assert visible_width(line) == width, f"line width drift for {text!r}: {line!r}"
 
 
 class TestWordWrapping:
@@ -600,7 +637,10 @@ class TestWordWrapping:
 
     def test_wraps_at_word_boundaries_instead_of_mid_word(self):
         """Wraps at word boundaries instead of mid-word."""
+        import re
+
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import _strip_ansi
 
         editor = Editor()
         width = 40
@@ -608,12 +648,26 @@ class TestWordWrapping:
         editor.set_text("Hello world this is a test of word wrapping functionality")
         lines = editor.render(width)
 
-        # Should have multiple lines, wrapped at word boundaries
-        assert len(lines) >= 3
+        content_lines = [_strip_ansi(line).strip() for line in lines[1:-1]]
+
+        # Should NOT break mid-word: line 1 should end with a complete word
+        assert not content_lines[0].endswith("-"), (
+            "Line should not end with hyphen (mid-word break)"
+        )
+
+        # Each content line should end with a complete word
+        for line in content_lines:
+            last_char = line.rstrip()[-1:]
+            assert last_char == "" or re.match(r"[\w.,!?;:]", last_char), (
+                f'Line ends unexpectedly with: "{last_char}"'
+            )
 
     def test_does_not_start_lines_with_leading_whitespace_after_word_wrap(self):
         """Does not start lines with leading whitespace after word wrap."""
+        import re
+
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import _strip_ansi
 
         editor = Editor()
         width = 20
@@ -621,12 +675,23 @@ class TestWordWrapping:
         editor.set_text("Word1 Word2 Word3 Word4 Word5 Word6")
         lines = editor.render(width)
 
-        # Multiple lines should be rendered
-        assert len(lines) >= 3
+        # Get content lines (between borders)
+        content_lines = lines[1:-1]
+
+        # No line should start with whitespace (except for padding at the end)
+        for i, raw_line in enumerate(content_lines):
+            line = _strip_ansi(raw_line)
+            trimmed_start = line.lstrip()
+            # The line should either be all padding or start with a word character
+            if len(trimmed_start) > 0:
+                assert not re.match(r"^\s+\S", line.rstrip()), (
+                    f"Line {i} starts with unexpected whitespace before content"
+                )
 
     def test_breaks_long_words_urls_at_character_level(self):
         """Breaks long words (URLs) at character level."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 30
@@ -634,12 +699,14 @@ class TestWordWrapping:
         editor.set_text("Check https://example.com/very/long/path/that/exceeds/width here")
         lines = editor.render(width)
 
-        # Should have multiple lines
-        assert len(lines) >= 3
+        # All lines should fit within width
+        for line in lines[1:-1]:
+            assert visible_width(line) == width
 
     def test_preserves_multiple_spaces_within_words_on_same_line(self):
         """Preserves multiple spaces within words on same line."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import _strip_ansi
 
         editor = Editor()
         width = 50
@@ -647,8 +714,9 @@ class TestWordWrapping:
         editor.set_text("Word1   Word2    Word3")
         lines = editor.render(width)
 
-        # Should fit in one content line (plus borders)
-        assert len(lines) >= 2
+        content_line = _strip_ansi(lines[1]).strip()
+        # Multiple spaces should be preserved
+        assert "Word1   Word2" in content_line, "Multiple spaces should be preserved"
 
     def test_handles_empty_string(self):
         """Handles empty string."""
@@ -666,6 +734,7 @@ class TestWordWrapping:
     def test_handles_single_word_that_fits_exactly(self):
         """Handles single word that fits exactly."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import _strip_ansi
 
         editor = Editor()
         width = 11  # +1 col reserved for cursor
@@ -675,157 +744,170 @@ class TestWordWrapping:
 
         # Should have exactly 3 lines (top border, content, bottom border)
         assert len(lines) == 3
+        content_line = _strip_ansi(lines[1])
+        assert "1234567890" in content_line, "Content should contain the word"
 
     def test_wraps_word_to_next_line_when_it_ends_exactly_at_terminal_width(self):
         """Wraps word to next line when it ends exactly at terminal width."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        # "hello " (6) + "world" (5) = 11
-        width = 11
+        # "hello " (6) + "world" (5) = 11, but "world" is non-whitespace
+        # ending at width. Thus, wrap it to next line. The trailing space
+        # stays with "hello" on line 1 (upstream editor.test.ts:929-937).
+        chunks = _word_wrap_line("hello world test", 11)
 
-        editor.set_text("hello world test")
-        lines = editor.render(width)
-
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 2
+        assert chunks[0].text == "hello "
+        assert chunks[1].text == "world test"
 
     def test_keeps_whitespace_at_terminal_width_boundary_on_same_line(self):
         """Keeps whitespace at terminal width boundary on same line."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        width = 12
+        # "hello world " is exactly 12 chars (including trailing space).
+        # The space at position 12 should stay on the first line
+        # (upstream editor.test.ts:939-947).
+        chunks = _word_wrap_line("hello world test", 12)
 
-        editor.set_text("hello world test")
-        lines = editor.render(width)
-
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 2
+        assert chunks[0].text == "hello world "
+        assert chunks[1].text == "test"
 
     def test_handles_unbreakable_word_filling_width_exactly_followed_by_space(self):
         """Handles unbreakable word filling width exactly followed by space."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        width = 12
+        # upstream editor.test.ts:949-955.
+        chunks = _word_wrap_line("aaaaaaaaaaaa aaaa", 12)
 
-        editor.set_text("aaaaaaaaaaaa aaaa")
-        lines = editor.render(width)
-
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 2
+        assert chunks[0].text == "aaaaaaaaaaaa"
+        assert chunks[1].text == " aaaa"
 
     def test_wraps_word_to_next_line_when_it_fits_width_but_not_remaining_space(self):
         """Wraps word to next line when it fits width but not remaining space."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        width = 12
+        # upstream editor.test.ts:957-963.
+        chunks = _word_wrap_line("      aaaaaaaaaaaa", 12)
 
-        editor.set_text("      aaaaaaaaaaaa")
-        lines = editor.render(width)
-
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 2
+        assert chunks[0].text == "      "
+        assert chunks[1].text == "aaaaaaaaaaaa"
 
     def test_keeps_word_with_multi_space_and_following_word_together_when_they_fit(self):
         """Keeps word with multi-space and following word together when they fit."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        width = 30
+        # upstream editor.test.ts:965-971.
+        chunks = _word_wrap_line("Lorem ipsum dolor sit amet,    consectetur", 30)
 
-        editor.set_text("Lorem ipsum dolor sit amet,    consectetur")
-        lines = editor.render(width)
-
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 2
+        assert chunks[0].text == "Lorem ipsum dolor sit "
+        assert chunks[1].text == "amet,    consectetur"
 
     def test_keeps_word_with_multi_space_and_following_word_when_they_fill_width_exactly(self):
         """Keeps word with multi-space and following word when they fill width exactly."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        width = 30
+        # upstream editor.test.ts:973-979.
+        chunks = _word_wrap_line("Lorem ipsum dolor sit amet,              consectetur", 30)
 
-        editor.set_text("Lorem ipsum dolor sit amet,              consectetur")
-        lines = editor.render(width)
-
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 2
+        assert chunks[0].text == "Lorem ipsum dolor sit "
+        assert chunks[1].text == "amet,              consectetur"
 
     def test_splits_when_word_plus_multi_space_plus_word_exceeds_width(self):
         """Splits when word plus multi-space plus word exceeds width."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        width = 30
+        # upstream editor.test.ts:981-988.
+        chunks = _word_wrap_line("Lorem ipsum dolor sit amet,               consectetur", 30)
 
-        editor.set_text("Lorem ipsum dolor sit amet,               consectetur")
-        lines = editor.render(width)
-
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 3
+        assert chunks[0].text == "Lorem ipsum dolor sit "
+        assert chunks[1].text == "amet,               "
+        assert chunks[2].text == "consectetur"
 
     def test_breaks_long_whitespace_at_line_boundary(self):
         """Breaks long whitespace at line boundary."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        width = 30
+        # upstream editor.test.ts:990-997.
+        chunks = _word_wrap_line(
+            "Lorem ipsum dolor sit amet,                         consectetur", 30
+        )
 
-        editor.set_text("Lorem ipsum dolor sit amet,                         consectetur")
-        lines = editor.render(width)
-
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 3
+        assert chunks[0].text == "Lorem ipsum dolor sit "
+        assert chunks[1].text == "amet,                         "
+        assert chunks[2].text == "consectetur"
 
     def test_breaks_long_whitespace_at_line_boundary_2(self):
         """Breaks long whitespace at line boundary (variant 2)."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        width = 30
+        # upstream editor.test.ts:999-1006.
+        chunks = _word_wrap_line(
+            "Lorem ipsum dolor sit amet,                          consectetur", 30
+        )
 
-        editor.set_text("Lorem ipsum dolor sit amet,                          consectetur")
-        lines = editor.render(width)
-
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 3
+        assert chunks[0].text == "Lorem ipsum dolor sit "
+        assert chunks[1].text == "amet,                         "
+        assert chunks[2].text == " consectetur"
 
     def test_breaks_whitespace_spanning_full_lines(self):
         """Breaks whitespace spanning full lines."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
 
-        editor = Editor()
-        width = 30
-
-        editor.set_text(
-            "Lorem ipsum dolor sit amet,                                     consectetur"
+        # upstream editor.test.ts:1008-1015.
+        chunks = _word_wrap_line(
+            "Lorem ipsum dolor sit amet,                                     consectetur", 30
         )
-        lines = editor.render(width)
 
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        assert len(chunks) == 3
+        assert chunks[0].text == "Lorem ipsum dolor sit "
+        assert chunks[1].text == "amet,                         "
+        assert chunks[2].text == "            consectetur"
 
     def test_force_breaks_when_wide_char_after_word_boundary_wrap_still_overflows(self):
         """Force-breaks when wide char after word boundary wrap still overflows."""
-        from pipython.tui.components.editor import Editor
+        from pipython.tui.components.editor import _word_wrap_line
+        from pipython.tui.engine.utils import visible_width
 
-        editor = Editor()
-        width = 187
+        # " " (1) + "a"*186 (186) + "你" (2) = 189 visible width
+        # maxWidth = 187: backtracking to the space would leave 186 + 2 = 188 > 187,
+        # so the algorithm must force-break before the wide char instead.
+        line = " " + "a" * 186 + "你"
+        chunks = _word_wrap_line(line, 187)
 
-        line_text = " " + "a" * 186 + "你"
-        editor.set_text(line_text)
+        for chunk in chunks:
+            assert visible_width(chunk.text) <= 187, (
+                f'chunk "{chunk.text[:20]}..." has visible width {visible_width(chunk.text)}, '
+                f"expected <= 187"
+            )
 
-        lines = editor.render(width)
-        # Should wrap to multiple lines
-        assert len(lines) >= 3
+        # Verify no content is lost
+        reconstructed = "".join(line[c.start : c.end] for c in chunks)
+        assert reconstructed == line
 
     def test_splits_oversized_atomic_segment_across_multiple_chunks(self):
-        """Splits oversized atomic segment across multiple chunks."""
+        """Splits oversized atomic segment across multiple chunks.
+
+        Upstream drives ``wordWrapLine`` with a synthetic pre-segmented
+        array that treats the paste marker as a single atomic segment
+        (editor.ts's ``wordWrapLine`` third parameter). This port's
+        ``_word_wrap_line`` has no such parameter — module docstring
+        deviation 4 documents that no paste-marker/atomic-segment awareness
+        is ported at all (Task 12 territory). The marker text below is
+        therefore wrapped like any other unbreakable run of characters; the
+        invariant this port *can* still verify through the public
+        ``Editor.render()`` surface is that no rendered line ever exceeds
+        the terminal width.
+        """
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 10
@@ -834,12 +916,18 @@ class TestWordWrapping:
         editor.set_text(f"A{marker}B")
 
         lines = editor.render(width)
-        # Should handle the oversized marker gracefully
-        assert len(lines) >= 2
+        # Every rendered content line must fit exactly within width
+        for line in lines[1:-1]:
+            assert visible_width(line) == width
 
     def test_splits_oversized_atomic_segment_at_start_of_line(self):
-        """Splits oversized atomic segment at start of line."""
+        """Splits oversized atomic segment at start of line.
+
+        See ``test_splits_oversized_atomic_segment_across_multiple_chunks``'s
+        docstring for why this diverges from upstream's pre-segmented setup.
+        """
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 10
@@ -848,12 +936,17 @@ class TestWordWrapping:
         editor.set_text(f"{marker}B")
 
         lines = editor.render(width)
-        # Should handle the oversized marker gracefully
-        assert len(lines) >= 2
+        for line in lines[1:-1]:
+            assert visible_width(line) == width
 
     def test_splits_oversized_atomic_segment_at_end_of_line(self):
-        """Splits oversized atomic segment at end of line."""
+        """Splits oversized atomic segment at end of line.
+
+        See ``test_splits_oversized_atomic_segment_across_multiple_chunks``'s
+        docstring for why this diverges from upstream's pre-segmented setup.
+        """
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 10
@@ -862,12 +955,17 @@ class TestWordWrapping:
         editor.set_text(f"A{marker}")
 
         lines = editor.render(width)
-        # Should handle the oversized marker gracefully
-        assert len(lines) >= 2
+        for line in lines[1:-1]:
+            assert visible_width(line) == width
 
     def test_splits_consecutive_oversized_atomic_segments(self):
-        """Splits consecutive oversized atomic segments."""
+        """Splits consecutive oversized atomic segments.
+
+        See ``test_splits_oversized_atomic_segment_across_multiple_chunks``'s
+        docstring for why this diverges from upstream's pre-segmented setup.
+        """
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
         width = 10
@@ -876,21 +974,35 @@ class TestWordWrapping:
         editor.set_text(f"{marker}{marker}")
 
         lines = editor.render(width)
-        # Should handle consecutive oversized markers gracefully
-        assert len(lines) >= 2
+        for line in lines[1:-1]:
+            assert visible_width(line) == width
 
     def test_wraps_normally_after_oversized_atomic_segment(self):
-        """Wraps normally after oversized atomic segment."""
+        """Wraps normally after oversized atomic segment.
+
+        Adapted from upstream's pre-segmented test (see
+        ``test_splits_oversized_atomic_segment_across_multiple_chunks``'s
+        docstring) — verifies wrapping still behaves sanely (lines within
+        width, no words dropped) once ordinary word content follows an
+        oversized unbreakable run.
+        """
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import _strip_ansi, visible_width
 
         editor = Editor()
-        width = 40
+        width = 10
 
-        editor.set_text("hello world this is a test")
+        marker = "[paste #1 +20 lines]"
+        editor.set_text(f"{marker} hello world")
         lines = editor.render(width)
 
-        # Should wrap to multiple lines
-        assert len(lines) >= 2
+        for line in lines[1:-1]:
+            assert visible_width(line) == width
+
+        # No words lost: normal wrapping resumes after the oversized run.
+        content = "".join(_strip_ansi(line) for line in lines[1:-1])
+        assert "hello" in content
+        assert "world" in content
 
 
 class TestCharacterJump:

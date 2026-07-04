@@ -117,6 +117,28 @@ Deviations from upstream editor.ts:
    ported** — the task-11 brief's Produces list exposes ``text``/``cursor``
    as plain read-only properties and only ``on_submit`` as a callback; none
    of the 87 translated tests exercise ``onChange`` or ``disableSubmit``.
+7. **``handle_input`` calls ``parse_key(data, kitty=False)`` with the Kitty
+   channel hardcoded off** — the task-11 brief's ``handle_input(data)``
+   signature carries no kitty-enabled parameter (this component, per
+   deviation 1, holds no ``tui``/terminal reference to read one from).
+   Upstream instead consults a module-level ``_kittyProtocolActive`` flag
+   (keys.ts:25-40) that a real terminal's keyboard-protocol negotiation
+   flips at runtime. This is a **known limitation, not a design choice**:
+   Kitty CSI-u–encoded keys are always parsed as if Kitty mode were
+   disabled until a future task threads a live capability flag through —
+   the natural checkpoint is Task 16, where ``RealTerminal.kitty_enabled``
+   (``engine/terminal.py``) must be wired into this call (and into the
+   TUI's dispatch to ``handle_input`` generally) so this hardcoded
+   ``False`` can be replaced with the negotiated value.
+8. **``_submit_value`` resets ``_preferred_visual_col`` to ``None``**,
+   which upstream's ``submitValue`` (editor.ts:1246-1259) does not do —
+   deliberate, not an oversight: submit clears the buffer back to a single
+   empty line, and leaving a stale sticky-column value in place would let
+   it leak into subsequent up/down navigation on that fresh empty buffer
+   (``_compute_vertical_move_column`` treats a non-``None`` value as "the
+   user has an intentional preferred column to restore"). Resetting it
+   here is a narrow behavioral improvement over upstream rather than a
+   compatibility gap.
 """
 
 from __future__ import annotations
