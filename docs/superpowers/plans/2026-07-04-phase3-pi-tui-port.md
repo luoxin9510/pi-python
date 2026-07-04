@@ -153,7 +153,7 @@ def test_apply_background_pads_to_width():
 - Test: `tests/tui/engine/test_stdin_buffer.py`
 
 **Interfaces:**
-- Produces: `StdinBuffer(on_frame: Callable[[str], None], esc_timeout: float = 0.05, timer: Callable = asyncio 计时注入位)`；`feed(data: bytes) -> None`；帧类型语义：完整转义序列成帧、半截序列等待后续字节、孤立 ESC 超时成帧、**bracketed paste（`ESC[200~`…`ESC[201~`）整块单帧**。计时器可注入（测试用手动时钟，不 sleep）。
+- Produces: `StdinBuffer(on_frame: Callable[[str], None], esc_timeout: float = 0.01, timer: Callable = asyncio 计时注入位)`（0.01=上游 10ms；此前 0.05 系 brief 单位笔误，已由维护者确认更正）；`feed(data: bytes) -> None`；帧类型语义：完整转义序列成帧、半截序列等待后续字节、孤立 ESC 超时成帧、**bracketed paste（`ESC[200~`…`ESC[201~`）整块单帧且经同一 on_frame 通道、marker 保留在帧内**（下游 Editor.handle_input 靠 marker 判断粘贴——单通道是硬契约，禁止第二回调）。计时器可注入（测试用手动时钟，不 sleep）。
 
 **上游规范源**：`stdin-buffer.ts`（434 行全量）；测试翻译源 `test/stdin-buffer.test.ts`（458 行）。
 
