@@ -117,6 +117,25 @@ class TestText:
         lines = text.render(20)
         assert len(lines) >= 2
 
+    def test_text_wrap_false_returns_single_unwrapped_line(self):
+        """Regression test for the Task-17 e2e bug
+        (``.superpowers/sdd/task-17-report.md``): the exit banner
+        ``f"session: {path}"`` word-wraps at the space after "session:" on
+        narrow real ptys, breaking ``pane.wait_for(r"session: ")``.
+
+        ``wrap=False`` must skip ``wrap_text_with_ansi`` entirely and return
+        the whole (possibly very long) content as a single list entry, even
+        at a narrow width that would otherwise force a wrap right at the
+        "session: " joint -- the terminal, not this component, decides where
+        the line breaks (soft-wrap), so the space is never removed and the
+        text is never split across list entries."""
+        long_path = "/some/very/long/tmp/path/that/is/definitely/longer/than/ten/cols"
+        text = Text(f"session: {long_path}", wrap=False)
+        lines = text.render(10)
+        assert lines == [f"session: {long_path}"]
+        assert len(lines) == 1
+        assert "session: " in lines[0]
+
 
 # ==============================================================================
 # BOX COMPONENT TESTS (≥4 cases)

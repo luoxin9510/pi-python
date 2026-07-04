@@ -33,6 +33,28 @@ Deviations from upstream text.ts:
    existing ``_AnsiCodeTracker`` machinery inside that function (already
    exercised by Task 1's own tests) re-opens/closes it across wrap
    boundaries — no bespoke styling logic duplicated here.
+5. ``wrap`` (bool, default ``True``) is this port's own addition, not an
+   upstream text.ts parameter — added post-hoc for the Task-17 e2e banner
+   bug (``.superpowers/sdd/task-17-report.md``): ``app2.py``'s exit banner
+   (``f"session: {path}"``) must stay on one logical line so
+   ``pane.wait_for(r"session: ")`` keeps matching on narrow real ptys, the
+   same guarantee phase-2's ``app.py`` gave via ``rich``'s
+   ``Console.print(..., soft_wrap=True)``. Checked upstream first (see the
+   task-17-report follow-up appended below): upstream has no non-wrapping
+   ``Text`` mode either — the actual upstream precedent for "a path-bearing
+   banner must not be word-wrapped" is architectural, not a component flag:
+   ``interactive-mode.ts``'s post-``this.stop()`` resume-command banner
+   (``process.stdout.write(...)``, around line 3418) is emitted via a raw
+   stdout write *after* the TUI stops, bypassing ``Text``/``wrapTextWithAnsi``
+   entirely so the terminal does its own native column soft-wrap instead of
+   the app's word-wrap. Since this port's ``_do_quit`` still routes through
+   the component tree (`transcript.add_child(Text(...))`) rather than a raw
+   post-stop stdout write, the closest-fidelity mirror inside that shape is
+   a ``wrap=False`` escape hatch that skips ``wrap_text_with_ansi`` and
+   returns the single unwrapped line — same effect (terminal, not the app,
+   decides where the line breaks), same trigger condition (a joint that must
+   never be split), different mechanism only because the surrounding call
+   site differs from upstream's.
 """
 
 from __future__ import annotations
@@ -48,9 +70,10 @@ class Text:
     """tui.ts ``Component``-compatible: multi-line word-wrapped text, no
     padding/background (see module docstring deviations 1-2)."""
 
-    def __init__(self, content: str = "", style: str = "") -> None:
+    def __init__(self, content: str = "", style: str = "", wrap: bool = True) -> None:
         self.content = content
         self.style = style
+        self.wrap = wrap
 
     def set_content(self, content: str) -> None:
         """Upstream ``setText()`` (text.ts:25-30, minus cache invalidation —
@@ -63,12 +86,21 @@ class Text:
     def render(self, width: int) -> list[str]:
         """text.ts:45-105's core, minus the no-op branches this port drops
         (see module docstring). Empty/whitespace-only content renders no
-        lines at all (text.ts:52-58's early return)."""
+        lines at all (text.ts:52-58's early return).
+
+        ``wrap=False`` (module docstring deviation 5) skips
+        ``wrap_text_with_ansi`` entirely and returns the content as a single
+        line, regardless of ``width`` — the terminal soft-wraps it natively
+        instead of the app hard-wrapping at a word boundary that may fall on
+        a joint (e.g. ``"session: "``) that must stay contiguous."""
         if not self.content or self.content.strip() == "":
             return []
 
         normalized = self.content.replace("\t", "   ")
         if self.style:
             normalized = f"{self.style}{normalized}{_RESET}"
+
+        if not self.wrap:
+            return [normalized]
 
         return wrap_text_with_ansi(normalized, max(1, width))

@@ -22,6 +22,12 @@ def _parse_args(argv: list[str] | None):
         help="litellm model id",
     )
     parser.add_argument("--cwd", type=Path, default=Path("."), help="agent working directory")
+    parser.add_argument(
+        "--engine",
+        choices=["legacy", "pi"],
+        default="legacy",
+        help="TUI engine: 'legacy' (prompt_toolkit/rich, default) or 'pi' (new diff-render engine)",
+    )
     return parser.parse_args(argv)
 
 
@@ -42,10 +48,26 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     import asyncio
 
-    from .app import run_app
-
     try:
-        asyncio.run(run_app(model=args.model, cwd=args.cwd.resolve()))
+        if args.engine == "pi":
+            from .app import make_client
+            from .app2 import run_app2
+
+            # make_client() is app.py's existing PI_PYTHON_FAKE_SCRIPT ->
+            # FakeClient wiring (test-only escape hatch, spec §7); reused
+            # verbatim so the pi engine honors the same env var as legacy
+            # instead of only ever taking run_app2's real-client default.
+            asyncio.run(
+                run_app2(
+                    model=args.model,
+                    cwd=args.cwd.resolve(),
+                    client=make_client(args.model),
+                )
+            )
+        else:
+            from .app import run_app
+
+            asyncio.run(run_app(model=args.model, cwd=args.cwd.resolve()))
     except KeyboardInterrupt:
         # SIGINT handler 只覆盖运行中的 turn，prompt_toolkit 只覆盖输入编辑；
         # 两者之间的窗口（比如 pre-prompt 的 file-list 刷新）冒出的

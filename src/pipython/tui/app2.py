@@ -277,12 +277,20 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
     quit_event = asyncio.Event()
     turn_task: asyncio.Task[None] | None = None
 
-    def _append(text: str, style: str = "") -> None:
-        transcript.add_child(Text(text, style=style))
+    def _append(text: str, style: str = "", *, wrap: bool = True) -> None:
+        transcript.add_child(Text(text, style=style, wrap=wrap))
         tui.request_render()
 
     def _do_quit() -> None:
-        _append(f"session: {app_state.session.store.path}", style=_DIM)
+        # wrap=False (components/text.py deviation 5): the session path is an
+        # unbreakable token after "session: " -- word-wrapping this banner can
+        # land the wrap point exactly on that space on a narrow real pty,
+        # splitting "session:" and the path across two captured rows with no
+        # rejoinable space (breaks `pane.wait_for(r"session: ")` — see
+        # .superpowers/sdd/task-17-report.md). Matches phase-2 app.py's
+        # deliberate `soft_wrap=True` for this exact line: let the terminal
+        # soft-wrap natively instead of hard-wrapping at a word boundary.
+        _append(f"session: {app_state.session.store.path}", style=_DIM, wrap=False)
         quit_event.set()
 
     def _on_submit(text: str) -> None:
