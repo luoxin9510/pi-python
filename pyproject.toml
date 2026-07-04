@@ -16,6 +16,10 @@ tui = [
     "rich==15.0.0",
     "rapidfuzz==3.14.5",
     "pathspec==1.1.1",
+    "markdown-it-py==4.2.0",
+    "linkify-it-py==2.1.0",
+    "wcwidth==0.8.2",
+    "regex==2026.6.28",
 ]
 
 [project.scripts]
