@@ -24,6 +24,11 @@ class RecordingTerm:
             *not* affect ``screen()`` (see below).
         columns: int — fixed to 80 (per brief).
         rows: int — fixed to 24 (per brief).
+        flush_count: int — total number of ``flush()`` calls received (Task
+            17 review, Important 1: ``TUI.do_render`` calls ``term.flush()``
+            exactly once per frame, at the very end — this counter is how
+            ``tests/tui/engine/test_diff_render.py`` verifies that without
+            coupling to a particular real-``sys.stdout`` mock).
 
     Methods:
         screen() -> list[str] — returns the current virtual screen (a list
@@ -68,6 +73,7 @@ class RecordingTerm:
         self.ops: list[str] = []
         self.columns: int = 80
         self.rows: int = 24
+        self.flush_count: int = 0
         self._lines: list[str] = ["" for _ in range(self.rows)]
         self._cursor_row: int = 0
 
@@ -76,6 +82,13 @@ class RecordingTerm:
         apply it to the persistent virtual screen (see RED correction #1)."""
         self.ops.append(data)
         self._apply(data)
+
+    def flush(self) -> None:
+        """Record a flush event (Task 17 review, Important 1). No screen
+        effect — ``TerminalIO.flush`` is purely about when buffered bytes
+        reach the real terminal, which this in-memory double has no
+        buffering of in the first place."""
+        self.flush_count += 1
 
     def _apply(self, op: str) -> None:
         """Apply a single write()'s data to the persistent virtual screen."""

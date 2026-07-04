@@ -264,7 +264,22 @@ def _find_negotiation_reply(buffer: bytes) -> tuple[tuple[str, int], bytes] | No
 class TerminalIO(Protocol):
     """Minimal terminal output boundary — the engine writes through this
     exclusively so tests can inject a recording double instead of a real
-    terminal (see Task 7 conftest's ``RecordingTerm``)."""
+    terminal (see Task 7 conftest's ``RecordingTerm``).
+
+    ``flush()`` (Task 17 review, Important 1) is deliberately *not* a formal
+    member of this Protocol, even though ``RealTerminal`` implements one
+    (below) and ``TUI.do_render`` calls it once per frame. Same rationale as
+    ``tui.py`` module docstring deviation 9's ``Component.handle_input``:
+    Python's ``typing.Protocol`` has no notion of a genuinely *optional*
+    structural member — declaring ``flush`` here would make every
+    ``TerminalIO`` double statically required to implement it (this was
+    tried and reverted: it broke a minimal write-only test double with a
+    ``reportArgumentType`` error, since Protocol conformance is all-or-
+    nothing per member). Callers that want to flush therefore probe for it
+    dynamically — ``getattr(term, "flush", None)`` + ``callable(...)``,
+    exactly like ``Focusable`` is probed via ``is_focusable`` and
+    ``handle_input`` via ``TUI.handle_input`` — rather than calling it
+    unconditionally. See ``TUI._flush_term``."""
 
     def write(self, data: str) -> None: ...
 
@@ -316,6 +331,12 @@ class RealTerminal(TerminalIO):
         self._enter_raw_mode()
 
         self.write(BRACKETED_PASTE_ENABLE)  # terminal.ts:147
+        # Inline flush (Task 17 review, Important 2): this write is not
+        # frame-driven — nothing downstream of start() triggers a do_render
+        # flush on our behalf — and the Kitty query right below depends on
+        # the terminal having actually *seen* prior writes before its reply
+        # can arrive within the 200ms negotiation window (deviation 1).
+        self.flush()
 
         # Restore guarantee, registered unconditionally right after the
         # first state-mutating write: bracketed paste (and the Kitty query
@@ -330,6 +351,7 @@ class RealTerminal(TerminalIO):
 
         self._protocol_query_sent = True
         self.write(KITTY_QUERY_SEQUENCE)  # terminal.ts:225
+        self.flush()  # see above — must reach the terminal before we read
 
         self._negotiate_kitty_protocol()
 
@@ -349,9 +371,17 @@ class RealTerminal(TerminalIO):
         self._started = False
 
         self.write(BRACKETED_PASTE_DISABLE)  # terminal.ts:412
+        # Inline flush (Task 17 review, Important 2): stop()'s restore path
+        # is not frame-driven either — there is no subsequent do_render to
+        # flush on this call's behalf, and the process may exit immediately
+        # after stop() returns, so every restore write must reach the
+        # terminal before that happens rather than sit in Python's stdout
+        # buffer.
+        self.flush()
 
         if self._protocol_query_sent or self.kitty_enabled:
             self.write(KITTY_PROTOCOL_DISABLE)  # terminal.ts:374, 419
+            self.flush()
             self.kitty_enabled = False
             self._protocol_query_sent = False
 
@@ -360,6 +390,7 @@ class RealTerminal(TerminalIO):
         self._restore_raw_mode()
 
         self.write(SHOW_CURSOR)
+        self.flush()
 
         atexit.unregister(self.stop)
 
@@ -367,15 +398,50 @@ class RealTerminal(TerminalIO):
 
     def write(self, data: str) -> None:
         sys.stdout.write(data)
-        # Python's stdout on a real tty is line-buffered: a frame's bytes
-        # only reach the terminal if the frame happens to contain "\n".
-        # Node's process.stdout.write (upstream terminal.ts:455) has no such
-        # buffering, so upstream never needs this — but a newline-less
-        # diff-only frame (plain keystroke echo, or a shrink-only
-        # "[interrupted]" frame) would otherwise sit unflushed until some
-        # later frame happens to carry a newline, or the process exits. See
-        # .superpowers/sdd/task-17-report.md "Task 17 (resumed)" for the
-        # real-tmux e2e evidence this was diagnosed from.
+
+    def flush(self) -> None:
+        """Flush ``sys.stdout`` (Task 17 review, Important 1 — fix round 2).
+
+        Python's stdout on a real tty is line-buffered: a frame's bytes only
+        reach the terminal if the frame happens to contain ``"\\n"``. Node's
+        ``process.stdout.write`` (upstream terminal.ts:455) has no such
+        buffering, so upstream never needs an explicit flush at all — but a
+        newline-less diff-only frame (plain keystroke echo, or a
+        shrink-only "[interrupted]" frame) would otherwise sit unflushed
+        until some later frame happens to carry a newline, or the process
+        exits. See ``.superpowers/sdd/task-17-report.md`` "Task 17
+        (resumed)" for the real-tmux e2e evidence this was diagnosed from.
+
+        Fix round 2 correction: the first fix flushed inside ``write()``
+        itself — once per ``sys.stdout.write()`` call. That is the *wrong*
+        granularity for this port specifically: ``tui.py``'s ``do_render``
+        deliberately issues one discrete ``term.write()`` per atomic ANSI
+        primitive (cursor move, carriage return, line erase, text chunk —
+        ``tui.py`` module docstring deviation 5), unlike upstream, which
+        accumulates one buffer string per frame and writes it once
+        (``this.terminal.write(buffer)``). A prior justification note
+        (``.superpowers/sdd/task-17-report.md``'s original "Suggested fix")
+        claimed "upstream's single-buffer-per-frame write makes per-write
+        equivalent to per-frame anyway" — that claim does not hold for
+        *this* port: because of deviation 5's discrete writes, flushing
+        inside ``write()`` itself means N flushes per rendered frame (N =
+        however many atomic ANSI ops that frame happened to emit), not one.
+        The architecturally correct granularity is a single flush at the end
+        of each ``do_render`` call (see ``tui.py``'s ``do_render``, which
+        now calls ``term.flush()`` once after cursor positioning) — this
+        method exists so callers (``do_render``, and this class's own
+        ``start()``/``stop()``) can request that flush explicitly, on their
+        own schedule, instead of ``write()`` doing it unconditionally on
+        every call.
+
+        ``start()``'s negotiation writes and ``stop()``'s restore writes are
+        the two exceptions that still flush inline, immediately after each
+        write (Task 17 review, Important 2): neither is frame-driven — there
+        is no subsequent ``do_render`` call whose end-of-frame flush would
+        otherwise cover them — and both have a real timing requirement of
+        their own (the 200ms Kitty negotiation window; restore writes that
+        must reach the terminal before the process exits).
+        """
         sys.stdout.flush()
 
     @property
@@ -595,15 +661,21 @@ class RealTerminal(TerminalIO):
         return pending
 
     def _enable_modify_other_keys(self) -> None:
-        """terminal.ts:320-324."""
+        """terminal.ts:320-324. Called only from ``start()``'s negotiation
+        path (via ``_negotiate_kitty_protocol``), so this write flushes
+        inline too — see ``start()``'s own comment: nothing frame-driven
+        follows it to flush on its behalf."""
         if self.kitty_enabled or self._modify_other_keys_active:
             return
         self.write(MODIFY_OTHER_KEYS_ENABLE)
+        self.flush()
         self._modify_other_keys_active = True
 
     def _disable_modify_other_keys(self) -> None:
-        """terminal.ts:326-330."""
+        """terminal.ts:326-330. Called only from ``stop()``'s restore path,
+        so this write flushes inline too — see ``stop()``'s own comment."""
         if not self._modify_other_keys_active:
             return
         self.write(MODIFY_OTHER_KEYS_DISABLE)
+        self.flush()
         self._modify_other_keys_active = False

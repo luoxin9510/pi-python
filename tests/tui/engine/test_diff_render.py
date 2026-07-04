@@ -286,6 +286,95 @@ class TestDiffRender:
         assert "line 3" in final_text
 
 
+class TestFlushGranularity:
+    """Task 17 review, Important 1 (fix round 2): ``TUI.do_render`` must
+    flush the terminal exactly once per rendered frame, at the very end
+    (after cursor positioning) — regardless of how many discrete
+    ``term.write()`` calls the diff needed internally (``tui.py`` module
+    docstring deviation 5's "flush granularity" note). ``RecordingTerm``
+    (``tests/tui/engine/conftest.py``) records every ``flush()`` call via
+    ``flush_count`` so these tests can pin the count directly, independent
+    of ``RealTerminal``'s own ``sys.stdout``-flushing tests in
+    ``test_terminal.py::TestFlushGranularity``."""
+
+    def test_do_render_flushes_exactly_once_on_first_render(
+        self, term: RecordingTerm, tui: TUI
+    ) -> None:
+        """First render writes many discrete ops (one per line plus
+        newlines) but must still flush only once."""
+        component = StaticComponent(["line 1", "line 2", "line 3"])
+        tui.set_root(component)
+        tui.do_render()
+
+        assert len(term.ops) > 1, "sanity: first render issues multiple writes"
+        assert term.flush_count == 1
+
+    def test_do_render_flushes_exactly_once_on_unchanged_rerender(
+        self, term: RecordingTerm, tui: TUI
+    ) -> None:
+        """Even a render that writes nothing (no diff) still flushes once —
+        do_render's flush happens unconditionally at the end of every call,
+        not only when ops were written."""
+        component = StaticComponent(["line 1", "line 2"])
+        tui.set_root(component)
+        tui.do_render()
+
+        tui.do_render()
+
+        assert term.flush_count == 2
+
+    def test_do_render_flushes_exactly_once_on_partial_line_change(
+        self, term: RecordingTerm, tui: TUI
+    ) -> None:
+        """A single-line change emits several discrete ops (move cursor,
+        erase, write) — still exactly one flush for the whole frame, not
+        one per op."""
+        component = StaticComponent(["line 1", "line 2", "line 3"])
+        tui.set_root(component)
+        tui.do_render()
+
+        component.lines[1] = "line 2 MODIFIED"
+        component.invalidate()
+        tui.do_render()
+
+        assert term.flush_count == 2
+
+    def test_do_render_does_not_flush_when_stopped(self, term: RecordingTerm, tui: TUI) -> None:
+        """``do_render`` no-ops entirely when ``stop()`` has been called —
+        no rendering happened, so no flush either."""
+        component = StaticComponent(["line 1"])
+        tui.set_root(component)
+        tui.stop()
+
+        tui.do_render()
+
+        assert term.flush_count == 0
+
+    def test_do_render_works_with_bare_terminalio_double_lacking_flush(self, tui: TUI) -> None:
+        """``do_render`` must not raise against a minimal double that only
+        implements the original three-member ``TerminalIO`` surface
+        (``write``/``columns``/``rows``, no ``flush``) — the flush call is
+        guarded via ``getattr``/``callable`` (see ``TUI._flush_term``)."""
+
+        class BareTerm:
+            def __init__(self) -> None:
+                self.ops: list[str] = []
+                self.columns = 80
+                self.rows = 24
+
+            def write(self, data: str) -> None:
+                self.ops.append(data)
+
+        bare = BareTerm()
+        bare_tui = TUI(bare)
+        component = StaticComponent(["line 1"])
+        bare_tui.set_root(component)
+
+        bare_tui.do_render()  # must not raise AttributeError
+
+        assert len(bare.ops) > 0
+
+
 class TestComponentProtocol:
     """Verify Component and Container protocol conformance."""
 

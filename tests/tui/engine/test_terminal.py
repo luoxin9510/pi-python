@@ -543,16 +543,27 @@ class TestTerminalIOProtocol:
             assert term.rows == 30
 
 
-class TestWriteFlushesStdout:
-    """Bug fix (evidence: ``.superpowers/sdd/task-17-report.md`` "Task 17
-    (resumed)"): line-buffered tty stdout silently drops any frame lacking a
-    trailing newline — ordinary keystroke echo and the ``[interrupted]``
-    shrink-frame (cursor moves + erase-line only, no ``\\n``) never render
-    on a real terminal, because ``RealTerminal.write`` never called
-    ``sys.stdout.flush()``. Every ``write()`` must flush immediately after,
-    including the restore writes issued from ``stop()``."""
+class TestFlushGranularity:
+    """Task 17 review, Important 1 (fix round 2): flush-per-write was the
+    wrong granularity for this port (``tui.py`` module docstring deviation
+    5 — ``do_render`` issues discrete per-primitive ``term.write()`` calls,
+    so a flush inside ``write()`` itself means N flushes per rendered frame,
+    not one). ``RealTerminal.write`` no longer flushes at all; a separate
+    ``RealTerminal.flush()`` method exists on the ``TerminalIO`` surface,
+    called once per frame by ``TUI.do_render`` (see
+    ``tests/tui/engine/test_diff_render.py::TestFlushGranularity``) — except
+    for ``start()``'s negotiation writes and ``stop()``'s restore writes,
+    which are NOT frame-driven and must still flush inline immediately
+    after each write (Task 17 review, Important 2: the 200ms Kitty
+    negotiation window, and restore writes that must reach the terminal
+    before the process exits)."""
 
-    def test_write_flushes_after_each_write(self):
+    def test_write_does_not_flush(self):
+        """``RealTerminal.write`` itself must never call
+        ``sys.stdout.flush()`` — flushing is now the caller's
+        responsibility (either ``TUI.do_render``'s single end-of-frame
+        flush, or an inline ``self.flush()`` call right after a
+        non-frame-driven write in ``start()``/``stop()``)."""
         with raw_env() as env:
             term = RealTerminal()
             term.start()
@@ -560,20 +571,40 @@ class TestWriteFlushesStdout:
             flushes_before = env.stdout.flush.call_count
             term.write("partial frame, no trailing newline")
 
+            assert env.stdout.flush.call_count == flushes_before
+
+    def test_flush_method_flushes_stdout(self):
+        """``RealTerminal.flush()`` — the new ``TerminalIO`` surface member
+        — calls ``sys.stdout.flush()`` directly."""
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
+
+            flushes_before = env.stdout.flush.call_count
+            term.flush()
+
             assert env.stdout.flush.call_count == flushes_before + 1
-            # flush must come after the write it belongs to, not before.
-            write_call_index = len(env.stdout.method_calls) - 1
-            assert env.stdout.method_calls[write_call_index][0] == "flush"
-            assert env.stdout.method_calls[write_call_index - 1] == (
-                "write",
-                ("partial frame, no trailing newline",),
-                {},
-            )
+
+    def test_start_negotiation_writes_flush_inline(self):
+        """``start()``'s writes (bracketed paste enable, Kitty query, and —
+        under this default ``raw_env()``'s immediate-timeout negotiation —
+        the modifyOtherKeys fallback) are not frame-driven: nothing later
+        flushes them on start()'s behalf, so each one must flush
+        immediately, inline, right after it's written (Task 17 review,
+        Important 2)."""
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
+
+            assert env.stdout.write.call_count > 0
+            assert env.stdout.flush.call_count == env.stdout.write.call_count
 
     def test_stop_restore_writes_each_flush(self):
         """stop() issues several restore writes (bracketed paste disable,
         Kitty/modifyOtherKeys disable, show cursor) — each one must flush,
-        not just the last."""
+        not just the last (Task 17 review, Important 2: stop()'s restore
+        path is not frame-driven either, and the process may exit right
+        after stop() returns)."""
         with raw_env() as env:
             term = RealTerminal()
             term.start()
@@ -699,6 +730,7 @@ class TestTerminalIOIntegration:
             assert hasattr(term, "start")
             assert hasattr(term, "stop")
             assert hasattr(term, "write")
+            assert hasattr(term, "flush")
             assert hasattr(term, "columns")
             assert hasattr(term, "rows")
             assert hasattr(term, "on_resize")

@@ -56,6 +56,26 @@ Declared deviations from upstream:
    way; the only real difference from upstream is the loss of atomic
    redraw during a signal/resize race, which synchronized-output wrapping
    (deviation 4) guards against.
+
+   **Task 17 review, Important 1 (fix round 2) — flush granularity:** this
+   deviation is also why flushing ``sys.stdout`` inside ``RealTerminal.write``
+   itself (this port's first fix for the "newline-less frame never reaches a
+   line-buffered tty" bug, see ``terminal.py``'s ``RealTerminal.flush``
+   docstring) was the wrong granularity. Because ``do_render`` emits one
+   discrete ``term.write()`` per atomic ANSI primitive rather than upstream's
+   single accumulated buffer, a per-write flush means N flushes per rendered
+   frame (N = however many cursor-move/erase/text-chunk primitives that
+   frame happened to emit) instead of one — needless syscall overhead
+   proportional to diff complexity, not to frame count. The earlier
+   justification that "upstream's single-buffer-per-frame write makes
+   per-write equivalent to per-frame anyway" does not hold *for this port*
+   precisely because of this deviation: upstream's one-write-per-frame shape
+   is exactly what makes a per-write flush equivalent to a per-frame flush
+   *there*; this port's discrete-write shape breaks that equivalence. The
+   architecturally correct fix keeps ``write()`` flush-free and adds a
+   single ``term.flush()`` call at the very end of ``do_render`` instead
+   (see below) — restoring one flush per frame regardless of how many
+   discrete writes the diff needed.
 6. **``request_render()`` degrades to an immediate, synchronous
    ``do_render()`` call when there is no running asyncio event loop**,
    rather than upstream's Node-always-has-an-event-loop assumption
@@ -589,10 +609,37 @@ class TUI:
     def do_render(self) -> None:
         """Synchronously render one frame: diff the root's output against
         the previous frame and write only what changed. Directly callable
-        from tests (task-7 brief)."""
+        from tests (task-7 brief).
+
+        Thin wrapper around ``_do_render_impl`` so that exactly one
+        ``term.flush()`` happens per rendered frame, at the very end, no
+        matter which of ``_do_render_impl``'s many internal branches/early
+        returns actually ran (Task 17 review, Important 1 — see ``tui.py``
+        module docstring deviation 5's "flush granularity" note and
+        ``terminal.py``'s ``RealTerminal.flush`` docstring for the full
+        writeup of why frame-granularity, not write-granularity, is the
+        correct shape here)."""
         if self._stopped:
             return
+        self._do_render_impl()
+        self._flush_term()
 
+    def _flush_term(self) -> None:
+        """Call ``self.term.flush()`` if it has one. Guarded via
+        ``getattr``/``callable`` rather than calling it unconditionally
+        because ``flush`` is deliberately *not* a formal ``TerminalIO``
+        Protocol member (see ``terminal.py``'s ``TerminalIO`` docstring) —
+        a bare double implementing only ``write``/``columns``/``rows`` (the
+        original three-member surface) must keep working without raising
+        ``AttributeError``."""
+        flush = getattr(self.term, "flush", None)
+        if callable(flush):
+            flush()
+
+    def _do_render_impl(self) -> None:
+        """The diff/viewport core itself (tui.ts:1254-1620) — every branch
+        below returns directly back to ``do_render``, which flushes exactly
+        once after this method returns by whichever path."""
         height = self.term.rows
         width = self.term.columns
 
