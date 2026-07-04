@@ -99,10 +99,23 @@ class PathProvider:
         line = lines[cursor_line]
         before = line[: cursor_col - len(prefix)]
         after = line[cursor_col:]
-        new_line = before + item.value + after
+        # autocomplete.ts:407-415 (isDirectory/suffix) + :417-418,423
+        # (cursorOffset/cursorCol), ported faithfully: upstream never adds a
+        # trailing space after a directory-shaped item (so the user can keep
+        # autocompleting deeper into that directory) but always adds one
+        # after a file, and the cursor always lands right after that suffix.
+        # This port's file_list never yields a directory entry
+        # (completers.py:52-58, os.walk only ever appends files), so
+        # is_directory is always False today and the space branch always
+        # fires — the check is kept, unexercised by any real file_list today,
+        # so a future directory-yielding file_list gets the right behavior
+        # for free.
+        is_directory = item.label.endswith("/")
+        suffix = "" if is_directory else " "
+        new_line = before + item.value + suffix + after
         new_lines = list(lines)
         new_lines[cursor_line] = new_line
-        return new_lines, cursor_line, len(before) + len(item.value)
+        return new_lines, cursor_line, len(before) + len(item.value) + len(suffix)
 
 
 class CommandProvider:

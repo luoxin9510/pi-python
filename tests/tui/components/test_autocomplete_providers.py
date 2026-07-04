@@ -64,18 +64,19 @@ Produces line, derived from upstream + the existing, unmodified
    this port's trigger never distinguishes an already-quoted typed prefix —
    not in the brief's Produces list). ``item.label`` is always the raw,
    unquoted, un-prefixed path (matching ``completers.py``'s own
-   ``display_meta="file"`` convention of showing the plain path). Since
-   ``build_file_list`` (and any conforming ``file_list`` source) only ever
-   enumerates *files*, never directories (``completers.py``'s ``os.walk``
-   only appends ``files``, never a directory entry itself — completers.py:
-   52-58), upstream's directory-vs-file trailing-space distinction
-   (autocomplete.ts:410-412, "don't add a space after directories") has no
-   equivalent case here and is not ported: ``apply_completion`` always
-   places the cursor immediately after the inserted (possibly quoted)
-   value, with no added trailing space — matching Task 13's own generic
-   ``apply_completion`` convention (``test_editor_autocomplete.py``'s shared
-   ``apply_completion`` helper: cursor lands at ``cursor_col - len(prefix) +
-   len(item.value)``, nothing more).
+   ``display_meta="file"`` convention of showing the plain path).
+   ``apply_completion`` ports upstream's directory-vs-file trailing-space
+   branch faithfully (autocomplete.ts:407-415 ``isDirectory``/``suffix``,
+   :417-418/:423 ``cursorOffset``/``cursorCol``): ``suffix = "" if
+   item.label.endswith("/") else " "``, and the cursor always lands right
+   after that suffix (``len(before) + len(item.value) + len(suffix)``).
+   Since ``build_file_list`` (and any conforming ``file_list`` source) only
+   ever enumerates *files*, never directories (``completers.py``'s
+   ``os.walk`` only appends ``files``, never a directory entry itself —
+   completers.py:52-58), ``isDirectory`` is always ``False`` in practice
+   today and the space-appending branch always fires — the check is kept,
+   unexercised by any real ``file_list`` today, purely so a future
+   directory-yielding ``file_list`` gets the right behavior for free.
 4. **``is_cancelled`` is checked at two points**: once before ever awaiting
    the (possibly slow) ``file_list()`` source — so a request already known
    to be stale never starts the fetch at all — and once again immediately
@@ -254,14 +255,20 @@ class TestPathProviderQuoting:
 
 class TestPathProviderApplyCompletion:
     def test_apply_completion_single_line_cursor_lands_after_inserted_value(self) -> None:
+        """autocomplete.ts:407-415/423: a non-directory item always gets a
+        trailing space appended, and the cursor lands right after that
+        space. The text already following the cursor here ("` please`")
+        already had its own leading space, so upstream's unconditional
+        append produces a double space — upstream never trims what's after
+        the cursor, it only ever prepends."""
         provider = PathProvider(_files_fn([]))  # file_list unused by apply_completion
         item = AutocompleteItem(value="@readme.md", label="readme.md")
         lines = ["open @re please"]
         # cursor sits right after "@re" (index 8), prefix is "@re" (len 3)
         new_lines, cursor_line, cursor_col = provider.apply_completion(lines, 0, 8, item, "@re")
-        assert new_lines == ["open @readme.md please"]
+        assert new_lines == ["open @readme.md  please"]
         assert cursor_line == 0
-        assert cursor_col == len("open @readme.md")
+        assert cursor_col == len("open @readme.md ")
 
     def test_apply_completion_multiline_buffer_exact_cursor_math(self) -> None:
         provider = PathProvider(_files_fn([]))
@@ -270,19 +277,37 @@ class TestPathProviderApplyCompletion:
         # "second @re" -> before cursor length 10 ("second " is 7, "@re" is 3)
         new_lines, cursor_line, cursor_col = provider.apply_completion(lines, 1, 10, item, "@re")
         assert new_lines[0] == "first line", "untouched lines must survive verbatim"
-        assert new_lines[1] == "second @readme.md line more"
+        assert new_lines[1] == "second @readme.md  line more"
         assert new_lines[2] == "third line"
         assert cursor_line == 1
-        assert cursor_col == len("second @readme.md")
+        assert cursor_col == len("second @readme.md ")
 
     def test_apply_completion_quoted_value_cursor_math(self) -> None:
         provider = PathProvider(_files_fn([]))
         item = AutocompleteItem(value='@"my file.txt"', label="my file.txt")
         lines = ["@my"]
         new_lines, cursor_line, cursor_col = provider.apply_completion(lines, 0, 3, item, "@my")
-        assert new_lines == ['@"my file.txt"']
+        assert new_lines == ['@"my file.txt" ']
         assert cursor_line == 0
-        assert cursor_col == len('@"my file.txt"')
+        assert cursor_col == len('@"my file.txt" ')
+
+    def test_apply_completion_directory_shaped_label_appends_no_space(self) -> None:
+        """autocomplete.ts:407-415 ``isDirectory``/``suffix``: an item whose
+        ``label`` ends with "/" gets no trailing space, so the user can keep
+        autocompleting deeper into that directory. This port's own
+        ``build_file_list`` never yields a directory entry
+        (completers.py:52-58, ``os.walk`` only ever appends ``files``), so no
+        real ``file_list`` source can trigger this branch today — this test
+        exercises the ported check directly via a hand-built directory-shaped
+        item, matching this class's existing pattern of constructing items by
+        hand to unit-test ``apply_completion`` in isolation."""
+        provider = PathProvider(_files_fn([]))  # file_list unused by apply_completion
+        item = AutocompleteItem(value="@src/", label="src/")
+        lines = ["@sr"]
+        new_lines, cursor_line, cursor_col = provider.apply_completion(lines, 0, 3, item, "@sr")
+        assert new_lines == ["@src/"]
+        assert cursor_line == 0
+        assert cursor_col == len("@src/")
 
 
 # =============================================================================
@@ -564,9 +589,9 @@ class TestCombinedProviderRouting:
         new_lines, cursor_line, cursor_col = combined.apply_completion(
             [text], 0, len(text), items[0], prefix
         )
-        assert new_lines == ["look @readme.md"]
+        assert new_lines == ["look @readme.md "]
         assert cursor_line == 0
-        assert cursor_col == len("look @readme.md")
+        assert cursor_col == len("look @readme.md ")
 
     async def test_slash_trigger_routes_to_command_provider(self) -> None:
         path_provider = PathProvider(_files_fn(["readme.md"]))
