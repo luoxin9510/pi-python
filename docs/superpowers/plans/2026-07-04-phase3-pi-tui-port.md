@@ -200,7 +200,7 @@ def test_apply_background_pads_to_width():
   - word_navigation: `word_left(text: str, pos: int) -> int`、`word_right(text: str, pos: int) -> int`——西文按 UAX#29 词界近似（字母数字连续段），**CJK 按"连续 CJK 段=一个词"**（spec §9 裁决）
   - fuzzy: `fuzzy_match(query: str, candidate: str) -> int | None`（评分语义照 fuzzy.ts）、`fuzzy_filter(query: str, items: list[str]) -> list[str]`
   - kill_ring: `KillRing()`：`kill(text, prepend: bool)`、`yank() -> str`、`yank_pop() -> str`
-  - undo_stack: `UndoStack()`：`push(state: tuple[str,int])`、`undo() -> tuple[str,int] | None`、`redo()`——合并策略照 undo-stack.ts
+  - undo_stack: `UndoStack()`：`push(state: tuple[str,int])`、`undo() -> tuple[str,int] | None`、`clear()`——**无 redo、无合并策略**（上游 undo-stack.ts 就是裸栈；此前"合并策略照上游/redo"系 brief 幻觉，审核证伪后删除；Task 12 编辑器仅绑 undo，与上游一致）
 - Consumes: Task 4 `key_id`
 
 **上游规范源**：同名五个 ts 文件；fuzzy/undo/kill-ring 若上游有测试则 [TEST-PORT]，无则按接口写新测试。
