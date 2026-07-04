@@ -7,10 +7,10 @@ import re
 import pytest
 
 from pipython.tui.engine.terminal import (
-    CLEAR_LINE,
     HIDE_CURSOR,
     SHOW_CURSOR,
 )
+from pipython.tui.engine.tui import ERASE_LINE_FULL
 
 
 class RecordingTerm:
@@ -96,8 +96,14 @@ class RecordingTerm:
         # not columns, so it's a no-op here.
         elif op == "\r":
             pass
-        # Handle erase_line (CLEAR_LINE = "\x1b[K")
-        elif op == CLEAR_LINE:
+        # Handle erase_line — doRender's own literal, ERASE_LINE_FULL =
+        # "\x1b[2K" (tui.ts:1432/1508/1519/1564), NOT terminal.py's
+        # CLEAR_LINE = "\x1b[K" (terminal.ts:493, a different call site:
+        # RealTerminal.erase_line(), which tui.py never calls). Fix round 1:
+        # this double previously matched against terminal.py's CLEAR_LINE,
+        # which silently stopped matching once tui.py was corrected to write
+        # its own upstream-faithful literal instead.
+        elif op == ERASE_LINE_FULL:
             self._lines[self._cursor_row] = ""
         # Handle cursor visibility (no screen effect)
         elif op in (HIDE_CURSOR, SHOW_CURSOR):

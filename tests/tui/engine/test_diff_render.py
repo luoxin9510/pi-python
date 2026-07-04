@@ -234,6 +234,57 @@ class TestDiffRender:
             f"5 request_render calls should coalesce, got {render_count} renders"
         )
 
+    def test_request_render_force_clears_and_redraws(self, term: RecordingTerm, tui: TUI) -> None:
+        """``request_render(force=True)`` must clear-and-redraw like upstream.
+
+        Upstream's ``requestRender(force=true)`` sets ``previousWidth``/
+        ``previousHeight = -1`` (tui.ts:715-716), which routes the *next*
+        ``doRender`` into the ``widthChanged`` branch (tui.ts:1343-1345) —
+        ``fullRender(true)``: clear screen + scrollback + cursor home
+        (``"\\x1b[2J\\x1b[H\\x1b[3J"``, tui.ts:1289), then repaint every line
+        fresh. It is NOT upstream's plain first-render path (tui.ts:1336-1339,
+        ``fullRender(false)`` — no clear), which is what a force that only
+        resets ``previousLines`` would fall into instead: since
+        ``previousLines`` is now empty, ``do_render`` would take the
+        "first render" branch and skip the clear sequence entirely, leaving
+        old on-screen content behind the fresh repaint (overlapping/corrupted
+        output) instead of a clean redraw.
+        """
+        component = StaticComponent(["line 1", "line 2", "line 3"])
+        tui.set_root(component)
+        tui.do_render()
+
+        term.ops.clear()
+
+        # No running event loop in this synchronous test, so
+        # request_render() degrades to an immediate do_render() call
+        # (module docstring deviation 6) — the explicit do_render() below is
+        # a harmless no-op second call, included per the brief's wording.
+        tui.request_render(force=True)
+        tui.do_render()
+
+        assert len(term.ops) > 0, "Forced render should produce ops"
+
+        # The clear sequence must be the very first thing written — before
+        # any repainted content — exactly matching fullRender(true)'s own
+        # buffer order (tui.ts:1287-1289).
+        assert term.ops[0] == "\x1b[2J\x1b[H\x1b[3J", (
+            "Forced render must clear screen+scrollback+home before repainting"
+        )
+
+        # All lines rewritten fresh after the clear (a full repaint, not a
+        # partial diff).
+        ops_text = "".join(term.ops)
+        assert "line 1" in ops_text
+        assert "line 2" in ops_text
+        assert "line 3" in ops_text
+
+        screen = term.screen()
+        final_text = "".join(screen)
+        assert "line 1" in final_text
+        assert "line 2" in final_text
+        assert "line 3" in final_text
+
 
 class TestComponentProtocol:
     """Verify Component and Container protocol conformance."""
@@ -297,3 +348,69 @@ class TestComponentProtocol:
 
         tui.set_focus(None)
         assert comp2.focused is False  # type: ignore
+
+
+class HandlingComponent:
+    """Minimal Component with an optional ``handle_input`` that records every
+    frame it receives, exactly as passed (no parsing/copying)."""
+
+    focused = False
+
+    def __init__(self) -> None:
+        self.received: list[str] = []
+
+    def render(self, width: int) -> list[str]:
+        return []
+
+    def invalidate(self) -> None:
+        pass
+
+    def handle_input(self, data: str) -> None:
+        self.received.append(data)
+
+
+class TestHandleInputDispatch:
+    """``TUI.handle_input``'s dispatch core (tui.ts's ``handleInput``, minus
+    overlay/debug-key routing — a later task's job, see module docstring
+    deviation 9): forward the raw frame to the focused component's optional
+    ``handle_input``, verbatim, or no-op if there is none/no focus."""
+
+    def test_focused_component_receives_exact_frame(self, tui: TUI) -> None:
+        """A plain input frame reaches the focused component's handle_input
+        unmodified."""
+        component = HandlingComponent()
+        tui.set_focus(component)
+
+        tui.handle_input("x")
+
+        assert component.received == ["x"]
+
+    def test_focused_component_receives_paste_marker_frame_verbatim(self, tui: TUI) -> None:
+        """A bracketed-paste frame — markers preserved, per
+        ``stdin_buffer.py``'s single-channel-paste contract (``ESC[200~`` ...
+        ``ESC[201~``, with the markers kept in the frame content) — passes
+        through ``handle_input`` exactly as received. ``TUI.handle_input``
+        does no parsing or stripping of its own; that is the component's job
+        (module docstring: "Parsing the frame into a ``KeyEvent`` is the
+        component's own responsibility")."""
+        component = HandlingComponent()
+        tui.set_focus(component)
+
+        paste_frame = "\x1b[200~pasted text\x1b[201~"
+        tui.handle_input(paste_frame)
+
+        assert component.received == [paste_frame]
+
+    def test_focused_component_without_handle_input_is_noop(self, tui: TUI) -> None:
+        """A focused component with no ``handle_input`` at all (an entirely
+        valid, render-only ``Component`` — see module docstring deviation 9)
+        must not crash ``TUI.handle_input``."""
+        component = StaticComponent(["line 1"])
+        component.focused = False  # type: ignore[attr-defined]
+        tui.set_focus(component)
+
+        tui.handle_input("x")  # must not raise
+
+    def test_no_focus_is_noop(self, tui: TUI) -> None:
+        """No focused component at all: handle_input is a no-op."""
+        tui.handle_input("x")  # must not raise

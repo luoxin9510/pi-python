@@ -95,14 +95,24 @@ Declared deviations from upstream:
 10. **``Component.wantsKeyRelease`` (tui.ts:81) is not ported at all** — it
     is outside the task-7 brief's Produces list entirely (an input-dispatch
     concern belonging to a later task), not omitted by oversight.
+11. **Upstream's width-exceeds-terminal crash-log branch is not ported**
+    (``if (!isImage && visibleWidth(line) > width) { ... }``, tui.ts:1519-1545)
+    — the case where a rendered line is wider than the terminal writes a
+    debug dump to ``~/.pi/agent/pi-crash.log``, stops the terminal, and
+    throws. That is a debug safety net for catching a misbehaving component
+    during upstream development, not part of the diff algorithm itself;
+    unconditional filesystem writes from deep inside a render call are
+    undesirable in this port regardless. Omitting it does not change any
+    diff/viewport behavior this task's tests exercise — a too-wide line still
+    gets erased (``ERASE_LINE_FULL``) and written by the surrounding code
+    exactly as upstream does either way, just without the crash-log side
+    effect and the ``throw``.
 """
 
 from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING, Protocol, TypeGuard
-
-from .terminal import CLEAR_LINE
 
 if TYPE_CHECKING:
     from asyncio import Handle
@@ -111,6 +121,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CURSOR_MARKER",
+    "ERASE_LINE_FULL",
     "Component",
     "Focusable",
     "is_focusable",
@@ -129,6 +140,20 @@ emits at the cursor position in its rendered output (tui.ts:120). Terminals
 ignore it outright. Finding and stripping it, then positioning the hardware
 cursor there, is a later task's job (see module docstring deviation 2) —
 this task only defines the constant for that task to consume."""
+
+
+ERASE_LINE_FULL = "\x1b[2K"
+"""Erase-entire-line sequence ``doRender`` itself builds directly into its
+buffer (tui.ts:1432, 1508 [Kitty-image row-clear — out of scope, module
+docstring deviation 3], 1519, 1564) — literal ``"\\x1b[2K"``, distinct from
+``terminal.py``'s ``CLEAR_LINE = "\\x1b[K"`` (terminal.ts:493, ``clearLine()``
+method). Those are two different upstream call sites: ``doRender`` never
+calls ``terminal.clearLine()``; it always inlines its own erase literal.
+Fix round 1: this port previously imported and wrote ``terminal.py``'s
+``CLEAR_LINE`` here by mistake — same *purpose* (erase a line) but the wrong
+*bytes*, one column short of upstream's own (a full ``\\x1b[2K`` clears the
+entire line regardless of cursor column; ``\\x1b[K`` only clears from the
+cursor to the end of the line)."""
 
 
 # =============================================================================
@@ -242,6 +267,16 @@ class TUI:
         self._max_lines_rendered = 0  # tui.ts:314
         self._previous_viewport_top = 0  # tui.ts:315
 
+        # Fix round 1: minimal stand-in for upstream's previousWidth/
+        # previousHeight = -1 sentinel (tui.ts:715-716), which routes the
+        # next doRender into the widthChanged branch — fullRender(true), a
+        # clear-and-redraw — rather than the plain first-render path
+        # (fullRender(false), no clear). Since this port doesn't track
+        # previous_width/previous_height at all (deviation 1), a dedicated
+        # flag plays the same "force the next render to clear" role without
+        # implementing full resize tracking.
+        self._force_full_clear = False
+
     # -- component tree --------------------------------------------------
 
     def set_root(self, component: Component) -> None:
@@ -294,14 +329,22 @@ class TUI:
     def request_render(self, force: bool = False) -> None:
         """Coalesce repeated calls into a single ``do_render()`` per event
         loop turn (module docstring deviation 7). ``force=True`` resets all
-        diff state immediately so the next render is a full first-render-style
-        repaint (tui.ts:713-720)."""
+        diff state immediately and arms ``_force_full_clear`` so the next
+        ``do_render()`` clears the screen+scrollback and repaints everything
+        fresh (tui.ts:713-720) — matching upstream's ``previousWidth``/
+        ``previousHeight = -1`` sentinel routing into the ``widthChanged``
+        branch (tui.ts:1343-1345, ``fullRender(true)``), NOT upstream's plain
+        first-render path (``fullRender(false)``, tui.ts:1336-1339), which
+        never clears and would leave stale content on screen underneath the
+        repaint (fix round 1 — see ``_force_full_clear``'s own comment in
+        ``__init__``)."""
         if force:
             self._previous_lines = []
             self._cursor_row = 0
             self._hardware_cursor_row = 0
             self._max_lines_rendered = 0
             self._previous_viewport_top = 0
+            self._force_full_clear = True
 
         if self._render_scheduled:
             return
@@ -364,6 +407,20 @@ class TUI:
             self._previous_viewport_top = max(0, buffer_length - height)
             self._previous_lines = new_lines
 
+        # Forced full clear (fix round 1): stands in for upstream's
+        # previousWidth/previousHeight = -1 sentinel reaching the
+        # widthChanged branch (tui.ts:1343-1345) — checked *before* the
+        # plain first-render branch below, exactly like upstream checks
+        # widthChanged before falling through to the unconditional
+        # first-render path. Must win even though request_render(force=True)
+        # also empties _previous_lines (which would otherwise satisfy the
+        # first-render branch's condition too, but with the wrong — no clear
+        # — fullRender(False) behavior).
+        if self._force_full_clear:
+            self._force_full_clear = False
+            full_render(True)
+            return
+
         # First render — just output everything (tui.ts:1335-1339).
         if not self._previous_lines:
             full_render(False)
@@ -422,7 +479,7 @@ class TUI:
                     self._move_cursor(clear_start_offset)
                 for i in range(extra_lines):
                     self.term.write("\r")
-                    self.term.write(CLEAR_LINE)
+                    self.term.write(ERASE_LINE_FULL)
                     if i < extra_lines - 1:
                         self._move_cursor(1)
                 move_back = max(0, extra_lines - 1 + clear_start_offset)
@@ -463,7 +520,7 @@ class TUI:
         for i in range(first_changed, render_end + 1):
             if i > first_changed:
                 self.term.write("\r\n")
-            self.term.write(CLEAR_LINE)
+            self.term.write(ERASE_LINE_FULL)
             self.term.write(new_lines[i])
 
         final_cursor_row = render_end
@@ -477,7 +534,7 @@ class TUI:
             extra_lines = len(self._previous_lines) - len(new_lines)
             for _ in range(len(new_lines), len(self._previous_lines)):
                 self.term.write("\r\n")
-                self.term.write(CLEAR_LINE)
+                self.term.write(ERASE_LINE_FULL)
             self._move_cursor(-extra_lines)
 
         self._cursor_row = max(0, len(new_lines) - 1)
