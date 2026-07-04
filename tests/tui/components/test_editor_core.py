@@ -898,13 +898,11 @@ class TestWordWrapping:
         Upstream drives ``wordWrapLine`` with a synthetic pre-segmented
         array that treats the paste marker as a single atomic segment
         (editor.ts's ``wordWrapLine`` third parameter). This port's
-        ``_word_wrap_line`` has no such parameter — module docstring
-        deviation 4 documents that no paste-marker/atomic-segment awareness
-        is ported at all (Task 12 territory). The marker text below is
-        therefore wrapped like any other unbreakable run of characters; the
-        invariant this port *can* still verify through the public
-        ``Editor.render()`` surface is that no rendered line ever exceeds
-        the terminal width.
+        ``_word_wrap_line`` now has pre_segmented parameter support —
+        Task 12 adds paste-marker/atomic-segment awareness. The marker text
+        below is therefore treated as a single atomic unit when possible;
+        the invariant this port verifies through the public ``Editor.render()``
+        surface is that no rendered line ever exceeds the terminal width.
         """
         from pipython.tui.components.editor import Editor
         from pipython.tui.engine.utils import visible_width
@@ -923,8 +921,8 @@ class TestWordWrapping:
     def test_splits_oversized_atomic_segment_at_start_of_line(self):
         """Splits oversized atomic segment at start of line.
 
-        See ``test_splits_oversized_atomic_segment_across_multiple_chunks``'s
-        docstring for why this diverges from upstream's pre-segmented setup.
+        Verifies atomic marker handling at line start. See
+        ``test_splits_oversized_atomic_segment_across_multiple_chunks`` for context.
         """
         from pipython.tui.components.editor import Editor
         from pipython.tui.engine.utils import visible_width
@@ -942,8 +940,8 @@ class TestWordWrapping:
     def test_splits_oversized_atomic_segment_at_end_of_line(self):
         """Splits oversized atomic segment at end of line.
 
-        See ``test_splits_oversized_atomic_segment_across_multiple_chunks``'s
-        docstring for why this diverges from upstream's pre-segmented setup.
+        Verifies atomic marker handling at line end. See
+        ``test_splits_oversized_atomic_segment_across_multiple_chunks`` for context.
         """
         from pipython.tui.components.editor import Editor
         from pipython.tui.engine.utils import visible_width
