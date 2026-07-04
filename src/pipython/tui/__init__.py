@@ -44,5 +44,11 @@ def main(argv: list[str] | None = None) -> int:
 
     from .app import run_app
 
-    asyncio.run(run_app(model=args.model, cwd=args.cwd.resolve()))
+    try:
+        asyncio.run(run_app(model=args.model, cwd=args.cwd.resolve()))
+    except KeyboardInterrupt:
+        # SIGINT handler 只覆盖运行中的 turn，prompt_toolkit 只覆盖输入编辑；
+        # 两者之间的窗口（比如 pre-prompt 的 file-list 刷新）冒出的
+        # KeyboardInterrupt 会一路顶到这里——干净退出而不是甩 traceback（issue #6）。
+        return 130
     return 0

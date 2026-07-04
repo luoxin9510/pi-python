@@ -91,7 +91,12 @@ async def run_app(*, model: str, cwd: Path) -> None:
     loop = asyncio.get_running_loop()
     try:
         while True:
-            completer.file_list = await build_file_list(cwd)
+            try:
+                completer.file_list = await build_file_list(cwd)
+            except KeyboardInterrupt:
+                # 刷新期间的 Ctrl+C 不该退出整个 app：保留旧列表，照常落到本轮
+                # prompt（issue #6）——不 continue，否则会跳过这一轮 prompt_async。
+                pass
             try:
                 text = (await prompt_session.prompt_async()).strip()
             except EOFError:  # Ctrl+D 空缓冲
