@@ -141,6 +141,14 @@ Deviations from upstream, beyond the interface narrowing already listed:
   1 column of width per cell) rather than bailing out to raw text — a
   narrower, but always-render-something, fallback for this edge case
   (untested; none of this task's fixtures are narrow enough to hit it).
+- Task-list checkboxes (``item.task``/``item.checked``, markdown.ts:620-622)
+  are not available for free the way upstream gets them from ``marked``'s
+  own GFM tokenizer: this repo's ``markdown-it-py`` setup has no
+  ``mdit-py-plugins`` tasklist extension (a new runtime dependency, out of
+  scope per this repo's frozen-dependency policy), so :func:`_extract_task_marker`
+  hand-rolls detection off a list item's first paragraph's leading inline
+  text instead, matching upstream's rendered ``"[ ] "``/``"[x] "`` marker
+  behavior exactly (always-lowercase ``"x"``, never source-case-preserving).
 """
 
 from __future__ import annotations
@@ -426,7 +434,7 @@ def _build_nodes(tokens: list[Token]) -> list[Node]:
                 {
                     "type": "code",
                     "content": tok.content,
-                    "lang": tok.info or "",
+                    "lang": (tok.info or "").strip(),
                     "map": _token_map(tok),
                 }
             )
@@ -694,6 +702,68 @@ def _render_hr(width: int) -> list[str]:
     return [_hr_style("─" * min(width, 80))]
 
 
+#: Hand-rolled equivalent of ``marked``'s ``listIsTask: /^\[[ xX]\] +\S/``
+#: tokenizer regex (module docstring deviation note): anchored at the very
+#: start of the item's leading text, requires the checkbox + at least one
+#: space. Unlike ``listIsTask``, this does *not* also require the following
+#: non-space char via a lookahead here — markdown-it-py splits a paragraph's
+#: inline children at markup boundaries (bold/italic/code/link/...), so the
+#: checkbox's own leading ``text`` token can end right after the marker
+#: (e.g. ``"[ ] "`` with the real content living in a *later* sibling token
+#: such as ``strong_open``); requiring ``\S`` inside this single token would
+#: wrongly reject that case. The "is there real content after the marker at
+#: all" check is instead done across the whole item in
+#: :func:`_extract_task_marker` (``has_content``), matching ``listIsTask``'s
+#: intent without its single-token blind spot.
+_TASK_CHECKBOX_RE = re.compile(r"^\[([ xX])\] +")
+
+
+def _extract_task_marker(item_nodes: list[Node]) -> tuple[str, list[Node]]:
+    """Hand-rolled ``item.task``/``item.checked`` detection (markdown.ts:
+    620-622, module docstring deviation note): this port has no
+    ``mdit-py-plugins`` tasklist dependency, so a list item's task marker is
+    detected directly off its first paragraph's leading inline *text* token
+    (module docstring adapter note 1: inline children are a flat *run* of
+    mixed token types — ``text``/``strong_open``/``text``/``strong_close``/
+    etc. — split at markup boundaries, *not* always a single flat ``text``
+    token; a checkbox immediately followed by bold/italic/code/link content
+    lands its own ``"[ ] "`` marker in ``inline[0]`` with the real content
+    starting only in a *later* sibling token, e.g. ``inline[1]`` being
+    ``strong_open``).
+
+    Returns ``("", item_nodes)`` unchanged when the item isn't a paragraph,
+    has no inline text, that text doesn't start with a checkbox marker, or
+    there is no real (non-whitespace) content anywhere after the marker
+    (checked via ``has_content`` below: either left over in ``inline[0]``'s
+    own remainder, or carried by a later inline token, or by a later item
+    node — mirroring ``marked``'s ``listIsTask: /^\\[[ xX]\\] +\\S/`` trailing
+    ``\\S`` requirement without needing it all inside one token). Otherwise
+    returns the rendered marker (``"[ ] "``/``"[x] "``, always lowercase
+    regardless of source case — markdown.ts:620) plus a *new* item-node list
+    with the leading marker text stripped from a *copy* of the first
+    paragraph's first inline token (the original ``Token``/``Node`` is left
+    untouched)."""
+    if not item_nodes or item_nodes[0]["type"] != "paragraph":
+        return "", item_nodes
+    inline: list[Token] = item_nodes[0]["inline"]
+    if not inline or inline[0].type != "text":
+        return "", item_nodes
+    match = _TASK_CHECKBOX_RE.match(inline[0].content)
+    if match is None:
+        return "", item_nodes
+
+    remainder = inline[0].content[match.end() :]
+    has_content = remainder.strip() != "" or len(inline) > 1 or len(item_nodes) > 1
+    if not has_content:
+        return "", item_nodes
+
+    checked = match.group(1) != " "
+    task_marker = f"[{'x' if checked else ' '}] "
+    new_first_text = inline[0].copy(content=remainder)
+    new_paragraph: Node = {**item_nodes[0], "inline": [new_first_text, *inline[1:]]}
+    return task_marker, [new_paragraph, *item_nodes[1:]]
+
+
 def _render_list(node: Node, depth: int, width: int, caps: TermCaps) -> list[str]:
     """``renderList`` (markdown.ts:604-654)."""
     lines: list[str] = []
@@ -705,7 +775,9 @@ def _render_list(node: Node, depth: int, width: int, caps: TermCaps) -> list[str
 
     for idx, item_nodes in enumerate(items):
         is_last = idx == n_items - 1
-        marker = f"{start + idx}. " if ordered else "- "
+        bullet = f"{start + idx}. " if ordered else "- "
+        task_marker, item_nodes = _extract_task_marker(item_nodes)
+        marker = bullet + task_marker  # markdown.ts:621 `const marker = bullet + taskMarker`
         first_prefix = indent + _list_bullet(marker)
         continuation_prefix = indent + " " * visible_width(marker)
         item_width = max(1, width - visible_width(first_prefix))

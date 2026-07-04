@@ -367,6 +367,79 @@ class TestNestedList:
 
 
 # ==============================================================================
+# TASK-LIST CHECKBOXES (hand-rolled, no mdit-py-plugins dep) — markdown.ts:620-622
+# ==============================================================================
+
+
+class TestTaskListCheckbox:
+    """Upstream concatenates ``taskMarker`` (``"[ ] "``/``"[x] "``) into the
+    list marker and styles the *whole* ``"- [ ] "`` prefix with
+    ``theme.listBullet`` (markdown.ts:620-622: ``const taskMarker = item.task
+    ? `[${item.checked ? "x" : " "}] ` : ""; const marker = bullet +
+    taskMarker;``). This port has no ``mdit-py-plugins`` tasklist dependency,
+    so detection is hand-rolled directly off the item's first paragraph's
+    leading inline text (see module docstring deviation note)."""
+
+    def test_unchecked_checkbox_styled_with_bullet(self):
+        md = Markdown("- [ ] todo", TRUE_COLOR_NO_HYPERLINKS)
+        bullet = _Theme.list_bullet("- [ ] ")
+        assert md.render(80) == [f"{bullet}todo"]
+
+    def test_checked_checkbox_styled_with_bullet(self):
+        md = Markdown("- [x] done", TRUE_COLOR_NO_HYPERLINKS)
+        bullet = _Theme.list_bullet("- [x] ")
+        assert md.render(80) == [f"{bullet}done"]
+
+    def test_uppercase_x_checkbox_normalizes_to_lowercase_marker(self):
+        """Upstream's rendered marker is always ``item.checked ? "x" : " "``
+        (lowercase literal) regardless of source case — verified against
+        ``marked``'s own checked derivation (``checked: p[0] !== "[ ]"``,
+        no case-preservation of the bracket content)."""
+        md = Markdown("- [X] DONE", TRUE_COLOR_NO_HYPERLINKS)
+        bullet = _Theme.list_bullet("- [x] ")
+        assert md.render(80) == [f"{bullet}DONE"]
+
+    def test_ordered_list_checkbox_also_styled(self):
+        """``taskMarker`` applies to ordered lists too (markdown.ts:620-622
+        reads ``item.task``/``item.checked`` regardless of ``token.ordered``)."""
+        md = Markdown("1. [ ] first\n2. [x] second", TRUE_COLOR_NO_HYPERLINKS)
+        b1 = _Theme.list_bullet("1. [ ] ")
+        b2 = _Theme.list_bullet("2. [x] ")
+        assert md.render(80) == [f"{b1}first", f"{b2}second"]
+
+    def test_mid_text_bracket_pair_left_untouched(self):
+        """A ``[ ]`` that is not the item's very first content must not be
+        detected as a checkbox (upstream/marked anchors task detection at the
+        item's start, ``listIsTask: /^\\[[ xX]\\] +\\S/``)."""
+        md = Markdown("- todo [ ] not a checkbox", TRUE_COLOR_NO_HYPERLINKS)
+        bullet = _Theme.list_bullet("- ")
+        assert md.render(80) == [f"{bullet}todo [ ] not a checkbox"]
+
+    def test_checkbox_followed_by_inline_markup_still_detected(self):
+        """A checkbox immediately followed by inline markup (bold/italic/
+        code/link/...) must still be detected, even though markdown-it-py
+        splits the paragraph's inline children at that markup boundary —
+        the checkbox's own leading ``text`` token ends up as exactly
+        ``"[ ] "`` with no trailing ``\\S`` of its own (the real content
+        lives in a *later* sibling token, e.g. ``strong_open``/``text``/
+        ``strong_close``). A naive single-token ``\\S``-lookahead check
+        would miss this (regression guard)."""
+        md = Markdown("- [ ] **bold** rest of line", TRUE_COLOR_NO_HYPERLINKS)
+        bullet = _Theme.list_bullet("- [ ] ")
+        expected = f"{bullet}{_Theme.bold('bold')} rest of line"
+        assert md.render(80) == [expected]
+
+    def test_empty_checkbox_with_no_content_is_not_a_task(self):
+        """A checkbox with nothing (or only whitespace) after it anywhere in
+        the item is not a real task per GFM's trailing ``\\S`` requirement
+        (``listIsTask: /^\\[[ xX]\\] +\\S/``) — rendered as a plain bullet
+        with the literal ``"[ ]"`` text untouched."""
+        md = Markdown("- [ ]", TRUE_COLOR_NO_HYPERLINKS)
+        bullet = _Theme.list_bullet("- ")
+        assert md.render(80) == [f"{bullet}[ ]"]
+
+
+# ==============================================================================
 # FENCED CODE (fixture: fenced_code.md) — markdown.ts:378-398
 # ==============================================================================
 
@@ -379,6 +452,17 @@ class TestFencedCode:
         lines = md.render(80)
         assert lines[0] == _Theme.code_block_border("```python")
         assert lines[-1] == _Theme.code_block_border("```")
+
+    def test_fence_lang_trimmed_of_trailing_whitespace(self):
+        """``node["lang"]`` must be ``.strip()``-ped (upstream marked's own
+        ``fences()`` tokenizer trims its lang/info capture) — markdown-it-py's
+        own ``tok.info`` does *not* strip trailing whitespace on its own
+        (verified empirically: fencing with ``python   `` (trailing spaces)
+        parses to ``tok.info == "python   "``), so an untrimmed lang would
+        leak into the rendered border line."""
+        md = Markdown("```python   \nx = 1\n```", TRUE_COLOR_NO_HYPERLINKS)
+        lines = md.render(80)
+        assert lines[0] == _Theme.code_block_border("```python")
 
     def test_code_content_lines_styled_and_indented(self):
         """Each content line wrapped in ``theme.codeBlock`` with the
