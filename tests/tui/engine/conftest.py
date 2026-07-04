@@ -79,8 +79,14 @@ class RecordingTerm:
 
     def _apply(self, op: str) -> None:
         """Apply a single write()'s data to the persistent virtual screen."""
+        # Handle clear sequence (full screen clear + home + scrollback clear):
+        # "\x1b[2J\x1b[H\x1b[3J" — reset all lines and move cursor home.
+        # This is a composite sequence handled as a unit (Task 8 housekeeping).
+        if op == "\x1b[2J\x1b[H\x1b[3J":
+            self._lines = ["" for _ in range(self.rows)]
+            self._cursor_row = 0
         # Handle move_to_row: CSI <n>B (down) or CSI <n>A (up)
-        if match := re.match(r"\x1b\[(\d+)B", op):
+        elif match := re.match(r"\x1b\[(\d+)B", op):
             delta = int(match.group(1))
             self._cursor_row = min(self._cursor_row + delta, self.rows - 1)
         elif match := re.match(r"\x1b\[(\d+)A", op):

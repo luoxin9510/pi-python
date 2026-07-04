@@ -114,6 +114,9 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Protocol, TypeGuard
 
+from .terminal import HIDE_CURSOR, SHOW_CURSOR
+from .utils import visible_width
+
 if TYPE_CHECKING:
     from asyncio import Handle
 
@@ -127,6 +130,7 @@ __all__ = [
     "is_focusable",
     "Container",
     "TUI",
+    "OverlayHandle",
 ]
 
 
@@ -229,6 +233,55 @@ class Container:
 
 
 # =============================================================================
+# Overlay stack (tui.ts:326, 366-620 focus-restore state machine, 509-580
+# showOverlay's returned handle) — Task 8's addition on top of Task 7's
+# Component/Container/diff core above.
+# =============================================================================
+
+
+class _OverlayEntry:
+    """tui.ts:398-405 ``OverlayStackEntry``, narrowed to this port's
+    simplified ``show_overlay(component, *, anchor_row=None)`` signature: no
+    ``options``/``hidden``/``focusOrder`` fields because this port has no
+    ``OverlayOptions`` (anchor enum/margins/width/maxHeight/visible-callback/
+    nonCapturing), no ``setHidden``, and no ``.focus()``-triggered
+    refocusing — the overlay stack's list order already *is* paint/focus
+    order (entries are only ever appended, never reordered), so a separate
+    monotonic ``focusOrder`` counter would carry no information a plain list
+    index doesn't already have."""
+
+    def __init__(
+        self, component: Component, pre_focus: Component | None, anchor_row: int | None
+    ) -> None:
+        self.component = component
+        self.pre_focus = pre_focus
+        self.anchor_row = anchor_row
+
+
+class OverlayHandle:
+    """tui.ts:509-580 ``showOverlay``'s returned handle object, narrowed to
+    ``.close()`` only per this task's brief Produces list — upstream's
+    ``.setHidden()``/``.focus()``/``.unfocus()``/``.isFocused()``/
+    ``.isHidden()`` are out of scope (no hide/reveal or manual-refocus API on
+    this port's overlay surface)."""
+
+    def __init__(self, tui: TUI, entry: _OverlayEntry) -> None:
+        self._tui = tui
+        self._entry = entry
+
+    def close(self) -> None:
+        """tui.ts:527-541, the ``hide: () => {...}`` closure returned by
+        ``showOverlay``: remove this overlay from the stack, retarget any
+        other overlay whose ``pre_focus`` pointed at it
+        (``retargetOverlayPreFocus``, tui.ts:411-417 — this is what makes
+        closing overlays *out of order* safe, see ``TUI._close_overlay``),
+        and — only if this overlay currently holds focus — restore focus to
+        the new topmost overlay, or, if none remain, to whichever component
+        held focus before this overlay opened."""
+        self._tui._close_overlay(self._entry)
+
+
+# =============================================================================
 # TUI (tui.ts:295-1714; this task ports only the doRender diff/viewport core,
 # tui.ts:1254-1620 — see module docstring for the full scope statement)
 # =============================================================================
@@ -258,14 +311,40 @@ class TUI:
         self._render_scheduled = False
         self._render_handle: Handle | None = None
 
-        # Diff/viewport bookkeeping (tui.ts:297-315). previous_width/
-        # previous_height are intentionally absent — see module docstring
-        # deviation 1.
+        # Diff/viewport bookkeeping (tui.ts:297-315).
         self._previous_lines: list[str] = []
         self._cursor_row = 0  # tui.ts:310 — end of rendered content
         self._hardware_cursor_row = 0  # tui.ts:311 — actual cursor row
         self._max_lines_rendered = 0  # tui.ts:314
         self._previous_viewport_top = 0  # tui.ts:315
+
+        # tui.ts:298-299 previousWidth/previousHeight — Task 8 addition (Task
+        # 7 deliberately omitted these, see module docstring deviation 1's
+        # "as of Task 7" framing). 0 is upstream's own sentinel for "no
+        # render yet" (doRender's widthChanged/heightChanged both require
+        # previous_* != 0 first — so a genuine first render never counts as
+        # a resize no matter what the terminal's actual current size is).
+        self._previous_width = 0
+        self._previous_height = 0
+
+        # Task 8 addition: idempotent HIDE_CURSOR/SHOW_CURSOR toggling.
+        # Upstream's positionHardwareCursor (tui.ts:1627-1656) calls
+        # terminal.hideCursor()/showCursor() unconditionally on *every*
+        # doRender — real terminals don't care about redundant hide/show
+        # writes, but this port's discrete-write test double
+        # (RecordingTerm) records every write() as a distinct op, and
+        # Task 7's own `test_unchanged_rerender_writes_nothing` baseline gate
+        # asserts *zero* new ops on a second identical render. Tracking
+        # whether the hardware cursor is currently shown/hidden and only
+        # writing on an actual transition preserves that baseline while
+        # still positioning the cursor (row/col move) on every render that
+        # has a marker, exactly as upstream does unconditionally.
+        self._cursor_visible = True
+
+        # tui.ts:326 overlayStack — Task 8 addition. See module docstring
+        # for what this port's overlay surface omits relative to upstream's
+        # full OverlayOptions/overlayFocusRestore state machine.
+        self._overlay_stack: list[_OverlayEntry] = []
 
         # Fix round 1: minimal stand-in for upstream's previousWidth/
         # previousHeight = -1 sentinel (tui.ts:715-716), which routes the
@@ -306,6 +385,58 @@ class TUI:
         if callable(handler):
             handler(data)
 
+    # -- overlay stack (tui.ts:509-580, 411-417) ----------------------------
+
+    def show_overlay(self, component: Component, *, anchor_row: int | None = None) -> OverlayHandle:
+        """tui.ts:509-580 ``showOverlay``, narrowed to this port's simplified
+        signature (``anchor_row`` only — no ``OverlayOptions`` anchor
+        enum/margins/width/maxHeight/visible-callback/nonCapturing; see
+        module docstring). Records the currently-focused component as the
+        new entry's ``pre_focus`` *before* moving focus (tui.ts:512-517),
+        then steals focus via the existing ``set_focus`` (Task 7 contract:
+        reads/writes ``.focused``) and requests a render so the overlay
+        actually appears without the caller needing to call ``do_render()``
+        itself (tui.ts:518-519's ``terminal.hideCursor()``/
+        ``requestRender()`` — the immediate ``hideCursor()`` call is skipped
+        as a redundant nicety: this port's own ``_position_hardware_cursor``
+        already converges to the right hidden/shown state by the end of the
+        render ``request_render()`` triggers here)."""
+        entry = _OverlayEntry(component=component, pre_focus=self._focused, anchor_row=anchor_row)
+        self._overlay_stack.append(entry)
+        self.set_focus(component)
+        self.request_render()
+        return OverlayHandle(self, entry)
+
+    def _close_overlay(self, entry: _OverlayEntry) -> None:
+        """tui.ts:527-541's ``hide()`` closure body. Safe to call for an
+        overlay that isn't the topmost (out-of-order close, tui.ts's own
+        stack-invariant comment at 366-380): ``_retarget_overlay_pre_focus``
+        runs *before* removal so any overlay still open that was chained to
+        this one's focus keeps a valid restore target, and focus is only
+        ever touched here if THIS overlay currently holds it — closing a
+        non-focused overlay from underneath the current one is a pure
+        stack-membership change with no focus side effect at all."""
+        if entry not in self._overlay_stack:
+            return
+        self._retarget_overlay_pre_focus(entry)
+        self._overlay_stack.remove(entry)
+        if self._focused is entry.component:
+            top = self._overlay_stack[-1] if self._overlay_stack else None
+            self.set_focus(top.component if top is not None else entry.pre_focus)
+        self.request_render()
+
+    def _retarget_overlay_pre_focus(self, removed: _OverlayEntry) -> None:
+        """tui.ts:411-417 ``retargetOverlayPreFocus``: any *other* still-open
+        overlay whose ``pre_focus`` pointed at the overlay being removed
+        gets repointed at what that removed overlay would itself have
+        restored focus to. Without this, closing overlays out of order
+        (bottom-of-stack first, e.g. open A, B then close A while B is still
+        open) would leave B's ``pre_focus`` dangling on a component (A) that
+        is no longer part of the overlay stack at all."""
+        for overlay in self._overlay_stack:
+            if overlay is not removed and overlay.pre_focus is removed.component:
+                overlay.pre_focus = removed.pre_focus
+
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
@@ -323,6 +454,27 @@ class TUI:
             self._render_handle.cancel()
             self._render_handle = None
         self._render_scheduled = False
+
+    # -- resize (terminal.ts:150 `onResize`; wired via Task 6's
+    # `RealTerminal.on_resize`, NOT `loop.add_signal_handler(SIGWINCH, ...)`
+    # — see terminal.py's `on_resize` docstring warning) --------------------
+
+    def on_resize(self) -> None:
+        """Zero-arg resize hook, shaped to match ``terminal.py``'s
+        ``ResizeCallback`` (``Callable[[], None]``) so the app layer can wire
+        it directly: ``real_terminal.on_resize(tui.on_resize)``. Upstream has
+        no separate ``onResize`` method on ``TUI`` either — it wires
+        ``terminal.start((data) => this.handleInput(data), () =>
+        this.requestRender())`` (tui.ts:660-666), i.e. plain
+        ``requestRender()`` on every resize. That suffices here too: this
+        port's ``do_render`` compares the terminal's *live* ``columns``/
+        ``rows`` against what was actually rendered last time
+        (``_previous_width``/``_previous_height``) and does the
+        widthChanged/heightChanged full-redraw + ``_previous_viewport_top``
+        correction itself (tui.ts:1258-1259, 1344-1358) — ``on_resize``
+        itself doesn't need to know a resize happened, only that *some*
+        render should happen soon, exactly like upstream."""
+        self.request_render()
 
     # -- render scheduling (tui.ts:712-748) ---------------------------------
 
@@ -379,6 +531,12 @@ class TUI:
         height = self.term.rows
         width = self.term.columns
 
+        # tui.ts:1257-1258 widthChanged/heightChanged — Task 8 addition.
+        # previous_* == 0 is the "no render yet" sentinel (see __init__), so
+        # a genuine first render never spuriously counts as a resize.
+        width_changed = self._previous_width != 0 and self._previous_width != width
+        height_changed = self._previous_height != 0 and self._previous_height != height
+
         prev_viewport_top = self._previous_viewport_top
         viewport_top = prev_viewport_top
         hardware_cursor_row = self._hardware_cursor_row
@@ -389,6 +547,19 @@ class TUI:
             return target_screen_row - current_screen_row
 
         new_lines = self._root.render(width) if self._root is not None else []
+
+        # Composite overlays over the main content (tui.ts:1274-1276) before
+        # the differential compare — so overlay lines participate in the
+        # diff exactly like any other content, and a change confined to an
+        # overlay only rewrites the rows it actually occupies.
+        if self._overlay_stack:
+            new_lines = self._composite_overlays(new_lines, width, height)
+
+        # Find and strip CURSOR_MARKER from the *composited* final line
+        # array (tui.ts:1279 — after overlay compositing, before line
+        # resets) so overlay/scrolled content is positioned correctly
+        # without any component ever computing its own screen coordinates.
+        cursor_pos = self._extract_cursor_position(new_lines, height)
 
         def full_render(clear: bool) -> None:
             if clear:
@@ -405,7 +576,10 @@ class TUI:
                 self._max_lines_rendered = max(self._max_lines_rendered, len(new_lines))
             buffer_length = max(height, len(new_lines))
             self._previous_viewport_top = max(0, buffer_length - height)
+            self._position_hardware_cursor(cursor_pos, len(new_lines))
             self._previous_lines = new_lines
+            self._previous_width = width
+            self._previous_height = height
 
         # Forced full clear (fix round 1): stands in for upstream's
         # previousWidth/previousHeight = -1 sentinel reaching the
@@ -422,13 +596,34 @@ class TUI:
             return
 
         # First render — just output everything (tui.ts:1335-1339).
-        if not self._previous_lines:
+        if not self._previous_lines and not width_changed and not height_changed:
             full_render(False)
             return
 
+        # Terminal width changed — wrapping changes, always needs a full
+        # re-render (tui.ts:1343-1347).
+        if width_changed:
+            full_render(True)
+            return
+
+        # Terminal height changed — re-render to keep the visible viewport
+        # aligned (tui.ts:1349-1353). Upstream carves out an exception for
+        # Termux's software-keyboard-driven height toggling
+        # (`!isTermuxSession()`) to avoid replaying full history on every
+        # keyboard show/hide; this port doesn't special-case that platform
+        # quirk, so a height change always gets a full redraw here.
+        if height_changed:
+            full_render(True)
+            return
+
         # Content shrunk below the working area — re-render to clear empty
-        # rows (tui.ts:1359-1365).
-        if self.clear_on_shrink and len(new_lines) < self._max_lines_rendered:
+        # rows (tui.ts:1359-1365). Skipped while an overlay is open: overlays
+        # need the padding rows compositeOverlays extends the buffer with.
+        if (
+            self.clear_on_shrink
+            and len(new_lines) < self._max_lines_rendered
+            and not self._overlay_stack
+        ):
             full_render(True)
             return
 
@@ -454,10 +649,13 @@ class TUI:
             appended_lines and first_changed == len(self._previous_lines) and first_changed > 0
         )
 
-        # No changes — nothing to write (tui.ts:1397-1401, minus the
-        # hardware-cursor-repositioning call, a later task's job).
+        # No changes — nothing to write, but the hardware cursor may still
+        # need repositioning (e.g. it moved within an unchanged line's
+        # content) (tui.ts:1397-1401).
         if first_changed == -1:
+            self._position_hardware_cursor(cursor_pos, len(new_lines))
             self._previous_viewport_top = prev_viewport_top
+            self._previous_height = height
             return
 
         # All changes are in deleted lines — nothing to render, just erase
@@ -487,7 +685,10 @@ class TUI:
                     self._move_cursor(-move_back)
                 self._cursor_row = target_row
                 self._hardware_cursor_row = target_row
+            self._position_hardware_cursor(cursor_pos, len(new_lines))
             self._previous_lines = new_lines
+            self._previous_width = width
+            self._previous_height = height
             self._previous_viewport_top = prev_viewport_top
             return
 
@@ -541,7 +742,121 @@ class TUI:
         self._hardware_cursor_row = final_cursor_row
         self._max_lines_rendered = max(self._max_lines_rendered, len(new_lines))
         self._previous_viewport_top = max(prev_viewport_top, final_cursor_row - height + 1)
+        self._position_hardware_cursor(cursor_pos, len(new_lines))
         self._previous_lines = new_lines
+        self._previous_width = width
+        self._previous_height = height
+
+    # -- overlay compositing (tui.ts:1032-1085's function head + early
+    # return; the anchor-enum/margin/maxHeight resolveOverlayLayout math and
+    # the kitty-image/segment-splicing tail, tui.ts:1085-1160, are out of
+    # scope — see _composite_overlays' own docstring) --------------------
+
+    def _composite_overlays(self, lines: list[str], width: int, height: int) -> list[str]:
+        """tui.ts:1032-1085 ``compositeOverlays``, narrowed to this port's
+        simplified ``anchor_row``-only overlay API: no anchor
+        enum/margins/maxHeight/nonCapturing/visible-callback
+        (``resolveOverlayLayout``, tui.ts:987-1030, has no equivalent
+        here — every overlay renders at the *full* terminal ``width`` and
+        simply overwrites, rather than column-splices into
+        (``compositeLineAt``, tui.ts:1210-1252), the corresponding rows of
+        ``lines`` starting at its ``anchor_row`` (default 0)). Still ports
+        the padding behavior (tui.ts:1064-1069): the working buffer is
+        extended with empty lines so every overlay has a row to land on
+        even if it would otherwise run past the end of ``lines`` or the
+        terminal's visible height."""
+        if not self._overlay_stack:
+            return lines
+        result = list(lines)
+        rendered: list[tuple[list[str], int]] = []
+        min_lines_needed = len(result)
+        for entry in self._overlay_stack:
+            overlay_lines = entry.component.render(width)
+            row = entry.anchor_row if entry.anchor_row is not None else 0
+            rendered.append((overlay_lines, row))
+            min_lines_needed = max(min_lines_needed, row + len(overlay_lines))
+
+        working_height = max(len(result), height, min_lines_needed)
+        while len(result) < working_height:
+            result.append("")
+
+        for overlay_lines, row in rendered:
+            for i, line in enumerate(overlay_lines):
+                idx = row + i
+                if 0 <= idx < len(result):
+                    result[idx] = line
+        return result
+
+    # -- hardware cursor (tui.ts:118-120 CURSOR_MARKER, tui.ts:1234-1252
+    # extractCursorPosition, tui.ts:1627-1656 positionHardwareCursor) -------
+
+    def _extract_cursor_position(self, lines: list[str], height: int) -> tuple[int, int] | None:
+        """tui.ts:1234-1252 ``extractCursorPosition``: scan only the bottom
+        ``height`` (visible-viewport) lines, from the last upward, for the
+        first row containing ``CURSOR_MARKER``. Strips *that one*
+        occurrence from the line (components should only ever embed a
+        single marker; extraction doesn't scrub every occurrence if one
+        misbehaves and emits more than one — matching upstream's own
+        single-``indexOf``-then-return behavior) and returns its (row, col),
+        column measured as the *visible* width of the text before the
+        marker (ANSI-aware, via ``visible_width`` — not raw ``len()``, which
+        would count invisible escape bytes from preceding SGR codes as
+        columns). Mutates ``lines`` in place, exactly like upstream mutates
+        its ``newLines`` array in place via index assignment."""
+        viewport_top = max(0, len(lines) - height)
+        for row in range(len(lines) - 1, viewport_top - 1, -1):
+            line = lines[row]
+            marker_index = line.find(CURSOR_MARKER)
+            if marker_index != -1:
+                before_marker = line[:marker_index]
+                col = visible_width(before_marker)
+                lines[row] = line[:marker_index] + line[marker_index + len(CURSOR_MARKER) :]
+                return (row, col)
+        return None
+
+    def _position_hardware_cursor(
+        self, cursor_pos: tuple[int, int] | None, total_lines: int
+    ) -> None:
+        """tui.ts:1627-1656 ``positionHardwareCursor``. When no marker was
+        found this render, hides the hardware cursor (idempotently — see
+        ``_cursor_visible``'s docstring in ``__init__``); otherwise moves it
+        to the marker's (row, col) — row via the same relative
+        ``\\x1b[nB``/``\\x1b[nA`` primitive ``_move_cursor`` uses, column via
+        an *absolute* ``\\x1b[<col+1>G`` (1-indexed) — and shows it
+        (idempotently). The column move is written unconditionally whenever
+        a marker was found (even if the row didn't change), since the
+        cursor's column almost always changes between renders (e.g. typing)
+        even when its row doesn't; upstream does the same (the row delta is
+        conditional, the column move never is).
+
+        Deliberately does *not* port upstream's ``showHardwareCursor``
+        opt-in flag (``PI_HARDWARE_CURSOR=1`` env var, default off, which
+        would otherwise keep the terminal cursor hidden even when a marker
+        is found) — not in this task's Produces list, and gating real
+        cursor visibility behind an undocumented env var would make the
+        marker-driven positioning this task exists to add invisible by
+        default."""
+        if cursor_pos is None or total_lines <= 0:
+            if self._cursor_visible:
+                self.term.write(HIDE_CURSOR)
+                self._cursor_visible = False
+            return
+
+        row, col = cursor_pos
+        target_row = max(0, min(row, total_lines - 1))
+        target_col = max(0, col)
+
+        row_delta = target_row - self._hardware_cursor_row
+        if row_delta > 0:
+            self.term.write(f"\x1b[{row_delta}B")
+        elif row_delta < 0:
+            self.term.write(f"\x1b[{-row_delta}A")
+        self.term.write(f"\x1b[{target_col + 1}G")
+
+        self._hardware_cursor_row = target_row
+        if not self._cursor_visible:
+            self.term.write(SHOW_CURSOR)
+            self._cursor_visible = True
 
     # -- cursor primitive (module docstring deviation 5) --------------------
 
