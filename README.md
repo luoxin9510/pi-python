@@ -75,6 +75,12 @@ and exits instead of raising a traceback.
 | `Ctrl+C` | During a running turn: interrupt the agent and return to the prompt. At the prompt: discard whatever is typed so far (including a multi-line draft) and start a fresh prompt |
 | `Ctrl+D` | Exit at an empty prompt (readline EOF semantics); on a non-empty line, deletes the character under the cursor |
 | `Up` / `Down` | At the start/end of the draft: browse prompt history (your current, unsent draft is preserved and restored when you arrow back down past it). Elsewhere: move the cursor a line up/down |
+
+Prompt history is per-session and in-memory, matching upstream pi (the old
+`~/.pi-python/tui-history` file from the previous prompt_toolkit UI is no
+longer used; history replay on `/resume` is planned alongside that command).
+There is no `Ctrl+R` reverse search — that was a prompt_toolkit extra with no
+upstream pi equivalent.
 | `Ctrl+A` / `Home`, `Ctrl+E` / `End` | Move to the start/end of the line |
 | `Ctrl+B`/`Ctrl+F`, `Left`/`Right` | Move the cursor one character left/right |
 | `Alt+B`/`Alt+F`, `Ctrl+Left`/`Ctrl+Right`, `Alt+Left`/`Alt+Right` | Move the cursor one word left/right |
