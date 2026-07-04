@@ -898,11 +898,17 @@ class TestWordWrapping:
         Upstream drives ``wordWrapLine`` with a synthetic pre-segmented
         array that treats the paste marker as a single atomic segment
         (editor.ts's ``wordWrapLine`` third parameter). This port's
-        ``_word_wrap_line`` now has pre_segmented parameter support —
-        Task 12 adds paste-marker/atomic-segment awareness. The marker text
-        below is therefore treated as a single atomic unit when possible;
-        the invariant this port verifies through the public ``Editor.render()``
-        surface is that no rendered line ever exceeds the terminal width.
+        ``_word_wrap_line``/``word_wrap_line`` now has ``pre_segmented``
+        parameter support for that (Task 12's paste-marker/atomic-segment
+        awareness) — but this test builds its marker-shaped text via
+        ``set_text``, not ``handle_paste``, so it never gets an entry in
+        ``Editor._pastes``; per ``_segment_with_markers``'s
+        ``validPasteIds()`` gate (module docstring deviation 4), the marker
+        text below is therefore *not* treated as an atomic segment — it is
+        deliberately non-atomic and wraps at plain grapheme boundaries like
+        any other text. The invariant this test verifies through the public
+        ``Editor.render()`` surface is simply that no rendered line ever
+        exceeds the terminal width, regardless.
         """
         from pipython.tui.components.editor import Editor
         from pipython.tui.engine.utils import visible_width

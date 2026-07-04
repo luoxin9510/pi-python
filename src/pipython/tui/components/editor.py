@@ -78,14 +78,24 @@ Deviations from upstream editor.ts:
    left sitting at such a boundary — i.e. it *is* "the grapheme column"
    the brief specifies, without needing a separate grapheme-index
    bookkeeping layer distinct from the string index.
-3. **No atomic-segment snap-to-start logic in *vertical* movement**
-   (editor.ts:1372-1412, ``snappedFromCursorCol``) — task 11 deferred this
-   pending paste-marker support; this task adds atomic-segment awareness
-   everywhere it is exercised by the ported test suite (horizontal
-   movement, backspace/forward-delete, word movement, word-wrap layout),
-   but no RED test drives a paste marker across a *vertical* (up/down)
-   move, so the snap-on-vertical-move refinement remains unported — still
-   a known gap, not a design decision, should a future task need it.
+3. **Vertical-movement atomic-segment snapping is ported**
+   (editor.ts:1372-1412, ``snappedFromCursorCol``) as of the task-12
+   fix-round-2 pass. Task 11 originally deferred this pending paste-marker
+   support, and task 12's initial GREEN phase left it unported since no RED
+   test drove a paste marker across a vertical (up/down) move — that gap
+   was in fact a data-loss bug: a sticky column could land the cursor
+   *inside* a paste marker (e.g. sticky col 10 landing inside a marker
+   starting at col 6), and the next keystroke there would split the
+   marker's text, breaking ``_PASTE_MARKER_RE``'s match and silently
+   losing the original pasted content at submit (``get_expanded_text()``
+   would return the broken literal instead of expanding it). ``_move_to_
+   visual_line`` now (a) resolves the pre-move visual column against
+   ``_snapped_from_cursor_col`` when a previous vertical move left the
+   cursor sitting at a segment start (so sticky-column tracking survives
+   the snap), and (b) after computing the raw target column, snaps it to
+   the start of any atomic segment (paste marker) it would otherwise land
+   inside — skipping past multi-visual-line marker continuations when
+   moving down through an already-visited segment, exactly as upstream.
 4. **``word_wrap_line`` (promoted from task-11's private ``_word_wrap_line``
    to a public name matching upstream's exported ``wordWrapLine``) gains an
    optional ``pre_segmented`` parameter** (editor.ts's third ``wordWrapLine``
@@ -137,14 +147,16 @@ Deviations from upstream editor.ts:
    CSI-u *parser itself* is not gated by this flag — ``\x1b[45;5u`` for
    Ctrl+- still parses correctly regardless — only a couple of legacy
    ambiguous 2-byte sequences depend on it; see keys.py.)
-8. **``_submit_value`` resets ``_preferred_visual_col`` to ``None``**,
-   which upstream's ``submitValue`` (editor.ts:1246-1259) does not do —
-   deliberate, not an oversight: submit clears the buffer back to a single
-   empty line, and leaving a stale sticky-column value in place would let
-   it leak into subsequent up/down navigation on that fresh empty buffer
-   (``_compute_vertical_move_column`` treats a non-``None`` value as "the
-   user has an intentional preferred column to restore"). Resetting it
-   here is a narrow behavioral improvement over upstream rather than a
+8. **``_submit_value`` resets ``_preferred_visual_col`` (and, since the
+   task-12-fix-round-2 vertical-snap port, ``_snapped_from_cursor_col``)
+   to ``None``**, which upstream's ``submitValue`` (editor.ts:1246-1259)
+   does not do — deliberate, not an oversight: submit clears the buffer
+   back to a single empty line, and leaving a stale sticky-column value in
+   place would let it leak into subsequent up/down navigation on that
+   fresh empty buffer (``_compute_vertical_move_column``/
+   ``_move_to_visual_line`` treat a non-``None`` value as "the user has an
+   intentional preferred column / pre-snap position to restore"). Resetting
+   both here is a narrow behavioral improvement over upstream rather than a
    compatibility gap.
 9. **``handle_paste`` does not port** the CSI-u Ctrl+letter re-decoding
    (editor.ts:1154-1159, a tmux-popup compatibility shim), the file-path
@@ -397,6 +409,14 @@ class Editor:
         # Preferred visual column for vertical cursor movement (sticky
         # column), editor.ts:311.
         self._preferred_visual_col: int | None = None
+
+        # Pre-snap cursor column: when a vertical move snaps the cursor to
+        # the start of an atomic segment (a paste marker), this remembers
+        # where the cursor *would* have landed, so the next vertical move
+        # can resolve the correct visual column against the VL it actually
+        # belongs to — even after a resize reshuffles VLs (editor.ts:318
+        # ``snappedFromCursorCol``).
+        self._snapped_from_cursor_col: int | None = None
 
         # Character jump mode (Ctrl+]/Ctrl+Alt+]), editor.ts:308.
         self._jump_mode: str | None = None
@@ -808,6 +828,7 @@ class Editor:
         self._cursor_line = 0
         self._cursor_col = 0
         self._preferred_visual_col = None
+        self._snapped_from_cursor_col = None
         self._pastes.clear()
         self._paste_counter = 0
         self._exit_history_browsing()
@@ -1089,6 +1110,7 @@ class Editor:
             if draft is not None:
                 self._restore(draft)
                 self._preferred_visual_col = None
+                self._snapped_from_cursor_col = None
             else:
                 self._set_text_internal("", "end")
         else:
@@ -1107,6 +1129,7 @@ class Editor:
         1319-1327)."""
         self._cursor_col = col
         self._preferred_visual_col = None
+        self._snapped_from_cursor_col = None
 
     def _move_to_line_start(self) -> None:
         self._last_action = None
@@ -1402,7 +1425,17 @@ class Editor:
         current_vl = visual_lines[current_visual_line]
         target_vl = visual_lines[target_visual_line]
 
-        current_visual_col = self._cursor_col - current_vl[1]
+        # When the cursor was snapped to a segment start on a previous
+        # vertical move, resolve the pre-snap position against the VL it
+        # belongs to. This gives the correct visual column even after a
+        # resize reshuffles VLs (editor.ts:1346-1349).
+        if self._snapped_from_cursor_col is not None:
+            vl_index = self._find_visual_line_at(
+                visual_lines, current_vl[0], self._snapped_from_cursor_col
+            )
+            current_visual_col = self._snapped_from_cursor_col - visual_lines[vl_index][1]
+        else:
+            current_visual_col = self._cursor_col - current_vl[1]
 
         is_last_source_segment = (
             current_visual_line == len(visual_lines) - 1
@@ -1429,6 +1462,49 @@ class Editor:
         target_col = target_vl[1] + move_to_visual_col
         logical_line = self._lines[target_vl[0]]
         self._cursor_col = min(target_col, len(logical_line))
+
+        # Snap cursor to atomic segment boundary (e.g. a paste marker) so
+        # the cursor never lands mid-marker — a partial edit there would
+        # split the marker text, breaking the PASTE_MARKER_REGEX match and
+        # silently losing the pasted content at submit time. Single-
+        # grapheme segments don't need snapping (editor.ts:1372-1412
+        # snappedFromCursorCol).
+        segments = self._segment_with_markers(logical_line)
+        for seg_text, seg_index in segments:
+            if seg_index > self._cursor_col:
+                break
+            if len(seg_text) <= 1:
+                continue
+            if self._cursor_col < seg_index + len(seg_text):
+                is_continuation = seg_index < target_vl[1]
+                is_moving_down = target_visual_line > current_visual_line
+
+                if is_continuation and is_moving_down:
+                    # The segment started on a previous visual line, and we
+                    # already visited it on the way down. Skip all
+                    # remaining continuation VLs and land on the first VL
+                    # past it.
+                    seg_end = seg_index + len(seg_text)
+                    next_vl = target_visual_line + 1
+                    while (
+                        next_vl < len(visual_lines)
+                        and visual_lines[next_vl][0] == target_vl[0]
+                        and visual_lines[next_vl][1] < seg_end
+                    ):
+                        next_vl += 1
+                    if next_vl < len(visual_lines):
+                        self._move_to_visual_line(visual_lines, current_visual_line, next_vl)
+                        return
+
+                # Snap to the start of the segment so it gets highlighted.
+                # Store the pre-snap position so the next vertical move can
+                # resolve it to the correct visual column.
+                self._snapped_from_cursor_col = self._cursor_col
+                self._cursor_col = seg_index
+                return
+
+        # No snap occurred — we moved out of the atomic segment.
+        self._snapped_from_cursor_col = None
 
     def _compute_vertical_move_column(
         self,

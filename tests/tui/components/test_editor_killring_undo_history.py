@@ -932,11 +932,7 @@ class TestUndo:
         editor.handle_input("|")
         assert editor.text == "hello| world"
 
-    @pytest.mark.skip(
-        reason="public insertTextAtCursor (editor.ts:1005-1013) is not ported — "
-        "not in the task-12 brief's Produces list; only the internal "
-        "_insert_text_at_cursor (no undo push / normalization) exists"
-    )
+    @pytest.mark.skip(reason="pending Task 13 insert_text_at_cursor hook")
     def test_undoes_insert_text_at_cursor_atomically(self):
         """Undoes insertTextAtCursor atomically."""
         from pipython.tui.components.editor import Editor
@@ -958,10 +954,7 @@ class TestUndo:
         editor.handle_input("|")
         assert editor.text == "hello| world"
 
-    @pytest.mark.skip(
-        reason="public insertTextAtCursor (editor.ts:1005-1013) is not ported — "
-        "not in the task-12 brief's Produces list"
-    )
+    @pytest.mark.skip(reason="pending Task 13 insert_text_at_cursor hook")
     def test_insert_text_at_cursor_handles_multiline_text(self):
         """insertTextAtCursor handles multiline text."""
         from pipython.tui.components.editor import Editor
@@ -984,10 +977,7 @@ class TestUndo:
         editor.handle_input("\x1b[45;5u")  # Ctrl+- (undo)
         assert editor.text == "hello world"
 
-    @pytest.mark.skip(
-        reason="public insertTextAtCursor (editor.ts:1005-1013) is not ported — "
-        "not in the task-12 brief's Produces list"
-    )
+    @pytest.mark.skip(reason="pending Task 13 insert_text_at_cursor hook")
     def test_insert_text_at_cursor_normalizes_crlf_and_cr_line_endings(self):
         """insertTextAtCursor normalizes CRLF and CR line endings."""
         from pipython.tui.components.editor import Editor
@@ -1463,10 +1453,13 @@ class TestPasteMarkerAtomicBehavior:
     def test_does_not_crash_when_paste_marker_is_wider_than_terminal_width(self):
         """Does not crash when paste marker is wider than terminal width."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
         import re
 
         editor = Editor()
-        # Create a paste with 47 lines - marker will be ~21 chars, wider than typical 80-col
+        # Reproduce: terminal width 8, paste marker "[paste #1 +47 lines]"
+        # (21 chars) — create a paste with 47 lines so the marker is wider
+        # than the render width.
         big_content = "line\n" * 47
         big_content = big_content.rstrip()
         editor.handle_input(f"\x1b[200~{big_content}\x1b[201~")
@@ -1474,19 +1467,28 @@ class TestPasteMarkerAtomicBehavior:
         text = editor.text
         marker = re.search(r"\[paste #\d+ \+\d+ lines\]", text)
         assert marker is not None
+        assert visible_width(marker.group(0)) > 8, "marker should be wider than render width"
 
-        # Should render without crashing at narrow widths
-        # (Just ensure get_expanded_text works, which uses similar rendering)
-        expanded = editor.get_expanded_text()
-        assert "line" in expanded
+        # Render at very narrow width - should not throw.
+        lines = editor.render(8)
+        # Every rendered line must fit within the width (marker is split).
+        for line in lines:
+            assert visible_width(line) <= 8, (
+                f"line exceeds width 8: visible={visible_width(line)} text={line!r}"
+            )
 
     def test_does_not_crash_when_text_plus_paste_marker_exceeds_terminal_width_with_cursor_on_marker(
         self,
     ):
         """Does not crash when text + paste marker exceeds terminal width with cursor on marker."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
+        # Reproduce: terminal width 54, text "b"*35 + "[paste #1 +27 lines]"
+        # + "bbbb". Cursor lands on the paste marker after word-wrap,
+        # causing the rendered line to be 55 visible chars (1 over width).
+
         # Type 35 'b' characters
         for i in range(35):
             editor.handle_input("b")
@@ -1507,15 +1509,25 @@ class TestPasteMarkerAtomicBehavior:
         editor.handle_input("\x1b[D")  # past last 'b'
         editor.handle_input("\x1b[D")  # now on the paste marker
 
-        # Should not crash - just ensure we can get the text
-        text = editor.text
-        assert "[paste #" in text
+        # Render at width 54 - should not throw.
+        render_width = 54
+        lines = editor.render(render_width)
+        for line in lines:
+            assert visible_width(line) <= render_width, (
+                f"line exceeds width {render_width}: visible={visible_width(line)} text={line!r}"
+            )
 
     def test_word_wrap_line_re_checks_overflow_after_backtracking_to_wrap_opportunity(self):
         """wordWrapLine re-checks overflow after backtracking to wrap opportunity."""
         from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.utils import visible_width
 
         editor = Editor()
+        # Reproduce crash #2: " " + "b"*35 + atomic_marker(20 chars) +
+        # "bbbb", layoutWidth=53. After wrapping at the space, the
+        # remaining 35 b's + marker = 55 must trigger a second force-break
+        # instead of silently overflowing.
+
         # Type a space, then 35 b's
         editor.handle_input(" ")
         for i in range(35):
@@ -1530,9 +1542,14 @@ class TestPasteMarkerAtomicBehavior:
         for i in range(4):
             editor.handle_input("b")
 
-        # Should not crash - just ensure we can get the text
-        text = editor.text
-        assert "[paste #" in text
+        # Render at width 54 (contentWidth=54, layoutWidth=53 with
+        # paddingX=0) - should not throw.
+        render_width = 54
+        lines = editor.render(render_width)
+        for line in lines:
+            assert visible_width(line) <= render_width, (
+                f"line exceeds width {render_width}: visible={visible_width(line)} text={line!r}"
+            )
 
     def test_expands_large_pasted_content_literally_in_get_expanded_text(self):
         """Expands large pasted content literally in getExpandedText."""
@@ -1580,10 +1597,11 @@ class TestPasteMarkerAtomicBehavior:
         editor.handle_input("\x1b[B")
         assert editor.cursor == (1, 0)
 
-        # Down to paste marker line - sticky col 10 falls inside marker.
-        # Cursor should snap to start of marker.
+        # Down to paste marker line - sticky col 10 falls inside marker
+        # (starts at col 6). Cursor should snap to start of marker (col 6),
+        # not end (col 6 + marker.length).
         editor.handle_input("\x1b[B")
-        assert editor.cursor[0] == 2  # On line 2
+        assert editor.cursor == (2, 6)
 
     def test_preserves_sticky_column_when_navigating_through_paste_marker_line(self):
         """Preserves sticky column when navigating through paste marker line."""
@@ -1613,30 +1631,79 @@ class TestPasteMarkerAtomicBehavior:
         editor.handle_input("\x1b[B")
         assert editor.cursor == (1, 0)
 
-        # Down to paste marker
+        # Down to paste marker - cursor snapped to col 0 (start of marker)
         editor.handle_input("\x1b[B")
-        assert editor.cursor[0] == 2
+        assert editor.cursor == (2, 0)
 
         # Down to empty line
         editor.handle_input("\x1b[B")
         assert editor.cursor == (3, 0)
 
-        # Down to last line - should keep cursor movement consistent
+        # Down to last line - should restore sticky col 10
         editor.handle_input("\x1b[B")
-        assert editor.cursor[0] == 4
+        assert editor.cursor == (4, 10)
 
-    @pytest.mark.skip(
-        reason="editor.py module docstring deviation 3: marker-aware vertical "
-        "movement across multi-visual-line markers (editor.ts:1372-1412 "
-        "snappedFromCursorCol / marker-continuation-VL handling) is unported"
-    )
+    def test_typing_after_vertical_snap_inserts_before_the_marker_not_inside_it(self):
+        """Regression: a vertical move that snaps the cursor onto a paste
+        marker must leave it *before* the marker (not mid-marker), so a
+        subsequent keystroke inserts text before the marker instead of
+        splitting it. Splitting the marker breaks ``_PASTE_MARKER_RE``'s
+        match, which would silently drop the pasted content from
+        ``get_expanded_text()`` at submit time — the data-loss bug this
+        vertical-snap port fixes."""
+        from pipython.tui.components.editor import Editor
+        import re
+
+        editor = Editor()
+        editor.set_text("12345678901234567890\n\nhello ")
+
+        big_content = "x" * 2000
+        editor.handle_input(f"\x1b[200~{big_content}\x1b[201~")
+        assert re.search(r"\[paste #\d+ \d+ chars\]", editor.text) is not None
+
+        # Navigate to line 0, col 10, then down twice to snap onto the
+        # marker on line 2 (starts at col 6) — same setup as
+        # test_snaps_to_the_paste_marker_start_when_navigating_down_into_it.
+        editor.handle_input("\x1b[A")
+        editor.handle_input("\x1b[A")
+        editor.handle_input("\x01")
+        for i in range(10):
+            editor.handle_input("\x1b[C")
+        editor.handle_input("\x1b[B")
+        editor.handle_input("\x1b[B")
+        assert editor.cursor == (2, 6)
+
+        # Typing here must insert BEFORE the marker, not split it.
+        editor.handle_input("Z")
+        assert editor.cursor == (2, 7)
+        line2 = editor.text.split("\n")[2]
+        assert line2.startswith("hello Z[paste #")
+        assert re.fullmatch(r"hello Z\[paste #\d+ \d+ chars\]", line2)
+
+        # get_expanded_text() must still expand the marker to the full
+        # 2000-char paste — not a broken literal from a split marker.
+        assert editor.get_expanded_text() == "12345678901234567890\n\nhello Z" + big_content
+
     def test_does_not_get_stuck_moving_down_from_a_multi_visual_line_paste_marker(self):
         """Does not get stuck moving down from a multi-visual-line paste marker."""
         from pipython.tui.components.editor import Editor
         import re
 
         editor = Editor()
-        # Build a line with marker that spans multiple visual lines
+        # Build:
+        # Logical line 0: "abcdefgh" + marker(21 chars) + "ijklmnopqr"
+        # Logical line 1: "123456789012345678"
+        #
+        # Marker "[paste #1 +100 lines]" (21 chars) is wider than the
+        # render width (20, i.e. layout width 19). Word-wrap splits at the
+        # space before "lines", producing:
+        #   VL1: abcdefgh              (startCol 0,  len 8)
+        #   VL2: [paste #1 +100        (startCol 8,  len 15) <- marker head
+        #   VL3: lines]ijklmnopqr      (startCol 23, len 16) <- marker tail + content
+        #   VL4: 123456789012345678    (line 1)
+        #
+        # On VL3 the marker tail "lines]" occupies visual cols 0-5.
+        # Content ("i") starts at visual col 6 = logical col 29.
         for ch in "abcdefgh":
             editor.handle_input(ch)
         big_content = "line\n" * 100
@@ -1647,12 +1714,19 @@ class TestPasteMarkerAtomicBehavior:
         editor.handle_input("\n")
         for ch in "123456789012345678":
             editor.handle_input(ch)
+        editor.render(20)
 
         text = editor.text
         marker_match = re.search(r"\[paste #\d+ \+\d+ lines\]", text)
         assert marker_match is not None
+        marker_len = len(marker_match.group(0))
+        assert marker_len > 20
+        marker_start = 8
+        marker_end = marker_start + marker_len  # 29
 
-        # Navigate to line 0, col 6
+        # Navigate to line 0, col 6 (on "g"). Preferred col 6 is past the
+        # marker tail on VL3, so the cursor should land on content ("i" at
+        # col 29) without snapping back.
         editor.handle_input("\x1b[A")  # Up to line 0
         editor.handle_input("\x01")  # Ctrl+A
         for i in range(6):
@@ -1661,24 +1735,32 @@ class TestPasteMarkerAtomicBehavior:
 
         # Down: cursor lands on paste marker start
         editor.handle_input("\x1b[B")
-        assert editor.cursor[0] == 0
+        assert editor.cursor == (0, marker_start)
 
-        # Down again: cursor should move but stay on same line
+        # Down again: preferred col 6 lands at VL3 col 29 ("i"), which is
+        # past the marker. Cursor stays on line 0.
         editor.handle_input("\x1b[B")
-        assert editor.cursor[0] == 0 or editor.cursor[0] == 1
+        assert editor.cursor == (0, marker_end)
 
-    @pytest.mark.skip(
-        reason="editor.py module docstring deviation 3: marker-aware vertical "
-        "movement across multi-visual-line markers (editor.ts:1372-1412 "
-        "snappedFromCursorCol / marker-continuation-VL handling) is unported"
-    )
+        # Up: back to paste marker
+        editor.handle_input("\x1b[A")
+        assert editor.cursor == (0, marker_start)
+
+        # Up again: back to col 6 ("g")
+        editor.handle_input("\x1b[A")
+        assert editor.cursor == (0, 6)
+
     def test_skips_marker_continuation_vls_when_preferred_col_falls_in_marker_tail(self):
         """Skips marker continuation VLs when preferred col falls in marker tail."""
         from pipython.tui.components.editor import Editor
         import re
 
         editor = Editor()
-        # Build a line with marker that wraps across visual lines
+        # Same layout as test_does_not_get_stuck_moving_down_from_a_multi_
+        # visual_line_paste_marker. Start at col 3 ("d"). Preferred col 3
+        # maps to VL3 visual col 3, which is inside the "lines]" marker
+        # tail, so moveToVisualLine detects the continuation VL and skips
+        # straight to VL4 (line 1).
         for ch in "abcdefgh":
             editor.handle_input(ch)
         big_content = "line\n" * 100
@@ -1689,25 +1771,33 @@ class TestPasteMarkerAtomicBehavior:
         editor.handle_input("\n")
         for ch in "123456789012345678":
             editor.handle_input(ch)
+        editor.render(20)
 
         text = editor.text
         marker_match = re.search(r"\[paste #\d+ \+\d+ lines\]", text)
         assert marker_match is not None
 
-        # Navigate to line 0, col 3
+        # Navigate to line 0, col 3 (on "d")
         editor.handle_input("\x1b[A")  # Up to line 0
         editor.handle_input("\x01")  # Ctrl+A
         for i in range(3):
             editor.handle_input("\x1b[C")
         assert editor.cursor == (0, 3)
 
-        # Down: should land on marker
+        # Down: marker
         editor.handle_input("\x1b[B")
-        assert editor.cursor[0] == 0
+        assert editor.cursor[1] == 8
 
-        # Down again: should move to line 1
+        # Down: skips VL3 (col 3 falls in the marker tail) and lands on
+        # line 1
         editor.handle_input("\x1b[B")
-        assert editor.cursor[0] == 1
+        assert editor.cursor == (1, 3)
+
+        # Round-trip back
+        editor.handle_input("\x1b[A")
+        assert editor.cursor[1] == 8  # marker
+        editor.handle_input("\x1b[A")
+        assert editor.cursor == (0, 3)
 
     def test_submits_large_pasted_content_literally(self):
         """Submits large pasted content literally."""
