@@ -348,3 +348,70 @@ class TestOverlayAnchor:
         # (exact positioning logic is implementation-defined, but it should be present)
         full_text = "".join(screen)
         assert "OVERLAY" in full_text
+
+    def test_overlay_visible_when_content_exceeds_height(
+        self, term: RecordingTerm, tui: TUI
+    ) -> None:
+        """``anchor_row`` is *screen-relative* (row 0 = top of the visible
+        viewport), not a bare buffer index — ``_composite_overlays`` must
+        translate it through the same scroll offset the rest of ``do_render``
+        already uses (``viewport_top = max(0, buffer_length - height)``),
+        exactly like upstream's ``compositeOverlays`` does via its own
+        ``viewportStart`` (tui.ts:1074 ``Math.max(0, workingHeight -
+        termHeight)``, tui.ts:1079 ``idx = viewportStart + row + i``).
+
+        Regression scenario (citation: reviewer-verified bug report): 100
+        lines of root content, a 24-row terminal, ``show_overlay(anchor_row=0)``.
+        ``viewport_top`` is 100 - 24 = 76 — the overlay must land at buffer
+        row 76 (the top of what's actually visible), not at bare buffer row 0
+        (76 rows *above* the visible viewport — on a real terminal, already
+        scrolled into scrollback and gone).
+
+        This is asserted via the exact terminal op sequence rather than
+        ``term.screen()``: ``RecordingTerm`` (see conftest.py) is a *fixed*
+        24-slot array that cannot represent 100 distinct buffer rows the way
+        a real scrolled terminal's visible-window/scrollback split would, so
+        it can't itself distinguish "landed at buffer row 0" from "landed at
+        buffer row 76" — but the exact cursor-relocation op it takes to get
+        there can, because upstream's diff algorithm treats "changed row is
+        above ``prev_viewport_top``" as an "unreachable, needs a full
+        redraw" signal (tui.ts:1452-1456 / this port's own
+        ``if first_changed < prev_viewport_top: full_render(True)``): with
+        the bug, the (mis-)composited row 0 change forces a full
+        clear-and-redraw of all 100 lines; with the fix, the correctly
+        composited row-76 change is recognized as already visible and
+        produces a single, small, targeted rewrite of just that one row —
+        no clear sequence, no full repaint of the other 99 lines.
+        """
+        content = [f"line {i}" for i in range(100)]
+        main = StaticComponent(content)
+        tui.set_root(main)
+        tui.do_render()  # first render: writes all 100 lines, no overlay yet.
+
+        term.ops.clear()
+
+        overlay = StaticComponent(["OVERLAY"])
+        tui.show_overlay(overlay, anchor_row=0)
+        tui.do_render()
+
+        clear_sequence = "\x1b[2J\x1b[H\x1b[3J"
+        assert clear_sequence not in term.ops, (
+            "a correctly viewport-translated anchor_row=0 overlay only "
+            "touches a row within the visible viewport (buffer row "
+            "viewport_top=76) — that never requires a full clear-and-redraw "
+            "of all 100 lines the way a bare buffer-index-0 placement would"
+        )
+
+        # Exact op sequence: the last full render left the (clamped) cursor
+        # at RecordingTerm's row 23 (100 lines >> 24 rows). viewport_top =
+        # max(0, 100 - 24) = 76; the overlay's target buffer row is
+        # viewport_top + anchor_row = 76 + 0 = 76, i.e. target_screen_row =
+        # 76 - 76 = 0. current_screen_row (hardware_cursor_row=99 from the
+        # first render) - viewport_top(76) = 23. The single relative move
+        # is therefore target_screen_row - current_screen_row = 0 - 23 =
+        # -23 rows (up), landing exactly on the one changed row.
+        assert term.ops == ["\x1b[23A", "\r", "\x1b[2K", "OVERLAY"], (
+            "expected a single targeted row rewrite at buffer row "
+            "viewport_top + anchor_row (76 + 0), derived from the exact "
+            "-23 relative cursor move"
+        )

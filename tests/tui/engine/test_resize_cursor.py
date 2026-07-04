@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from pipython.tui.engine.terminal import SHOW_CURSOR
+
 # These imports are expected to fail with ModuleNotFoundError on first run
 # (until the implementation is written in tui.py).
 try:
@@ -184,27 +186,36 @@ class TestHardwareCursor:
     def test_cursor_positioned_to_marker_location(self, term: RecordingTerm, tui: TUI) -> None:
         """After extract_cursor_position, the hardware cursor should move to the marker row/col.
 
-        The terminal ops should end with a cursor-move command to the marker's position.
-        Per tui.ts: the final ops are typically a cursor-move to (row, col) of the marker.
-        The exact ANSI sequence is CSI <row> ';' <col> 'H' (absolute cursor position).
+        RED-tightened (from a loose ``CSI \\d+;?\\d*[HGf]`` presence-only
+        regex, which the original docstring's own guess — ``CSI r;cH``
+        combined-row-column addressing — never actually matches this port's
+        real implementation): ``_position_hardware_cursor`` (tui.ts:
+        1627-1656) never emits a combined ``row;colH``. It emits at most a
+        *relative* row move (``\\x1b[nB``/``\\x1b[nA``, only when the row
+        actually changed) followed unconditionally by an *absolute* column
+        move (``\\x1b[<col+1>G``, 1-indexed).
+
+        Exact derivation for this case: the marker sits at ``cursor_col=5``
+        in ``"0123456789"`` (row 0, the only line — a first render, so
+        ``_hardware_cursor_row`` is freshly initialized to 0 by
+        ``full_render`` before ``_position_hardware_cursor`` runs). The
+        marker's row (0) equals that already-current row, so
+        ``row_delta == 0`` and *no* row-move op is emitted at all — the sole
+        cursor-addressing op is the unconditional column move, col=5
+        (visible width of ``"01234"`` before the marker), 1-indexed:
+        ``"\\x1b[6G"``.
         """
         component = CursorComponent(["0123456789"], cursor_col=5)
         component.focused = True
         tui.set_root(component)
         tui.do_render()
 
-        # Check the ops for cursor positioning at the marker's position
-        # After render, ops should contain a cursor-move to row 0, col 5
-        # (since marker is at column 5 in line "0123456789")
-        ops_str = "".join(term.ops)
-
-        # The ops should include a cursor move; typical format is "\x1b[<row>;<col>H"
-        # For marker at col 5, row 0, we expect something like "\x1b[0;5H" or similar
-        # (row might be 1-indexed in some terminals)
-        # This is a presence check: there should be cursor-addressing ops
-        has_cursor_move = bool(re.search(r"\x1b\[\d+;?\d*[HGf]", ops_str))
-        assert has_cursor_move, (
-            "Cursor positioning op (CSI H/G/f) should be present after extraction"
+        assert not any(re.search(r"\x1b\[\d+[AB]", op) for op in term.ops), (
+            "no row-move op expected: the marker's row (0) equals the "
+            "cursor's row after a first render, so row_delta == 0"
+        )
+        assert term.ops[-1] == "\x1b[6G", (
+            "expected the exact absolute-column cursor-addressing op for col=5 (1-indexed: col+1=6)"
         )
 
     def test_cursor_works_with_unfocused_component(self, term: RecordingTerm, tui: TUI) -> None:
@@ -251,7 +262,58 @@ class TestHardwareCursor:
 
         # Both main and overlay content should be present
         assert "main line" in full_text
-        assert "overlay content" in full_text
+
+    def test_marker_found_in_overlay_with_long_content(self, term: RecordingTerm, tui: TUI) -> None:
+        """A focused overlay's CURSOR_MARKER must still be found and
+        stripped when composited over *more than one screenful* of root
+        content — not leaked raw into the terminal.
+
+        This exercises the composite → viewport-window → extract order
+        ``do_render`` relies on (tui.ts:1274-1279: overlays are composited
+        first, then ``extractCursorPosition`` scans only the bottom
+        ``height`` rows of that *composited* array). ``anchor_row`` is
+        screen-relative, so ``_composite_overlays`` must translate it
+        through the same scroll offset (``viewport_start = max(0,
+        working_height - height)``) that ``_extract_cursor_position``'s own
+        scan window (``viewport_top = max(0, len(lines) - height)``) uses —
+        both formulas agree here (100-line buffer, no further padding), so
+        a correctly placed marker at ``viewport_start + anchor_row`` is
+        always inside ``_extract_cursor_position``'s scan range. With the
+        buggy bare-buffer-index placement (``idx = row + i``, no
+        ``viewport_start``), a marker anchored at row 0 lands 76 rows above
+        that scan window — never found, never stripped, and the raw marker
+        bytes get written straight to the terminal instead.
+        """
+        content = [f"line {i}" for i in range(100)]
+        main = StaticComponent(content)
+        tui.set_root(main)
+        tui.do_render()
+
+        overlay = CursorComponent(["overlay content"], cursor_col=3)
+        tui.show_overlay(overlay, anchor_row=0)
+        overlay.focused = True
+        tui.do_render()
+
+        ops_str = "".join(term.ops)
+        assert CURSOR_MARKER not in ops_str, (
+            "CURSOR_MARKER must never reach the terminal raw — a marker "
+            "placed outside _extract_cursor_position's viewport-bounded "
+            "scan is never found or stripped"
+        )
+        assert "overlay content" in ops_str
+
+        # A found-and-positioned marker always ends in a SHOW_CURSOR write
+        # (_position_hardware_cursor's idempotent hidden->shown transition).
+        # If the marker were instead mis-placed above the viewport by a
+        # buggy compositor, extract_cursor_position would never find it,
+        # cursor_pos stays None, and the cursor is left hidden — no
+        # SHOW_CURSOR write at all. This is a fully black-box discriminator
+        # (no private-attribute access needed): empirically absent against
+        # the pre-fix bug, present once the fix is in place.
+        assert SHOW_CURSOR in term.ops, (
+            "the marker must be found within the viewport and the hardware "
+            "cursor shown at its position"
+        )
 
 
 class TestCursorPositioningEdgeCases:
@@ -340,5 +402,23 @@ class TestCursorPositioningEdgeCases:
         )
         # All original text content survives around both markers.
         assert "before" in full_text
+        # RED-tightened: exact surviving-marker position, not just
+        # count/substring presence. Isolate the op that actually wrote the
+        # line's *content* (as opposed to the trailing absolute-column
+        # cursor-addressing op _position_hardware_cursor appends
+        # afterwards, which — per RecordingTerm's `_apply`, see
+        # conftest.py — has no dedicated case for "\x1b[nG" and so falls
+        # through to the same "append as text" branch as real content,
+        # polluting a plain `screen()`-based string compare with trailing
+        # escape bytes). The first marker's "before" text collapses into
+        # the gap it vacated ("beforemiddle"); the second, untouched marker
+        # survives immediately before "after" — exactly upstream's
+        # single-``indexOf``-then-return semantics, no more, no less.
+        content_ops = [op for op in term.ops if "before" in op]
+        assert len(content_ops) == 1
+        assert content_ops[0] == "beforemiddle" + CURSOR_MARKER + "after", (
+            "the surviving marker must sit exactly between 'middle' and "
+            "'after' — not stripped, not shifted"
+        )
         assert "middle" in full_text
         assert "after" in full_text

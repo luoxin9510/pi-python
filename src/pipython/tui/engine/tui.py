@@ -760,11 +760,35 @@ class TUI:
         here — every overlay renders at the *full* terminal ``width`` and
         simply overwrites, rather than column-splices into
         (``compositeLineAt``, tui.ts:1210-1252), the corresponding rows of
-        ``lines`` starting at its ``anchor_row`` (default 0)). Still ports
-        the padding behavior (tui.ts:1064-1069): the working buffer is
-        extended with empty lines so every overlay has a row to land on
-        even if it would otherwise run past the end of ``lines`` or the
-        terminal's visible height."""
+        ``lines`` starting at its ``anchor_row``). That "just overwrite the
+        full row" simplification is only a degenerate case of upstream's own
+        splice math for the COLUMN dimension (``col=0, overlayWidth=width``
+        collapses ``compositeLineAt`` to a plain overwrite) — it does
+        *not* extend to the ROW dimension the same way. ``row``/
+        ``anchor_row`` is a *screen-relative* coordinate (row 0 means "the
+        top of the currently visible viewport", not "buffer index 0"), so it
+        still needs translating into absolute buffer-array indices via
+        upstream's own ``viewportStart`` offset (tui.ts:1074 ``const
+        viewportStart = Math.max(0, workingHeight - termHeight);``, tui.ts:
+        1079 ``const idx = viewportStart + row + i;``) — ported verbatim
+        below as ``viewport_start``.
+
+        Fix round 2: this method previously composited at the bare buffer
+        index ``idx = row + i``, silently correct only while the working
+        buffer is no taller than the terminal (``viewport_start == 0``) and
+        silently *wrong* the moment content has scrolled past one screenful
+        (``viewport_start > 0``): an overlay anchored at ``anchor_row=0``
+        would land ``viewport_start`` rows *above* the visible window —
+        invisible on a real terminal (already scrolled into scrollback) —
+        and, since ``_extract_cursor_position`` only scans the bottom
+        ``height`` rows, any ``CURSOR_MARKER`` the overlay carried would
+        never be found there either, leaking the raw marker bytes into what
+        actually gets written instead of being stripped.
+
+        Still ports the padding behavior (tui.ts:1064-1069): the working
+        buffer is extended with empty lines so every overlay has a row to
+        land on even if it would otherwise run past the end of ``lines`` or
+        the terminal's visible height."""
         if not self._overlay_stack:
             return lines
         result = list(lines)
@@ -780,9 +804,17 @@ class TUI:
         while len(result) < working_height:
             result.append("")
 
+        # tui.ts:1074 — translate the screen-relative anchor_row into an
+        # absolute buffer index via the same scroll offset the rest of
+        # do_render already uses (mirrors _previous_viewport_top's own
+        # max(0, buffer_length - height) formula, and matches
+        # _extract_cursor_position's viewport_top exactly once `result` is
+        # padded to working_height, as it is above).
+        viewport_start = max(0, working_height - height)
+
         for overlay_lines, row in rendered:
             for i, line in enumerate(overlay_lines):
-                idx = row + i
+                idx = viewport_start + row + i  # tui.ts:1079
                 if 0 <= idx < len(result):
                     result[idx] = line
         return result
