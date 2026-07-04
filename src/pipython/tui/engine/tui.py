@@ -218,6 +218,22 @@ class Container:
         except ValueError:
             pass
 
+    def replace_child(self, old: Component, new: Component) -> None:
+        """Swap ``old`` for ``new`` in place (same index), leaving every
+        other child and their order untouched. Not an upstream port — this
+        port's own convenience, added (Task 16 fix round 1, Minor finding 2)
+        so callers doing an in-place content replace (e.g. ``app2.py``
+        swapping a streaming ``Text`` slot for its rendered ``Markdown`` at
+        message_end) don't have to reach into ``self.children`` and
+        re-derive the index via ``.index(old)`` themselves. A no-op if
+        ``old`` isn't currently a child, mirroring ``remove_child``'s own
+        suppressed-``ValueError`` convention above."""
+        try:
+            idx = self.children.index(old)
+        except ValueError:
+            return
+        self.children[idx] = new
+
     def clear(self) -> None:
         self.children = []
 
@@ -384,12 +400,24 @@ class TUI:
         """Forward a raw input frame to the focused component's optional
         ``handle_input``, if it has one (tui.ts:handleInput's core dispatch,
         minus overlay/debug-key routing — a later task's job). Parsing the
-        frame into a ``KeyEvent`` is the component's own responsibility."""
+        frame into a ``KeyEvent`` is the component's own responsibility.
+
+        Task 16 fix round 1 (Important finding 1): requests a render right
+        after dispatching, unconditionally — upstream parity (tui.ts:
+        827-834: ``this.focusedComponent.handleInput(data);
+        this.requestRender();``, both inside the same "a handler exists"
+        guard this method already has). Previously this method dispatched
+        only, leaving every caller to remember its own follow-up
+        ``request_render()`` — ``app2.py`` had grown exactly such a
+        per-frame workaround (with a docstring that misattributed the
+        missing repaint to ``Editor`` having "no tui reference", when the
+        actual gap was here); that workaround is now removed as redundant."""
         if self._focused is None:
             return
         handler = getattr(self._focused, "handle_input", None)
         if callable(handler):
             handler(data)
+            self.request_render()
 
     # -- overlay stack (tui.ts:509-580, 411-417) ----------------------------
 

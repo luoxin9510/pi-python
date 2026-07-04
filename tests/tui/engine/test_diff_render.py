@@ -414,3 +414,43 @@ class TestHandleInputDispatch:
     def test_no_focus_is_noop(self, tui: TUI) -> None:
         """No focused component at all: handle_input is a no-op."""
         tui.handle_input("x")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_handle_input_requests_a_coalesced_render(self, tui: TUI) -> None:
+        """Task 16 fix round 1 (Important finding 1): dispatching to the
+        focused component's ``handle_input`` must itself request a render
+        (upstream parity, tui.ts:827-834: ``this.focusedComponent.
+        handleInput(data); this.requestRender();`` — both inside the same
+        "a handler exists" guard this method already has). Before this fix,
+        callers (``app2.py``) had to remember their own follow-up
+        ``request_render()`` after every ``handle_input()`` call; this test
+        pins the render request into ``TUI.handle_input`` itself so no
+        caller has to.
+
+        Also verifies the coalescing behavior ``request_render`` already
+        provides (``test_request_render_coalesces`` above) still holds when
+        triggered indirectly through repeated ``handle_input`` calls within
+        the same event-loop turn: three frames in a row should still
+        collapse into a single ``do_render()``, not three."""
+        component = HandlingComponent()
+        tui.set_focus(component)
+
+        render_count = 0
+        original_do_render = tui.do_render
+
+        def counting_do_render() -> None:
+            nonlocal render_count
+            render_count += 1
+            original_do_render()
+
+        tui.do_render = counting_do_render  # type: ignore[method-assign]
+
+        for ch in "abc":
+            tui.handle_input(ch)
+
+        await asyncio.sleep(0.01)
+
+        assert component.received == ["a", "b", "c"]
+        assert render_count == 1, (
+            f"3 handle_input calls should coalesce into 1 render, got {render_count}"
+        )

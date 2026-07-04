@@ -84,13 +84,23 @@ Locked test-harness design decisions (read before touching this file)
    that never observes the awaited condition simply times out and fails the
    test, exactly like any other regular assertion).
 
-7. **Signal delivery for the SIGINT/interrupt test is a real `os.kill(getpid(),
-   SIGINT)`**, not a synthetic call into some handler — sent only after
-   polling confirms a turn is genuinely in flight (so `run_app2`'s own
-   `loop.add_signal_handler(signal.SIGINT, ...)` registration, wherever it
-   happens, is guaranteed to already be active — mirroring the legacy
-   `app.py`'s exact same per-turn-registration pattern this app2 obligation
-   explicitly preserves).
+7. **Interrupt delivery — two distinct tests, task-16 fix round 1 (Critical
+   finding 1).** A REAL terminal's Ctrl+C never reaches this app as a
+   process signal at all: raw mode (`engine/terminal.py`) clears `ISIG` for
+   the whole session, so Ctrl+C arrives only as the ordinary stdin byte
+   `"\x03"`, indistinguishable at the OS level from any other keystroke.
+   `test_ctrl_c_stdin_byte_mid_turn_cancels_and_shows_interrupted` drives
+   *that* real path — sending `\x03` through `stdin_pipe`, exactly like
+   every other scripted frame in this file — and is the primary test for
+   "Ctrl+C interrupts a turn". A second, clearly-named test,
+   `test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted`,
+   sends a real `os.kill(getpid(), SIGINT)` instead: this covers a genuine
+   *external* signal (e.g. another process sending SIGINT), which
+   `run_app2` still supports via its own `loop.add_signal_handler(signal.
+   SIGINT, ...)` registration in `_run_turn` (mirroring the legacy
+   `app.py`'s exact same per-turn-registration pattern) — a real but
+   secondary path, sent only after polling confirms a turn is genuinely in
+   flight so that registration is guaranteed to already be active.
 
 RED-phase failure mode: ``ModuleNotFoundError: No module named
 'pipython.tui.app2'`` at collection — see task-16-report.md's RED section
@@ -424,11 +434,51 @@ async def test_tool_result_error_renders_reddish_line(tmp_path, stdin_pipe):
 
 
 # =============================================================================
-# 5. SIGINT mid-turn -> cancel -> "[interrupted]"
+# 5. Ctrl+C / SIGINT mid-turn -> cancel -> "[interrupted]"
+#
+# Critical finding 1 (task-16 fix round 1): a REAL terminal's Ctrl+C never
+# arrives as a process signal (raw mode clears ISIG for the whole session,
+# engine/terminal.py) -- only as the ordinary stdin byte "\x03". The primary
+# test below drives *that* real path. A second, clearly-named test covers
+# the secondary path: a genuine external SIGINT (e.g. `kill -INT <pid>` from
+# another process), which run_app2 still supports via
+# `loop.add_signal_handler(signal.SIGINT, ...)` in `_run_turn`.
 # =============================================================================
 
 
-async def test_sigint_mid_turn_cancels_and_shows_interrupted(tmp_path, stdin_pipe):
+async def test_ctrl_c_stdin_byte_mid_turn_cancels_and_shows_interrupted(tmp_path, stdin_pipe):
+    """The real production path: Ctrl+C reaches `_on_stdin_frame` as the
+    stdin byte `"\\x03"`, exactly like any other scripted frame in this
+    file -- never as a signal. Must cancel the in-flight turn task the same
+    way `test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted`
+    (below) verifies for a genuine external signal."""
+    client = SteppedFakeClient(
+        script=[
+            AssistantMessage(content=[TextContent(text="partial "), TextContent(text="more text")])
+        ]
+    )
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term) as task:
+        send(stdin_pipe, "go")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "partial" in full_ops_text(term))
+
+        send(stdin_pipe, b"\x03")  # real-terminal Ctrl+C: a stdin byte, not a signal
+
+        await wait_until(lambda: "[interrupted]" in full_ops_text(term))
+        assert not task.done()  # app keeps running after an interrupted turn
+
+
+async def test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted(tmp_path, stdin_pipe):
+    """Secondary path (task-16 fix round 1 rename -- this test used to be
+    named `test_sigint_mid_turn_cancels_and_shows_interrupted` and was the
+    *only* interrupt test, incorrectly standing in for real-terminal Ctrl+C,
+    which does not actually deliver SIGINT at all; see the stdin-byte test
+    above for that real path). A genuine external signal -- e.g. another
+    process sending SIGINT -- is still wired through
+    `loop.add_signal_handler(signal.SIGINT, ...)` in `_run_turn` and must
+    still cancel an in-flight turn."""
     client = SteppedFakeClient(
         script=[
             AssistantMessage(content=[TextContent(text="partial "), TextContent(text="more text")])
@@ -555,6 +605,45 @@ async def test_unknown_slash_command_shows_help_hint(tmp_path, stdin_pipe):
         send(stdin_pipe, "/bogus")
         send(stdin_pipe, "\r")
         await wait_until(lambda: "/help" in full_ops_text(term))
+
+
+# =============================================================================
+# Important finding 2 (task-16 fix round 1): slash commands serialize with
+# turns -- a command submitted while a turn is in flight must be ignored (not
+# queued, not raced), matching phase 2's own ignore-while-busy single-flight
+# semantics for plain-text turns. `/clear` is the sharpest probe: it swaps
+# `app_state.session` outright, which -- if allowed mid-turn -- would pull
+# the rug out from under the still-iterating `session.prompt()` generator
+# `_run_turn` is consuming.
+# =============================================================================
+
+
+async def test_slash_clear_mid_turn_does_not_swap_session_under_running_turn(tmp_path, stdin_pipe):
+    client = SteppedFakeClient(
+        script=[
+            AssistantMessage(content=[TextContent(text="partial "), TextContent(text="more text")])
+        ]
+    )
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
+        send(stdin_pipe, "go")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "partial" in full_ops_text(term))
+
+        send(stdin_pipe, "/clear")
+        send(stdin_pipe, "\r")
+        await asyncio.sleep(0.2)  # give a (buggy) immediate-dispatch path a chance to fire
+        assert "new session" not in full_ops_text(term), (
+            "/clear must be ignored while a turn is running, not dispatched immediately"
+        )
+
+        # The running turn must be completely undisturbed by the ignored command.
+        await wait_until(lambda: "more text" in full_ops_text(term))
+
+        session_dir = tmp_path / "sessions"
+        jsonl_files = list(session_dir.rglob("*.jsonl"))
+        assert len(jsonl_files) == 1, "no session swap should have happened"
 
 
 # =============================================================================

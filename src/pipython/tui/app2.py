@@ -24,16 +24,44 @@ Four binding wiring obligations (task-16-brief.md; RED-asserted in
 (b) No ``loop.add_signal_handler(signal.SIGWINCH, ...)`` anywhere — resize
     goes through ``term.on_resize(tui.on_resize)`` only (see ``_run``).
 (c) ``term.kitty_enabled`` threads into ``Editor.handle_input``'s
-    ``parse_key(data, kitty=False)`` call sites (editor.py module docstring
-    deviation 7). Resolved *without* modifying ``components/editor.py``
-    (out of this task's file list — see ``_thread_kitty_flag`` below for the
-    disclosed approach: a scoped monkeypatch of the module-level ``parse_key``
-    name ``editor.py`` itself calls, restored on exit).
+    ``parse_key`` call sites (editor.py module docstring deviation 7).
+    Task 16 fix round 1: previously resolved via a scoped monkeypatch of the
+    module-level ``parse_key`` name ``editor.py`` calls (``editor.py`` was
+    out of this task's original file list); now resolved properly by
+    injection — ``editor.py`` gained a public ``kitty_enabled: bool = False``
+    attribute its own ``handle_input`` reads, and this module sets it once,
+    right after constructing the ``Editor`` (see ``_run``), instead of
+    monkeypatching anything.
 (d) Submit uses ``Editor.get_expanded_text()`` — this is already true for
     free: ``Editor._submit_value`` (editor.py) calls
     ``self.get_expanded_text().strip()`` *before* invoking ``on_submit``, so
     any ``on_submit`` callback here already only ever sees expanded text,
     never a folded paste marker.
+
+Task 16 fix round 1 — additional findings addressed here (see
+``.superpowers/sdd/task-16-report.md``'s "Fix round 1" section for the full
+review write-up):
+
+- **Real-terminal Ctrl+C.** Raw mode (``engine/terminal.py``) clears
+  ``ISIG`` for the whole session, so a real terminal's Ctrl+C never arrives
+  as a process signal — only as the stdin byte ``"\\x03"``. ``_on_stdin_frame``
+  now cancels the in-flight ``turn_task`` on that byte when one is running
+  (routing through the existing ``asyncio.CancelledError`` → ``"[interrupted]"``
+  path in ``_run_turn``), and only falls back to clearing the editor's draft
+  buffer when no turn is running. ``loop.add_signal_handler(signal.SIGINT,
+  ...)`` (in ``_run_turn``) is kept as a secondary path for a real *external*
+  signal (e.g. another process sending ``SIGINT``), not the primary one.
+- **Render-on-input (upstream parity).** ``TUI.handle_input`` itself now
+  requests a render after dispatching to the focused component (tui.ts:
+  827-834) — the per-frame ``tui.request_render()`` workaround this module
+  used to need after every ``tui.handle_input(frame)`` call is gone.
+- **Slash commands serialize with turns.** ``_on_submit`` now gates ``"/"``
+  dispatch behind the exact same ``turn_task is None or turn_task.done()``
+  single-flight check plain-text turns already used — a slash command
+  submitted while a turn is in flight is ignored (not queued), matching
+  phase 2's own busy semantics, instead of racing a second command against
+  the running turn (e.g. ``/clear`` swapping ``app_state.session`` out from
+  under an in-flight ``session.prompt()`` iteration).
 """
 
 from __future__ import annotations
@@ -46,7 +74,6 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Iterator
 
 from rich.console import Console
 
@@ -64,7 +91,6 @@ from pipython import (
     create_agent_session,
 )
 from pipython.tui.completers import build_file_list
-from pipython.tui.components import editor as _editor_module
 from pipython.tui.components.autocomplete import CombinedProvider, CommandProvider, PathProvider
 from pipython.tui.components.editor import Editor
 from pipython.tui.components.loader import Loader
@@ -90,40 +116,6 @@ _ERR_TRUNC = 200
 
 def _clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
-
-
-# =============================================================================
-# Obligation (c): thread term.kitty_enabled into editor.py's parse_key calls
-# without modifying components/editor.py.
-# =============================================================================
-
-
-@contextlib.contextmanager
-def _thread_kitty_flag(term: TerminalIO) -> Iterator[None]:
-    """editor.py's ``handle_input`` (both the main branch and the
-    character-jump branch) call the bare module-level name ``parse_key``
-    (``from ..engine.keys import ... parse_key``) hardcoded to
-    ``kitty=False`` (module docstring deviation 7 there, which explicitly
-    flags Task 16 as "the natural checkpoint" to fix this). Since that name
-    is resolved from ``editor.py``'s own module globals at call time,
-    swapping ``pipython.tui.components.editor.parse_key`` for the duration
-    of one ``run_app2`` invocation intercepts both call sites and substitutes
-    the real negotiated ``term.kitty_enabled`` for the hardcoded literal —
-    without touching ``editor.py``'s source (out of this task's file list;
-    see task-16-report.md's GREEN section for why this "parse seam" approach
-    was chosen over adding a new ``editor.kitty`` attribute). Restored on
-    exit so no other concurrently-imported code observes the patch.
-    """
-    original = _editor_module.parse_key
-
-    def _kitty_aware_parse_key(frame: str, kitty: bool = False):
-        return original(frame, kitty=bool(getattr(term, "kitty_enabled", False)))
-
-    _editor_module.parse_key = _kitty_aware_parse_key
-    try:
-        yield
-    finally:
-        _editor_module.parse_key = original
 
 
 # =============================================================================
@@ -231,6 +223,16 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
     loader = Loader(tui.request_render)
     loader_slot = _LoaderSlot(loader)
     editor = Editor(on_submit=lambda text: _on_submit(text))
+    # Obligation (c): thread the negotiated Kitty capability into the
+    # editor's parse_key calls (editor.py module docstring deviation 7) via
+    # the public attribute it exposes for exactly this — set once, right
+    # after construction. Safe to read now (not stale) because
+    # RealTerminal.start() negotiates Kitty synchronously, before run_app2
+    # ever reaches this point (see run_app2's own call to real_term.start()
+    # above); a bare TerminalIO that doesn't carry kitty_enabled at all
+    # (legal per the type hint) degrades to the attribute's own False
+    # default via getattr.
+    editor.kitty_enabled = bool(getattr(term, "kitty_enabled", False))
 
     root = Container()
     root.add_child(transcript)
@@ -274,9 +276,19 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
             return
         editor.add_to_history(text)
         _append(text)
+        # Important finding 2 (task-16 fix round 1): slash commands now
+        # serialize with turns under the exact same single-flight gate
+        # plain-text turns already used — a command submitted while a turn
+        # is in flight is ignored (not queued), matching phase 2's
+        # ignore-while-busy semantics, rather than racing a second command
+        # (e.g. `/clear` swapping app_state.session) against the running
+        # turn's still-iterating `session.prompt()` generator.
+        busy = turn_task is not None and not turn_task.done()
+        if busy:
+            return
         if text.startswith("/"):
             asyncio.create_task(_run_command(text))
-        elif turn_task is None or turn_task.done():
+        else:
             turn_task = asyncio.create_task(_run_turn(text))
 
     async def _run_command(text: str) -> None:
@@ -315,8 +327,7 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
                 elif isinstance(event, MessageEnd):
                     full = extract_text(event.message)
                     if slot is not None and full.strip():
-                        idx = transcript.children.index(slot)
-                        transcript.children[idx] = Markdown(full, caps)
+                        transcript.replace_child(slot, Markdown(full, caps))
                     slot = None
                     tui.request_render()
                 elif isinstance(event, ToolCallEvent):
@@ -344,68 +355,80 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
             tui.request_render()
 
     def _on_stdin_frame(frame: str) -> None:
-        if frame == "\x03":  # Ctrl+C: editor.py's own handle_key no-ops for
-            # this ("parent's job (exit/clear)") — app2 clears the buffer.
-            editor.set_text("")
-            tui.request_render()
+        if frame == "\x03":  # Ctrl+C
+            # Critical finding 1 (task-16 fix round 1): raw mode
+            # (engine/terminal.py) clears ISIG for the whole session, so a
+            # REAL terminal's Ctrl+C never arrives as a process signal —
+            # only as this stdin byte. If a turn is in flight, cancel it
+            # (routes through _run_turn's existing `asyncio.CancelledError`
+            # handler -> "[interrupted]"); otherwise fall back to
+            # editor.py's documented behavior of no-oping on Ctrl+C
+            # ("parent's job (exit/clear)") by clearing the draft buffer
+            # ourselves. `loop.add_signal_handler(signal.SIGINT, ...)` in
+            # `_run_turn` remains wired as a secondary path for a genuine
+            # *external* signal (e.g. `kill -INT <pid>` from another
+            # process) — not the primary Ctrl+C path anymore.
+            if turn_task is not None and not turn_task.done():
+                turn_task.cancel()
+            else:
+                editor.set_text("")
+                tui.request_render()
             return
         if frame == "\x04" and editor.text == "":  # Ctrl+D, empty buffer: exit
             _do_quit()
             return
-        # Editor (task-11/12/13 scope) holds no `tui`/render-request
-        # reference of its own outside the autocomplete overlay path — a
-        # plain keystroke mutates its buffer but never itself triggers a
-        # repaint, so the app layer must request one after every frame.
+        # Important finding 1 (task-16 fix round 1): TUI.handle_input now
+        # requests its own render after dispatching (upstream parity,
+        # tui.ts:827-834) — no separate request_render() call needed here
+        # anymore.
         tui.handle_input(frame)
-        tui.request_render()
 
     stdin_buffer = StdinBuffer(on_frame=_on_stdin_frame)
 
-    with _thread_kitty_flag(term):
-        # Obligation (b): resize goes through term.on_resize only — never
-        # loop.add_signal_handler(signal.SIGWINCH, ...).
-        on_resize = getattr(term, "on_resize", None)
-        if callable(on_resize):
-            on_resize(tui.on_resize)
+    # Obligation (b): resize goes through term.on_resize only — never
+    # loop.add_signal_handler(signal.SIGWINCH, ...).
+    on_resize = getattr(term, "on_resize", None)
+    if callable(on_resize):
+        on_resize(tui.on_resize)
 
-        # Obligation (a): drain_pending() bytes MUST be fed before the live
-        # reader attaches (engine/terminal.py's own binding requirement).
-        drain_pending = getattr(term, "drain_pending", None)
-        if callable(drain_pending):
-            pending = drain_pending()
-            if isinstance(pending, bytes) and pending:
-                stdin_buffer.feed(pending)
+    # Obligation (a): drain_pending() bytes MUST be fed before the live
+    # reader attaches (engine/terminal.py's own binding requirement).
+    drain_pending = getattr(term, "drain_pending", None)
+    if callable(drain_pending):
+        pending = drain_pending()
+        if isinstance(pending, bytes) and pending:
+            stdin_buffer.feed(pending)
 
-        loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        fd = None
+
+    def _readable() -> None:
+        assert fd is not None
         try:
-            fd = sys.stdin.fileno()
-        except (AttributeError, OSError, ValueError):
-            fd = None
+            data = os.read(fd, 4096)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            data = b""
+        if data:
+            stdin_buffer.feed(data)
 
-        def _readable() -> None:
-            assert fd is not None
-            try:
-                data = os.read(fd, 4096)
-            except (BlockingIOError, InterruptedError):
-                return
-            except OSError:
-                data = b""
-            if data:
-                stdin_buffer.feed(data)
+    if fd is not None:
+        loop.add_reader(fd, _readable)
 
+    tui.start()
+    try:
+        await quit_event.wait()
+    finally:
         if fd is not None:
-            loop.add_reader(fd, _readable)
-
-        tui.start()
-        try:
-            await quit_event.wait()
-        finally:
-            if fd is not None:
-                with contextlib.suppress(ValueError, OSError):
-                    loop.remove_reader(fd)
-            with contextlib.suppress(ValueError):
-                loop.remove_signal_handler(signal.SIGINT)
-            if turn_task is not None and not turn_task.done():
-                turn_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await turn_task
+            with contextlib.suppress(ValueError, OSError):
+                loop.remove_reader(fd)
+        with contextlib.suppress(ValueError):
+            loop.remove_signal_handler(signal.SIGINT)
+        if turn_task is not None and not turn_task.done():
+            turn_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await turn_task

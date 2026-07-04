@@ -131,22 +131,22 @@ Deviations from upstream editor.ts:
    as plain read-only properties and only ``on_submit`` as a callback; none
    of the translated tests exercise ``onChange`` or ``disableSubmit``.
    ``getExpandedText`` *is* ported (task-12 brief, ``get_expanded_text()``).
-7. **``handle_input`` calls ``parse_key(data, kitty=False)`` with the Kitty
-   channel hardcoded off** — the task-11 brief's ``handle_input(data)``
-   signature carries no kitty-enabled parameter (this component, per
-   deviation 1, holds no ``tui``/terminal reference to read one from).
-   Upstream instead consults a module-level ``_kittyProtocolActive`` flag
-   (keys.ts:25-40) that a real terminal's keyboard-protocol negotiation
-   flips at runtime. This is a **known limitation, not a design choice**:
-   Kitty CSI-u–encoded keys are always parsed as if Kitty mode were
-   disabled until a future task threads a live capability flag through —
-   the natural checkpoint is Task 16, where ``RealTerminal.kitty_enabled``
-   (``engine/terminal.py``) must be wired into this call (and into the
-   TUI's dispatch to ``handle_input`` generally) so this hardcoded
-   ``False`` can be replaced with the negotiated value. (Note: the Kitty
-   CSI-u *parser itself* is not gated by this flag — ``\x1b[45;5u`` for
-   Ctrl+- still parses correctly regardless — only a couple of legacy
-   ambiguous 2-byte sequences depend on it; see keys.py.)
+7. **``handle_input`` calls ``parse_key(data, kitty=self.kitty_enabled)``** —
+   ``self.kitty_enabled`` is a plain public ``bool`` attribute (default
+   ``False``), analogous to ``self.focused``: this component still holds no
+   ``tui``/terminal reference of its own (deviation 1), so it cannot read a
+   live capability flag itself — the caller must set it. Upstream instead
+   consults a module-level ``_kittyProtocolActive`` flag (keys.ts:25-40)
+   that a real terminal's keyboard-protocol negotiation flips at runtime.
+   **Checkpoint resolved (Task 16 fix round 1)**: ``app2.py`` sets
+   ``editor.kitty_enabled = term.kitty_enabled`` once, right after
+   constructing the ``Editor`` — safe because ``RealTerminal.start()``
+   negotiates Kitty synchronously (blocking on the DA reply) before
+   ``run_app2`` ever reaches that point, so the value is already final, not
+   a snapshot of an in-progress negotiation. (Note: the Kitty CSI-u *parser
+   itself* is not gated by this flag — ``\x1b[45;5u`` for Ctrl+- still
+   parses correctly regardless — only a couple of legacy ambiguous 2-byte
+   sequences depend on it; see keys.py.)
 8. **``_submit_value`` resets ``_preferred_visual_col`` (and, since the
    task-12-fix-round-2 vertical-snap port, ``_snapped_from_cursor_col``)
    to ``None``**, which upstream's ``submitValue`` (editor.ts:1246-1259)
@@ -626,6 +626,14 @@ class Editor:
 
         self.focused: bool = False
 
+        # Kitty keyboard-protocol negotiation result, threaded in by the app
+        # layer (module docstring deviation 7): a plain public attribute,
+        # analogous to ``focused`` above — this component has no ``tui``/
+        # terminal reference of its own to read one from. Defaults to
+        # ``False`` (legacy/non-Kitty parsing), matching upstream's own
+        # default-off ``_kittyProtocolActive`` before negotiation completes.
+        self.kitty_enabled: bool = False
+
         self._lines: list[str] = [""]
         self._cursor_line: int = 0
         self._cursor_col: int = 0
@@ -837,7 +845,7 @@ class Editor:
         # see handle_key's docstring for why parse_key alone cannot carry
         # arbitrary Unicode literals).
         if self._jump_mode is not None:
-            e = parse_key(data, kitty=False)
+            e = parse_key(data, kitty=self.kitty_enabled)
             cancels = e is not None and (
                 self.bindings.matches(key_id(e), "tui.editor.jumpForward")
                 or self.bindings.matches(key_id(e), "tui.editor.jumpBackward")
@@ -877,7 +885,7 @@ class Editor:
             self._add_new_line()
             return
 
-        e = parse_key(data, kitty=False)
+        e = parse_key(data, kitty=self.kitty_enabled)
         if e is not None:
             self.handle_key(e)
             return
