@@ -10,9 +10,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ripgrep  # grep/find 的 rg 优先路径必须被真实测到（spec §8）
         run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Install tmux  # tui e2e 用 tmux 驱动真实交互（spec §7/§8）
+        run: sudo apt-get install -y tmux
       - uses: astral-sh/setup-uv@v5
       - run: uv python install ${{ matrix.python }}
-      - run: uv sync
+      - run: uv sync --extra tui
       - run: uv run ruff check .
       - run: uv run pyright
       - run: uv run pytest
