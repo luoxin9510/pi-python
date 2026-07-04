@@ -1,4 +1,18 @@
-"""Completers for the pi-python TUI: fuzzy @path and /command completion."""
+"""File-list building for the pi-python TUI's ``@path`` completion.
+
+Task 18 (pi-tui engine becomes the only TUI): ``PiCompleter`` — the
+``prompt_toolkit.completion.Completer`` subclass that drove the legacy
+engine's ``@``-fuzzy (``rapidfuzz``-scored) and ``/``-command completion — is
+retired along with the legacy engine and the ``prompt_toolkit``/``rapidfuzz``
+dependencies it required. The pi-tui engine's own completion path
+(``components/autocomplete.py``'s ``PathProvider``/``CommandProvider``/
+``CombinedProvider``, wired into ``Editor.set_autocomplete_provider``) is the
+sole surviving completer; it already reuses this module's ``AT_FRAGMENT_RE``
+and ``build_file_list`` unmodified (see that module's docstring). Equivalence
+for ``PiCompleter``'s retired fuzzy-@ and slash-completion behavior is pinned
+by ``tests/tui/components/test_autocomplete_providers.py`` (see
+``.superpowers/sdd/task-18-report.md``'s coverage table).
+"""
 
 import asyncio
 import os
@@ -6,9 +20,6 @@ import re
 from pathlib import Path
 
 import pathspec
-from prompt_toolkit.completion import CompleteEvent, Completer, Completion
-from prompt_toolkit.document import Document
-from rapidfuzz import process as fuzz_process
 
 AT_FRAGMENT_RE = re.compile(r"@([^\s@]*)$")
 _FILE_LIMIT = 5000
@@ -69,28 +80,3 @@ async def build_file_list(cwd: Path, limit: int = _FILE_LIMIT) -> list[str]:
             None, _walk_with_pathspec, cwd, cap
         )
     return files[:limit]
-
-
-class PiCompleter(Completer):
-    def __init__(self, commands: dict[str, str]):
-        self.commands = commands
-        self.file_list: list[str] = []
-
-    def get_completions(self, document: Document, complete_event: CompleteEvent):
-        text = document.text_before_cursor
-        if document.text.startswith("/") and "\n" not in document.text:
-            frag = text[1:]
-            for name, desc in sorted(self.commands.items()):
-                if name.startswith(frag):
-                    yield Completion(f"/{name}", start_position=-len(text), display_meta=desc)
-            return
-        m = AT_FRAGMENT_RE.search(text)
-        if not m:
-            return
-        frag = m.group(1)
-        if not frag:
-            candidates = self.file_list[:10]
-        else:
-            candidates = [x for x, _, _ in fuzz_process.extract(frag, self.file_list, limit=10)]
-        for path in candidates:
-            yield Completion(path, start_position=-len(frag), display_meta="file")

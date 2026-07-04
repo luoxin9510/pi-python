@@ -1,42 +1,41 @@
 """Slash-command registry + dispatch for the pipython TUI (spec §6).
 
-All dynamic content is printed via ``rich.Text``, never f-string markup: help
-descriptions may contain ``[litellm-id]``-shaped placeholders, tree labels
-contain message excerpts, and unknown-command handling echoes back arbitrary
-user input. rich's markup parser would silently swallow bracketed substrings
-in any of these if we built them as markup strings, so we route them through
-``rich.Text`` (which never parses markup) instead.
+Task 18 (pi-tui engine becomes the only TUI): the legacy prompt_toolkit/rich
+stack (``app.py``, ``keys.py``, ``render.py``) and its console-based
+``RichSink`` fallback are retired along with it — ``rich``/``prompt_toolkit``/
+``rapidfuzz`` are dropped from ``pyproject.toml`` entirely (spec's Task 18
+deletion gate), so ``RichSink`` (which wrapped ``rich.console.Console``)
+cannot be kept even as an unused fallback: importing ``rich`` at module load
+time would crash as soon as the dependency is gone.
 
-Task 16 addition — Sink dual-track (task-16-brief.md): every handler used to
-print straight to ``ctx.console``. The new-engine app loop (``app2.py``) has
-no ``rich.Console`` to print to (its transcript is a tree of ``Component``
-objects) — so ``CommandContext`` grows an optional ``sink: Sink | None``, and
-each handler now goes through ``out = ctx.sink or RichSink(ctx.console)``.
-``RichSink`` is the *literal* old behavior (a thin wrapper that still prints
-``rich.Text`` onto ``ctx.console``) — when ``ctx.sink`` is left at its
-default ``None``, every handler's output is byte-identical to before this
-change (verified by ``tests/tui/test_commands.py``, which is untouched).
+**API break (disclosed per task-18-brief.md's instruction to surface this):**
+``CommandContext`` no longer carries a ``console: rich.console.Console``
+field, and ``sink`` is no longer optional — every caller must supply a real
+``Sink`` (the pi-tui engine's ``app.py`` always did, via ``_ComponentSink``;
+it was only the *removed* legacy ``app.py`` that had no such object to pass
+and relied on the ``None`` → ``RichSink(console)`` fallback). Every handler
+below now writes through ``ctx.sink`` unconditionally.
 
-``_tree`` is the one handler that can't be expressed as a handful of
-``out.emit_text(...)`` calls either way: its rich path builds a real
-``rich.tree.Tree`` object (dim/bold-green styled, ``←`` leaf marker) and
-prints *that* — no ``Sink`` method takes a ``Tree``. So ``_tree`` branches
-explicitly: sink is ``None``/``RichSink`` → build and print the same
-``rich.tree.Tree`` as before (parity pinned by
-``tests/tui/test_commands_sink.py::test_tree_via_none_sink_still_uses_rich_tree_unchanged``);
-a real (non-``RichSink``) sink → a new pure-ANSI tree renderer
-(``_render_ansi_tree_lines``: ``├──``/``└──`` connectors, raw ANSI
-dim/bold-green SGR, ``←`` leaf marker) emitted as a list of lines via
-``out.emit_lines(...)``.
+``_tree``'s rendering is now unconditionally the pure-ANSI tree introduced in
+task-16 for the sink path (``├──``/``└──`` connectors, raw ANSI
+dim/bold-green SGR, ``←`` leaf marker) — this was previously a branch taken
+only for a "real" (non-``RichSink``) sink; with ``RichSink`` gone it is
+simply how ``_tree`` renders, unconditionally. Equivalence for the retired
+``rich.tree.Tree`` rendering (dim/bold-green styling, issue #4) is pinned by
+``tests/tui/test_commands.py::test_tree_dim_off_path_bold_green_on_path_via_sink``
+(carried over verbatim from task-16's sink-parity suite) — see
+``.superpowers/sdd/task-18-report.md``'s coverage table.
+
+All dynamic content is printed via ``sink.emit_text``/``emit_lines``, never
+f-string-interpolated into a markup string — this predates and is unrelated
+to the ``rich`` removal (it was already true of every sink-based handler);
+kept as plain formatted strings here since there is no markup parser left in
+this module to guard against.
 """
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
-
-from rich.console import Console
-from rich.text import Text
-from rich.tree import Tree
 
 from pipython import (
     AgentSession,
@@ -49,7 +48,31 @@ from pipython import (
     entry_type,
 )
 
-from .render import summarize_message_dict
+_SUMMARY_TRUNC = 50
+
+
+def _clip(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def summarize_message_dict(d: dict) -> str:
+    """Moved here verbatim from the retired ``render.py`` (Task 18) — the
+    only remaining caller is ``_label`` below. Rules: a plain string
+    ``content`` is truncated; a list ``content`` prefers its first ``text``
+    block, falling back to a ``[tool: <name>]`` marker for a ``toolCall``
+    block if no text block exists; anything else falls back to the
+    message's ``role``."""
+    content = d.get("content")
+    if isinstance(content, str):
+        return _clip(content, _SUMMARY_TRUNC)
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return _clip(block.get("text", ""), _SUMMARY_TRUNC)
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "toolCall":
+                return f"[tool: {block.get('name', '?')}]"
+    return _clip(str(d.get("role", "?")), _SUMMARY_TRUNC)
 
 
 @dataclass
@@ -61,38 +84,20 @@ class AppState:
 
 class Sink(Protocol):
     """Output boundary for slash-command handlers (task-16-brief.md): the
-    new-engine app loop implements this over its component tree (appending
-    ``Text``/lines to the transcript ``Container``); ``RichSink`` (below)
-    implements it over a ``rich.Console`` for the legacy path."""
+    pi-tui engine's app loop (``app.py``) implements this over its component
+    tree (appending ``Text``/lines to the transcript ``Container``) via
+    ``_ComponentSink`` — the sole production implementation since Task 18
+    retired the legacy ``RichSink``/console fallback."""
 
     def emit_text(self, s: str, style: str = "") -> None: ...
 
     def emit_lines(self, lines: list[str]) -> None: ...
 
 
-class RichSink:
-    """Default ``Sink``: prints straight to a ``rich.Console`` via
-    ``rich.Text`` (never markup — see module docstring). This is the exact
-    implementation ``ctx.sink is None`` falls back to
-    (``RichSink(ctx.console)``), so it *is* the pre-task-16 behavior, not a
-    reimplementation of it — parity is structural, not coincidental."""
-
-    def __init__(self, console: Console) -> None:
-        self.console = console
-
-    def emit_text(self, s: str, style: str = "") -> None:
-        self.console.print(Text(s, style=style))
-
-    def emit_lines(self, lines: list[str]) -> None:
-        for line in lines:
-            self.console.print(Text(line))
-
-
 @dataclass
 class CommandContext:
-    console: Console
     app: AppState
-    sink: Sink | None = None
+    sink: Sink
 
 
 @dataclass(frozen=True)
@@ -112,11 +117,11 @@ def _label(e) -> str:
 
 
 # =============================================================================
-# Pure-ANSI tree renderer (task-16): the ``_tree`` handler's real-sink path.
+# Pure-ANSI tree renderer (task-16): now ``_tree``'s only rendering path.
 # No canonical dim/bold-green ANSI convention existed anywhere in this port
-# before this task (task-9's ``Text.style`` is a raw pass-through string with
+# before task-16 (task-9's ``Text.style`` is a raw pass-through string with
 # no fixed palette) — these are this module's own pick, plain SGR 2 (dim) and
-# SGR 1+32 (bold green), matching what ``tests/tui/test_commands_sink.py``'s
+# SGR 1+32 (bold green), matching what ``tests/tui/test_commands.py``'s
 # ``_looks_dim``/``_looks_bold_green`` tolerantly accept.
 # =============================================================================
 
@@ -128,8 +133,7 @@ _ANSI_RESET = "\x1b[0m"
 def _render_ansi_tree_lines(store) -> list[str]:
     """``├──``/``└──``-connector tree, one line per entry, styled dim
     (off the current path) or bold-green (on it), with the leaf entry
-    suffixed ``" ←"`` — the pure-ANSI counterpart of the ``rich.tree.Tree``
-    the ``RichSink``/``sink=None`` path below still builds verbatim."""
+    suffixed ``" ←"``."""
     entries = [e for e in store.entries if entry_id(e) and not isinstance(e, SessionHeader)]
     on_path = {entry_id(e) for e in current_path(store.entries, store.leaf_id)}
     children: dict[str | None, list] = {}
@@ -156,65 +160,29 @@ def _render_ansi_tree_lines(store) -> list[str]:
 
 
 async def _help(ctx: CommandContext, _: str) -> None:
-    out = ctx.sink or RichSink(ctx.console)
     for cmd in sorted(build_registry().values(), key=lambda c: c.name):
-        # Text：描述含 [litellm-id] 这类方括号，markup 拼接会被吞（复审实测）
-        out.emit_text(f"/{cmd.name:<8} {cmd.description}")
+        ctx.sink.emit_text(f"/{cmd.name:<8} {cmd.description}")
 
 
 async def _model(ctx: CommandContext, arg: str) -> None:
-    out = ctx.sink or RichSink(ctx.console)
     if arg:
         ctx.app.session.set_model(arg)
-        out.emit_text(f"model → {arg}")
+        ctx.sink.emit_text(f"model → {arg}")
     else:
-        out.emit_text(f"model: {ctx.app.session.model}")
+        ctx.sink.emit_text(f"model: {ctx.app.session.model}")
 
 
 async def _clear(ctx: CommandContext, _: str) -> None:
     ctx.app.session = await ctx.app.make_session()
-    out = ctx.sink or RichSink(ctx.console)
-    if isinstance(out, RichSink):
-        # console.rule() has no Sink equivalent (Sink is text/lines-only) —
-        # keep the exact legacy visual for the rich path.
-        out.console.rule("new session")
-    else:
-        out.emit_text("new session")
+    ctx.sink.emit_text("new session")
 
 
 async def _tree(ctx: CommandContext, _: str) -> None:
     store = ctx.app.session.store
-    out = ctx.sink or RichSink(ctx.console)
-
-    if isinstance(out, RichSink):
-        # 过滤 header：leaf 初始为 None，首条消息 parentId 也是 None，不滤则 header
-        # 会被渲染成根级兄弟节点（审核发现）
-        entries = [e for e in store.entries if entry_id(e) and not isinstance(e, SessionHeader)]
-        on_path = {entry_id(e) for e in current_path(store.entries, store.leaf_id)}
-        children: dict[str | None, list] = {}
-        for e in entries:
-            children.setdefault(entry_parent_id(e), []).append(e)
-        tree = Tree("session")
-
-        def attach(node, parent_id):
-            for e in children.get(parent_id, []):
-                eid = entry_id(e)
-                label = _label(e)
-                if eid == store.leaf_id:
-                    label += " ←"
-                style = "bold green" if eid in on_path else "dim"
-                # Text 不解析 markup——消息摘要常含方括号（审核实测会被吞）
-                attach(node.add(Text(label, style=style)), eid)
-
-        attach(tree, None)
-        out.console.print(tree)
-        return
-
-    out.emit_lines(_render_ansi_tree_lines(store))
+    ctx.sink.emit_lines(_render_ansi_tree_lines(store))
 
 
 async def _branch(ctx: CommandContext, arg: str) -> None:
-    out = ctx.sink or RichSink(ctx.console)
     prefix = arg.strip()
     store = ctx.app.session.store
     # 排除 header：header.id 也是合法字符串，前缀能唯一命中它，但它不在
@@ -225,11 +193,11 @@ async def _branch(ctx: CommandContext, arg: str) -> None:
     if len(matches) == 1:
         match = matches[0]
         ctx.app.session.branch(match)
-        out.emit_text(f"branched to {match[:8]}")
+        ctx.sink.emit_text(f"branched to {match[:8]}")
     elif not matches:
-        out.emit_text("no match", style="red")
+        ctx.sink.emit_text("no match", style="red")
     else:
-        out.emit_text(f"ambiguous prefix ({len(matches)} matches)", style="red")
+        ctx.sink.emit_text(f"ambiguous prefix ({len(matches)} matches)", style="red")
 
 
 async def _quit(ctx: CommandContext, _: str) -> None:
@@ -252,7 +220,6 @@ async def dispatch(registry: dict[str, Command], ctx: CommandContext, line: str)
     name, _, arg = line[1:].partition(" ")
     cmd = registry.get(name)
     if cmd is None:
-        out = ctx.sink or RichSink(ctx.console)
-        out.emit_text(f"unknown command /{name} — try /help", style="red")
+        ctx.sink.emit_text(f"unknown command /{name} — try /help", style="red")
         return
     await cmd.handler(ctx, arg.strip())

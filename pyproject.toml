@@ -12,9 +12,6 @@ dependencies = [
 
 [project.optional-dependencies]
 tui = [
-    "prompt_toolkit==3.0.52",
-    "rich==15.0.0",
-    "rapidfuzz==3.14.5",
     "pathspec==1.1.1",
     "markdown-it-py==4.2.0",
     "linkify-it-py==2.1.0",

@@ -1,10 +1,27 @@
-"""RED-phase integration suite for Task 16 (`app2.py` main loop + commands
-Sink dual-track), per ``.superpowers/sdd/task-16-brief.md`` and spec §6
+"""Integration suite for the pipython TUI's main loop + commands Sink
+dual-track, per ``.superpowers/sdd/task-16-brief.md`` and spec §6
 (``docs/superpowers/specs/2026-07-04-phase3-pi-tui-port-design.md``).
 
-Target surface (does not exist yet as of RED):
-``async run_app2(*, model: str, cwd: Path, client: ModelClient | None = None,
-term: TerminalIO | None = None) -> None`` in ``src/pipython/tui/app2.py``.
+This file was named ``test_app2.py`` through Tasks 16-17, targeting the
+pi-tui engine module while it was developed *alongside* the legacy
+prompt_toolkit/rich TUI under a disambiguating "2" suffix (spec §8). Task 18
+(pi-tui engine becomes the only TUI) deleted the legacy engine outright,
+dropped the "2" suffix from the module and its entry point, and renamed
+this file into the vacated ``test_app.py`` slot — every reference below to
+the module or its entry point uses the current (un-suffixed) names. This
+file also carries forward, from
+the retired ``test_app_helpers.py``/``test_render.py``: unit tests for
+``load_fake_client``/``make_client`` (moved into this module verbatim) and
+``extract_text`` (ditto), plus new integration-level tests closing gaps the
+task-18 coverage table found — tool-call-line truncation, a successful tool
+result's content never being echoed, ``ErrorEvent``/non-``"done"``
+``AgentEnd`` rendering, and a slash-command handler exception not crashing
+the app loop (see ``.superpowers/sdd/task-18-report.md`` for the full
+before/after mapping).
+
+Target surface: ``async run_app(*, model: str, cwd: Path, client:
+ModelClient | None = None, term: TerminalIO | None = None) -> None`` in
+``src/pipython/tui/app.py``.
 
 This is the *first full assembly* of the phase-3 engine (Task 7/8 `TUI`
 + Task 9-15 components) with a real `pipython` `AgentSession`, driven
@@ -16,7 +33,7 @@ the terminal — "no real terminal throughout" per the brief.
 Locked test-harness design decisions (read before touching this file)
 ======================================================================
 
-1. **stdin injection seam: ``sys.stdin.fileno()``.** ``run_app2`` has no
+1. **stdin injection seam: ``sys.stdin.fileno()``.** ``run_app`` has no
    dedicated "input source" parameter in its Produces signature — only
    ``term`` (the *output* boundary, matching ``engine.terminal.TerminalIO``).
    Consuming live keystrokes therefore still has to go through a real
@@ -27,7 +44,7 @@ Locked test-harness design decisions (read before touching this file)
    the pipe's read end — **the same convention `engine/terminal.py`'s own
    ``RealTerminal._enter_raw_mode``/``_read_negotiation_reply`` already use**
    (``sys.stdin.fileno()``, guarded, never a hardcoded literal ``0``). Per
-   this precedent, **`run_app2` must resolve the stdin fd via
+   this precedent, **`run_app` must resolve the stdin fd via
    `sys.stdin.fileno()`** (not a hardcoded ``0``) for these tests to be able
    to inject input at all. Bytes are written with a plain ``os.write()`` —
    a real pipe, not a mock — consistent with this repo's "real integration"
@@ -37,7 +54,7 @@ Locked test-harness design decisions (read before touching this file)
    `TerminalIO` Protocol** (`write`/`columns`/`rows`): it also carries
    `kitty_enabled`, `on_resize(cb)`, and `drain_pending()` — the same three
    extra members `RealTerminal` (`engine/terminal.py`) exposes beyond the
-   Protocol. `run_app2` must consult these (defensively — a plain
+   Protocol. `run_app` must consult these (defensively — a plain
    `TerminalIO` that lacks them is still a legal `term=` value per the type
    hint) to satisfy obligations (a)/(b)/(c) below. `FakeRealTerm` subclasses
    the existing `engine.conftest.RecordingTerm` test double (Task 7's own
@@ -60,7 +77,7 @@ Locked test-harness design decisions (read before touching this file)
       — `test_submit_sends_full_expanded_paste_text_not_the_folded_marker`.
 
 4. **Streaming interleaving: `SteppedFakeClient`.** Plain `FakeClient.stream()`
-   has no real ``await`` suspension point, so driving it inside `run_app2`'s
+   has no real ``await`` suspension point, so driving it inside `run_app`'s
    turn-consuming loop would run the *entire* scripted turn in one
    uninterrupted scheduler burst — collapsing `TUI.request_render()`'s
    `call_soon` coalescing into a single final frame and making "streaming
@@ -71,8 +88,8 @@ Locked test-harness design decisions (read before touching this file)
 
 5. **No canonical "red" / "dim" / "bold-green" ANSI convention exists yet**
    in this port for *this* component (task-9's `Text.style` is a raw
-   pass-through string with no fixed palette, and app2 is the first caller
-   to pick an actual error color) — `_has_reddish_styling` below accepts any
+   pass-through string with no fixed palette, and this module was the first
+   caller to pick an actual error color) — `_has_reddish_styling` below accepts any
    SGR spelling of "reddish foreground" (8-color red/bright-red or a
    truecolor triplet where the red channel dominates) rather than locking
    GREEN into one exact byte sequence invented by this test file.
@@ -96,7 +113,7 @@ Locked test-harness design decisions (read before touching this file)
    `test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted`,
    sends a real `os.kill(getpid(), SIGINT)` instead: this covers a genuine
    *external* signal (e.g. another process sending SIGINT), which
-   `run_app2` still supports via its own `loop.add_signal_handler(signal.
+   `run_app` still supports via its own `loop.add_signal_handler(signal.
    SIGINT, ...)` registration in `_run_turn` (mirroring the legacy
    `app.py`'s exact same per-turn-registration pattern) — a real but
    secondary path, sent only after polling confirms a turn is genuinely in
@@ -111,6 +128,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import signal
@@ -121,6 +139,7 @@ import pytest
 
 from pipython import AssistantMessage, TextContent, ToolCallContent
 from pipython.testing import FakeClient
+from pipython.tui.app import extract_text, load_fake_client, make_client
 from pipython.tui.components.loader import DEFAULT_FRAMES
 
 # See module docstring note 2 / engine.conftest note in
@@ -131,8 +150,7 @@ from pipython.tui.components.loader import DEFAULT_FRAMES
 # dotted `tests.tui.engine.conftest`) is what's reliably importable here.
 from engine.conftest import RecordingTerm
 
-# Target surface — does not exist yet (RED).
-from pipython.tui.app2 import run_app2  # noqa: E402
+from pipython.tui.app import run_app  # noqa: E402
 
 
 # =============================================================================
@@ -172,14 +190,14 @@ def send(w_fd: int, data: bytes | str) -> None:
 
 
 # =============================================================================
-# FakeRealTerm — RecordingTerm + the RealTerminal-only extras app2 must use
+# FakeRealTerm — RecordingTerm + the RealTerminal-only extras the app must use
 # =============================================================================
 
 
 class FakeRealTerm(RecordingTerm):
     """`RecordingTerm` (Task 7's own write/screen()-replay double) plus the
     three `RealTerminal`-only members (`kitty_enabled`, `on_resize`,
-    `drain_pending`) app2 needs for obligations (a)/(b)/(c). See module
+    `drain_pending`) the app needs for obligations (a)/(b)/(c). See module
     docstring note 2."""
 
     def __init__(self, *, kitty_enabled: bool = False, pending: bytes = b"") -> None:
@@ -301,10 +319,10 @@ async def wait_until(
 
 @contextlib.asynccontextmanager
 async def running_app(**kwargs):
-    """Runs run_app2 as a background task; always cancels + drains it on
+    """Runs run_app as a background task; always cancels + drains it on
     exit regardless of whether the test already drove a clean exit
     (cancelling an already-finished task is a no-op)."""
-    task = asyncio.create_task(run_app2(**kwargs))
+    task = asyncio.create_task(run_app(**kwargs))
     try:
         yield task
     finally:
@@ -472,7 +490,7 @@ async def test_tool_result_error_renders_reddish_line(tmp_path, stdin_pipe):
 # engine/terminal.py) -- only as the ordinary stdin byte "\x03". The primary
 # test below drives *that* real path. A second, clearly-named test covers
 # the secondary path: a genuine external SIGINT (e.g. `kill -INT <pid>` from
-# another process), which run_app2 still supports via
+# another process), which run_app still supports via
 # `loop.add_signal_handler(signal.SIGINT, ...)` in `_run_turn`.
 # =============================================================================
 
@@ -530,7 +548,7 @@ async def test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted(tmp
 
 # =============================================================================
 # 6. Ctrl+C clears the editor buffer (Editor itself no-ops on ctrl+c --
-#    editor.py handle_key: "Ctrl+C: parent's job (exit/clear)" -- app2 must
+#    editor.py handle_key: "Ctrl+C: parent's job (exit/clear)" -- the app must
 #    do the clearing itself)
 # =============================================================================
 
@@ -552,7 +570,7 @@ async def test_ctrl_c_clears_editor_buffer_without_submitting(tmp_path, stdin_pi
 # =============================================================================
 # 7. Ctrl+D on an empty buffer exits with a session-path banner; on a
 #    non-empty buffer it must NOT quit (editor's own binding: ctrl+d ->
-#    deleteCharForward) -- app2 only special-cases the *empty* case.
+#    deleteCharForward) -- the app only special-cases the *empty* case.
 # =============================================================================
 
 
@@ -566,7 +584,7 @@ async def test_ctrl_d_empty_buffer_exits_with_session_banner(tmp_path, stdin_pip
 
         session_dir = tmp_path / "sessions"
         jsonl_files = list(session_dir.rglob("*.jsonl"))
-        assert jsonl_files, "expected run_app2 to have created a session file"
+        assert jsonl_files, "expected run_app to have created a session file"
         banner_needle = jsonl_files[0].stem
         assert "session" in full_ops_text(term).lower()
         assert banner_needle in full_ops_text(term)
@@ -882,3 +900,158 @@ async def test_submit_sends_full_expanded_paste_text_not_the_folded_marker(tmp_p
         await wait_until(lambda: bool(client.calls))
         submitted = client.calls[-1][-1].content
         assert submitted == big_paste
+
+
+# =============================================================================
+# Task 18 gap closures — see .superpowers/sdd/task-18-report.md's coverage
+# table. These port forward regression coverage from the retired
+# test_app_helpers.py/test_render.py (pure-function tests: load_fake_client,
+# make_client, extract_text) plus close gaps the coverage table found with
+# no prior equivalent against this engine: tool-call-line truncation, a
+# successful tool result's content never being echoed, ErrorEvent/non-"done"
+# AgentEnd rendering, and a slash-command handler exception not crashing the
+# app loop.
+# =============================================================================
+
+
+def test_load_fake_client_roundtrip(tmp_path):
+    # Ported from the retired test_app_helpers.py — load_fake_client moved
+    # into pipython.tui.app verbatim (see that module's docstring).
+    script = [{"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]
+    f = tmp_path / "s.json"
+    f.write_text(json.dumps(script))
+    client = load_fake_client(str(f))
+    assert isinstance(client, FakeClient) and len(client._script) == 1
+
+
+def test_make_client_env_switch(tmp_path, monkeypatch):
+    # Ported from the retired test_app_helpers.py — make_client moved into
+    # pipython.tui.app verbatim; this is the CLI's PI_PYTHON_FAKE_SCRIPT
+    # wiring, exercised end-to-end by every e2e tmux test's env= kwarg.
+    f = tmp_path / "s.json"
+    f.write_text("[]")
+    monkeypatch.setenv("PI_PYTHON_FAKE_SCRIPT", str(f))
+    assert isinstance(make_client("any/model"), FakeClient)
+    monkeypatch.delenv("PI_PYTHON_FAKE_SCRIPT")
+    assert make_client("any/model") is None
+
+
+def test_extract_text_joins_blocks_skipping_tool_calls():
+    # Ported from the retired test_render.py's test_extract_text_joins_blocks
+    # — extract_text moved into pipython.tui.app verbatim.
+    msg = AssistantMessage(
+        content=[
+            TextContent(text="a"),
+            ToolCallContent(id="t1", name="bash", arguments={"command": "ls"}),
+            TextContent(text="b"),
+        ]
+    )
+    assert extract_text(msg) == "ab"
+
+
+async def test_tool_call_line_args_truncated(tmp_path, stdin_pipe):
+    # Gap closure: the retired test_render.py's test_tool_call_line_truncated
+    # asserted long tool-call arguments get clipped in the "[tool] <name>
+    # <args>" line (_ARG_TRUNC in app.py) — no prior test against this
+    # engine pinned that truncation actually happens.
+    long_cmd = "x" * 500
+    script = [
+        AssistantMessage(
+            content=[ToolCallContent(id="1", name="bash", arguments={"command": long_cmd})]
+        ),
+        done("finished"),
+    ]
+    client = FakeClient(script=script)
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
+        send(stdin_pipe, "go")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "[tool] bash" in full_ops_text(term))
+        assert long_cmd not in full_ops_text(term), (
+            "tool-call arguments must be truncated, never echoed in full"
+        )
+        await wait_until(lambda: "finished" in full_ops_text(term))
+
+
+async def test_tool_result_success_content_not_echoed(tmp_path, stdin_pipe):
+    # Gap closure: the retired test_render.py's
+    # test_tool_result_only_errors_printed asserted a *successful* tool
+    # result's content is never printed (only errors are, via
+    # test_tool_result_error_renders_reddish_line above) — no prior test
+    # against this engine pinned the "success is silent" half of that rule.
+    (tmp_path / "success_marker_9f3a.txt").write_text("x")
+    script = [
+        AssistantMessage(content=[ToolCallContent(id="1", name="ls", arguments={})]),
+        done("all good"),
+    ]
+    client = FakeClient(script=script)
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
+        send(stdin_pipe, "go")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "all good" in full_ops_text(term))
+        assert "success_marker_9f3a.txt" not in full_ops_text(term), (
+            "a successful tool result's content must never be echoed"
+        )
+
+
+async def test_error_event_and_agent_end_error_reason_rendered(tmp_path, stdin_pipe):
+    # Gap closure: the retired test_render.py's test_error_event_rendered_in_red
+    # / test_agent_end_non_done_notice covered ErrorEvent (reddish text) and
+    # AgentEnd(reason != "done") ("[end] <reason>") — no prior test against
+    # this engine exercised either. Driven through the *real* failure path
+    # rather than a hand-built event: a script with exactly one entry (a
+    # tool call) makes the agent loop for a second model turn once the tool
+    # result comes back, but the FakeClient's script is now exhausted, so
+    # `client.stream()` raises AssertionError — agent.py's own `except
+    # Exception` branch (spec §4.3) converts that into ErrorEvent +
+    # AgentEnd(reason="error") rather than letting it escape naked. The
+    # "[end] <reason>" format string is reason-agnostic, so this also stands
+    # in for the "max_turns" case the retired test used (not practically
+    # triggerable here: run_app's AgentSessionConfig always uses the default
+    # max_turns=50, with no override in run_app's own signature).
+    script = [AssistantMessage(content=[ToolCallContent(id="1", name="ls", arguments={})])]
+    client = FakeClient(script=script)
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
+        send(stdin_pipe, "go")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "script exhausted" in full_ops_text(term))
+        assert _has_reddish_styling(full_ops_text(term))
+        await wait_until(lambda: "[end] error" in full_ops_text(term))
+
+
+async def test_command_handler_exception_does_not_crash_app_loop(tmp_path, stdin_pipe, monkeypatch):
+    # Gap closure: the retired test_commands.py's
+    # test_command_handler_exception_does_not_crash_run_app pinned that a
+    # handler bug (e.g. /branch hitting a header id, per commands.py's own
+    # comment) can't take down the whole app loop — no prior test against
+    # this engine's _run_command exercised that defensive path.
+    from pipython.tui import app as app_module
+    from pipython.tui.commands import Command
+    from pipython.tui.commands import build_registry as real_build_registry
+
+    async def boom(_ctx, _arg):
+        raise RuntimeError("boom-handler")
+
+    registry = real_build_registry()
+    registry["boom"] = Command("boom", "raises for testing", boom)
+    monkeypatch.setattr(app_module, "build_registry", lambda: registry)
+
+    client = FakeClient(script=[])
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
+        send(stdin_pipe, "/boom")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "boom-handler" in full_ops_text(term))
+
+        # The app loop must still be genuinely alive afterwards -- not just
+        # "the test process didn't crash" -- so drive one more real command
+        # through the same tui/editor/dispatch machinery.
+        send(stdin_pipe, "/help")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "quit" in full_ops_text(term))
