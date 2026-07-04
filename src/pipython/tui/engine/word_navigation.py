@@ -28,9 +28,32 @@ word-navigation.test.ts's CJK case before implementing.
 
 Interface (binding, per task-5 brief): ``word_left(text, pos) -> int``,
 ``word_right(text, pos) -> int`` — pure functions, no state.
+
+Fix (task-11 GREEN phase, editor.py's Character jump / word-movement RED
+suite): fullwidth/CJK punctuation (e.g. "，", "。", "《", "》" — U+FF0C etc.,
+outside the ``_CJK_RANGES`` ideograph/kana/hangul ranges above) used to fall
+through to the default "word" class, same as Latin letters. That is
+harmless when such punctuation sits between two CJK runs (it still forms
+its own single-character run, since neither neighbor is "word"-class
+either) — the case task-1's own upstream-derived regression test covers
+("stops at fullwidth Chinese punctuation", issue #4972, pure-CJK text). But
+it silently *merges* with an adjacent ASCII word run when one exists on
+either side (e.g. "hello你好，world" — walking left from "world" swallowed
+the fullwidth comma into the same run instead of stopping at it), which
+task-11's "handles mixed CJK and ASCII word movement" RED test (a faithful
+translation of upstream's own test of that name) exposed. ``_is_extended_
+punctuation`` below closes that gap by classifying non-ASCII characters in
+general Unicode punctuation categories (Po/Ps/Pe/Pi/Pf/Pd) as "punct" —
+their own boundary-forming run, distinct from both "cjk" and "word" —
+mirroring how ASCII punctuation (``_PUNCTUATION_CHARS``) already behaves.
+Verified against both the pure-CJK and mixed-CJK/ASCII cases; the existing
+CJK-run and Latin-word test cases in ``test_editor_support.py`` are
+unaffected (none of their text contains non-ASCII punctuation).
 """
 
 from __future__ import annotations
+
+import unicodedata
 
 __all__ = ["word_left", "word_right"]
 
@@ -58,6 +81,20 @@ def _is_cjk(ch: str) -> bool:
     return any(lo <= cp <= hi for lo, hi in _CJK_RANGES)
 
 
+def _is_extended_punctuation(ch: str) -> bool:
+    """Non-ASCII punctuation (fullwidth/CJK forms like "，", "。", "《", "》")
+    that should form its own word-movement boundary, same as ASCII
+    punctuation — see module docstring's task-11 fix note. ASCII characters
+    are excluded (already handled by ``_PUNCTUATION_CHARS``); "Pc"
+    (connector punctuation, e.g. "_") is deliberately excluded so
+    underscores keep classifying as "word", matching this port's existing
+    ASCII handling.
+    """
+    if ord(ch) < 128:
+        return False
+    return unicodedata.category(ch) in {"Po", "Ps", "Pe", "Pi", "Pf", "Pd"}
+
+
 def _char_class(ch: str) -> str:
     """Classify one character into a run type: "space", "cjk", "punct", or
     "word" (letters, digits, underscore, and anything else not covered
@@ -66,7 +103,7 @@ def _char_class(ch: str) -> str:
         return "space"
     if _is_cjk(ch):
         return "cjk"
-    if ch in _PUNCTUATION_CHARS:
+    if ch in _PUNCTUATION_CHARS or _is_extended_punctuation(ch):
         return "punct"
     return "word"
 
