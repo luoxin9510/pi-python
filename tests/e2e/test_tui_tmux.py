@@ -44,7 +44,7 @@ def test_full_turn_stream_tool_markdown_tree_exit(pane):
     assert "I saw the files" in pane.capture()
 
 
-def test_ctrl_c_interrupts_back_to_prompt(pane, tmp_path):
+def test_ctrl_c_interrupts_back_to_prompt(tmp_path):
     # 让工具真实卡住：脚本第 1 条调用 bash sleep（重写单用例专用 fixture）
     slow = tmp_path / "slow.json"
     slow.write_text(

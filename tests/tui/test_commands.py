@@ -93,6 +93,29 @@ async def test_tree_shows_structure_and_leaf(tmp_path):
     assert "first question"[:20] in text and "←" in text
 
 
+async def test_tree_dim_off_path_bold_green_on_path(tmp_path):
+    # 分叉出一个节点不在当前路径上，验证 /tree 的样式：路径外 dim，路径上
+    # bold green（issue #4，此前无断言覆盖 src/pipython/tui/commands.py 的
+    # off-path 着色逻辑）。
+    ctx = await make_ctx(tmp_path, script=[done("first reply"), done("second reply")])
+    reg = build_registry()
+    await drain(ctx.app.session, "first question")
+    lines = [json.loads(x) for x in ctx.app.session.store.path.read_text().splitlines()]
+    first_user_id = next(x["id"] for x in lines if x["type"] == "message")
+    await dispatch(reg, ctx, f"/branch {first_user_id[:8]}")
+    await drain(ctx.app.session, "second question")  # 从 first_user_id 分叉出新路径
+    await dispatch(reg, ctx, "/tree")
+
+    def style_of(substr: str) -> str | None:
+        for seg in ctx.console._record_buffer:
+            if substr in seg.text:
+                return str(seg.style)
+        return None
+
+    assert style_of("first reply") == "dim"  # 分叉前的旧回复，已离开当前路径
+    assert style_of("second reply") == "bold green"  # 当前叶子，仍在路径上
+
+
 async def test_tree_shows_model_change_target(tmp_path):
     ctx = await make_ctx(tmp_path)
     reg = build_registry()
