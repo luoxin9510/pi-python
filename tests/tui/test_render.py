@@ -3,6 +3,7 @@ from rich.console import Console
 from pipython import (
     AgentEnd,
     AssistantMessage,
+    ErrorEvent,
     MessageEnd,
     TextContent,
     TextDelta,
@@ -63,6 +64,15 @@ async def test_agent_end_non_done_notice():
     await r.handle(AgentEnd(reason="max_turns"))
     r.finish()
     assert "max_turns" in out(console)
+
+
+async def test_error_event_rendered_in_red():
+    # SDK 把耗尽重试的模型失败转成 ErrorEvent + AgentEnd("error")（agent.py）；
+    # handle() 此前没有 ErrorEvent 分支，坏 API key 等失败会悄无声息、零诊断。
+    console, r = make()
+    await r.handle(ErrorEvent(message="AuthenticationError: invalid API key"))
+    r.finish()
+    assert "AuthenticationError: invalid API key" in out(console)
 
 
 def test_extract_text_joins_blocks():

@@ -18,6 +18,7 @@ from rich.text import Text
 from pipython import (
     AgentEnd,
     AssistantMessage,
+    ErrorEvent,
     MessageEnd,
     TextDelta,
     ToolCallEvent,
@@ -102,6 +103,10 @@ class TurnRenderer:
         elif isinstance(event, ToolResultEvent):
             if event.result.is_error:
                 self.console.print(Text(_clip(event.result.content, _ERR_TRUNC), style="red"))
+        elif isinstance(event, ErrorEvent):
+            # SDK 把耗尽重试的模型失败转成 ErrorEvent + AgentEnd("error")（agent.py）；
+            # 降级（非 Live）路径下同样只是普通 print，无需特殊处理。
+            self.console.print(Text(event.message, style="red"))
         elif isinstance(event, AgentEnd):
             if event.reason != "done":
                 self.console.print(Text(f"[end] {event.reason}", style="yellow"))
