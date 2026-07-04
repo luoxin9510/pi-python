@@ -218,7 +218,7 @@ Container
 | 风险 | 防线 |
 |---|---|
 | 终端兼容矩阵（Terminal.app/iTerm2/kitty/Ghostty 的 kitty 协议差异） | 能力协商+legacy 回退；验收在维护者实际终端过；Terminal.app 的 Shift+Enter 限制已裁决降级（§5） |
-| 宽度/字素分歧（最大暗坑） | §7.3 金标准；宽度分类正则照抄 string-width 同款；字素按 UAX #29 重实现 |
+| 宽度/字素分歧（最大暗坑） | §7.3 金标准；宽度分类正则照抄 string-width 同款（RGI_Emoji 除外，见 §2）；字素按 UAX #29 重实现 |
 | **词边界的 CJK 分词无轻量等价**（Intl.Segmenter word 粒度是 ICU 字典分词） | 裁决：CJK 下词级移动（Alt+F/B 等）按"连续 CJK 段视作一个词"简化，**允许与 pi 行为不同**；西文行为对齐 UAX #29。验收预期照此，写入 README 已知限制 |
 | tui.ts 差分/光标/resize 核心（约 500 行高分支密度，与 editor/keys 同级硬骨头） | 拆分为独立任务（差分算法、overlay 栈、resize/光标修正分开），不与 request_render 归并逻辑合并 |
 | editor/keys 体量（2307+1400 行）；**editor.test.ts 达 4051 行**，测试翻译本身是大活 | editor 拆多任务；测试翻译按行为域分批（编辑/光标/kill-ring/undo/粘贴/补全），每批随对应实现任务走 |
