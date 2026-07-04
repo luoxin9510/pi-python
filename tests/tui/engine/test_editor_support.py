@@ -179,31 +179,48 @@ class TestWordNavigation:
 
         This MUST test the declared deviation: CJK continuous run = ONE word.
         From upstream line 36-42 (but reinterpreted per spec §9).
+
+        text = "hello 世界你好 world"
+                 0123456789...
+        indices: h0 e1 l2 l3 o4 _5 世6 界7 你8 好9 _10 w11 o12 r13 l14 d15 (len 16)
         """
         text = "hello 世界你好 world"
-        # All 4 CJK chars are one continuous run, so should be treated as ONE word
-        # Move from 'w' of world (pos 15) backward: should skip "world " and jump over
-        # the entire CJK run "世界你好" in one jump
-        pos_world_end = len(text)  # After "world"
-        result_back = word_left(text, pos_world_end)
-        # Should jump over "world" and land before the CJK run or at its start
-        # Given spec ruling: CJK continuous run = ONE word, we expect to land
-        # at position of the space after "hello", then further back would skip CJK as one unit
-        assert result_back < pos_world_end, "word_left should move backward from end"
+        # From end of "world" (16), one hop back lands at start of "world" (11) —
+        # ordinary ASCII word run, not touching the CJK run yet.
+        assert word_left(text, 16) == 11
+        # From start of "world" (11), one hop back skips the separating space and
+        # swallows the ENTIRE CJK run "世界你好" in a single jump, landing at 6
+        # (not one character at a time, per the spec §9 deviation from upstream).
+        assert word_left(text, 11) == 6
 
     def test_word_right_cjk_mixed_required(self):
         """[TEST-PORT] CJK forward - spec §9 (single CJK run = one word).
 
         Moving forward from before CJK run should jump over entire run in one bound.
+        See test_word_left_cjk_mixed_required for the text's index map.
         """
         text = "hello 世界你好 world"
-        # From after "hello " (pos 6, start of CJK), word_right should skip the entire
-        # CJK run "世界你好" as ONE word and land at the space after
-        result = word_right(text, 6)
-        # Result should be past all 4 CJK characters
-        assert result > 6, "word_right should move forward from CJK start"
-        # Should be somewhere in the range that's past the CJK run
-        assert result <= len(text)
+        # From start of the CJK run (6), one hop forward swallows the ENTIRE run
+        # "世界你好" in a single jump, landing at 10 (the following space) — not
+        # one character at a time.
+        assert word_right(text, 6) == 10
+        # From start of "world" (11), one hop forward lands at the end (16) —
+        # ordinary ASCII word run.
+        assert word_right(text, 11) == 16
+
+    def test_word_left_colon(self):
+        """[TEST-PORT] colon path from upstream word-navigation.test.ts:19-24."""
+        text = "foo:bar"
+        assert word_left(text, 7) == 4  # bar
+        assert word_left(text, 4) == 3  # :
+        assert word_left(text, 3) == 0  # foo
+
+    def test_word_right_colon(self):
+        """[TEST-PORT] colon forward from upstream word-navigation.test.ts:76-81."""
+        text = "foo:bar"
+        assert word_right(text, 0) == 3  # foo
+        assert word_right(text, 3) == 4  # :
+        assert word_right(text, 4) == 7  # bar
 
     def test_word_left_whitespace_boundaries(self):
         """[TEST-PORT] whitespace at boundaries from upstream line 44-48."""
@@ -263,11 +280,12 @@ class TestFuzzyMatch:
         assert result is None
 
     def test_exact_match_has_good_score(self):
-        """[TEST-PORT] exact match from upstream line 17-21."""
+        """[TEST-PORT] exact match from upstream line 17-21 (fuzzy.test.ts:20)."""
         result = fuzzy_match("test", "test")
         assert result is not None
-        # Exact match should have a good score (lower/negative due to bonuses)
-        # Per upstream logic: exact match gets -100 bonus
+        # Per upstream: score should be negative due to consecutive/boundary/
+        # exact-match bonuses (exact match alone gets a -100 bonus).
+        assert result < 0
 
     def test_characters_must_appear_in_order(self):
         """[TEST-PORT] order from upstream line 23-29."""
@@ -284,22 +302,22 @@ class TestFuzzyMatch:
         assert result2 is not None
 
     def test_consecutive_better_than_scattered(self):
-        """[TEST-PORT] scoring from upstream line 39-46."""
+        """[TEST-PORT] scoring from upstream line 39-46 (fuzzy.test.ts:45)."""
         consecutive = fuzzy_match("foo", "foobar")
         scattered = fuzzy_match("foo", "f_o_o_bar")
         assert consecutive is not None
         assert scattered is not None
-        # Consecutive should score better (lower score)
-        assert consecutive <= scattered
+        # Consecutive should score strictly better (lower score) than scattered.
+        assert consecutive < scattered
 
     def test_word_boundary_scores_better(self):
-        """[TEST-PORT] word boundary bonus from upstream line 48-55."""
+        """[TEST-PORT] word boundary bonus from upstream line 48-55 (fuzzy.test.ts:54)."""
         at_boundary = fuzzy_match("fb", "foo-bar")
         not_at_boundary = fuzzy_match("fb", "afbx")
         assert at_boundary is not None
         assert not_at_boundary is not None
-        # At boundary should score better (lower)
-        assert at_boundary <= not_at_boundary
+        # At boundary should score strictly better (lower) than not at boundary.
+        assert at_boundary < not_at_boundary
 
     def test_swapped_alphanumeric_tokens(self):
         """[TEST-PORT] alpha-numeric swap from upstream line 57-61."""
@@ -504,16 +522,22 @@ class TestUndoStack:
         assert state is not None
         assert state["text"] == "hello"  # Not "modified"
 
-    def test_undo_redo_cycle(self):
-        """[TEST] Undo stores states for cycling."""
+    def test_undo_multi_push_progresses_to_exhaustion(self):
+        """[TEST] Multi-push undo sequence progresses A<-B<-C in LIFO order,
+        then returns None once exhausted (undo-stack.ts:16-18 ``pop()`` —
+        there is no redo upstream, see undo_stack.py module docstring)."""
         stack = UndoStack()
-        stack.push(("state1", 0))
-        stack.push(("state2", 5))
-        stack.push(("state3", 10))
-        # Pop in LIFO order
+        stack.push(("state1", 0))  # A
+        stack.push(("state2", 5))  # B
+        stack.push(("state3", 10))  # C
+        # Pop in LIFO order: C, then B, then A.
         assert stack.undo() == ("state3", 10)
         assert stack.undo() == ("state2", 5)
         assert stack.undo() == ("state1", 0)
+        # Stack is now exhausted; further undo() calls stay at None (no redo
+        # to progress "back" into — this is a plain stack, not a cycle).
+        assert stack.undo() is None
+        assert stack.undo() is None
 
     def test_empty_stack_undo_returns_none(self):
         """[TEST] undo on empty stack returns None."""
