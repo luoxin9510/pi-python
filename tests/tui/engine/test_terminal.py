@@ -24,6 +24,7 @@ Tests cover:
 Upstream reference: ~/Developer/nukcole-pi/packages/tui/src/terminal.ts
 """
 
+import os
 import signal
 import termios
 from contextlib import contextmanager
@@ -279,9 +280,16 @@ class TestNegotiationBranches:
     every other byte via ``drain_pending()``."""
 
     def test_clean_kitty_reply_enables_kitty(self):
+        """Important 1 (fix round 2): ``KITTY_QUERY_SEQUENCE`` always ends
+        with the DA query (``\\x1b[c``), so on every Kitty-capable terminal
+        the trailing DA reply arrives too — here in the *same* chunk as the
+        Kitty-flags reply. Both replies must be excised; none may leak into
+        ``drain_pending()``. Fails against the pre-fix
+        ``_read_negotiation_reply`` (which returns as soon as the Kitty-flags
+        reply is found, leaving ``\x1b[?1;2c`` as pending input)."""
         with raw_env() as env:
             env.select.side_effect = [([0], [], [])]
-            env.read.side_effect = [b"\x1b[?7u"]
+            env.read.side_effect = [b"\x1b[?7u\x1b[?1;2c"]
 
             term = RealTerminal()
             term.start()
@@ -290,6 +298,49 @@ class TestNegotiationBranches:
             assert term.drain_pending() == b""
             written = [c.args[0] for c in env.stdout.write.call_args_list]
             assert MODIFY_OTHER_KEYS_ENABLE not in written
+
+    def test_kitty_flags_then_da_in_second_read_both_excised(self):
+        """Important 1 (fix round 2): the Kitty-flags reply and the trailing
+        DA reply arrive in two *separate* ``os.read`` chunks (simulating them
+        landing in different pty reads). The probe must keep reading past
+        the first (Kitty-flags) match and perform a second ``os.read`` to
+        find and excise the DA reply too. ``env.read.call_count == 2`` is the
+        genuine RED discriminator here: pre-fix code returns immediately
+        after the first read/match and never attempts a second read."""
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], []), ([0], [], [])]
+            env.read.side_effect = [b"\x1b[?7u", b"\x1b[?c"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is True
+            assert term.drain_pending() == b""
+            assert env.read.call_count == 2
+
+    def test_kitty_flags_da_never_arrives_before_deadline_residual(self):
+        """Documents the one residual case module docstring deviation 6's
+        "Fix round 2" note describes: a Kitty-flags reply is seen, but the
+        DA reply that should terminate the probe never arrives before the
+        200ms deadline. ``kitty_enabled`` still latches ``True`` off the
+        Kitty-flags reply alone, and everything accumulated so far (here,
+        unrelated typed-ahead bytes ``b"ZZ"`` sharing the chunk with the
+        Kitty reply) is preserved via ``drain_pending()`` rather than
+        discarded. ``env.select.call_count == 2`` is the genuine RED
+        discriminator: pre-fix code returns immediately after the first
+        match and never calls ``select`` a second time, so this assertion
+        fails pre-fix even though ``kitty_enabled``/``drain_pending()`` alone
+        happen to coincide with old behavior for this particular input."""
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], []), ([], [], [])]
+            env.read.side_effect = [b"\x1b[?7uZZ"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is True
+            assert term.drain_pending() == b"ZZ"
+            assert env.select.call_count == 2
 
     def test_timeout_disables_kitty_and_writes_modify_other_keys_fallback(self):
         """No reply at all within the probe window (default ``raw_env()``'s
@@ -320,10 +371,13 @@ class TestNegotiationBranches:
         """A single stdin chunk containing typed-ahead keystrokes *and* the
         negotiation reply must both detect the reply and preserve the typed
         bytes (Critical 2) — not discard everything because the whole
-        buffer doesn't equal the reply."""
+        buffer doesn't equal the reply. A DA reply is appended after the
+        Kitty reply (fix round 2, Important 1: every Kitty-capable terminal
+        also answers the probe's trailing DA query) to prove it does NOT
+        get counted as leftover pending input."""
         with raw_env() as env:
             env.select.side_effect = [([0], [], [])]
-            env.read.side_effect = [b"abc\x1b[?31u"]
+            env.read.side_effect = [b"abc\x1b[?31u\x1b[?c"]
 
             term = RealTerminal()
             term.start()
@@ -332,9 +386,12 @@ class TestNegotiationBranches:
             assert term.drain_pending() == b"abc"
 
     def test_reply_mid_buffer_bytes_before_and_after_preserved(self):
+        """DA appended at the very end, after the "XY" typeahead (fix round
+        2, Important 1), to prove the universal DA terminator is excised
+        rather than folded into the preserved typeahead."""
         with raw_env() as env:
             env.select.side_effect = [([0], [], [])]
-            env.read.side_effect = [b"ab\x1b[?7uXY"]
+            env.read.side_effect = [b"ab\x1b[?7uXY\x1b[?c"]
 
             term = RealTerminal()
             term.start()
@@ -355,15 +412,20 @@ class TestNegotiationBranches:
             assert term.drain_pending() == b""
 
     def test_kitty_flags_zero_triggers_modify_other_keys_fallback(self):
+        """DA appended after the negative (``flags == 0``) Kitty-flags reply
+        (fix round 2, Important 1) proves the "only DA seen after a
+        *negative* Kitty reply" path also fully excises both replies —
+        ``drain_pending()`` must be empty, not left holding the DA reply."""
         with raw_env() as env:
             env.select.side_effect = [([0], [], [])]
-            env.read.side_effect = [b"\x1b[?0u"]
+            env.read.side_effect = [b"\x1b[?0u\x1b[?c"]
 
             term = RealTerminal()
             term.start()
 
             assert term.kitty_enabled is False
             env.stdout.write.assert_any_call(MODIFY_OTHER_KEYS_ENABLE)
+            assert term.drain_pending() == b""
 
     def test_timeout_across_multiple_reads_preserves_all_bytes(self):
         with raw_env() as env:
@@ -599,13 +661,19 @@ class TestTerminalIOIntegration:
 
     def test_columns_default_fallback(self):
         """RealTerminal.columns falls back to exactly 80 if stdout.columns is
-        None (Minor: pinned from the RED suite's hedged
-        ``in (80, None)``). pytest's default fd-level output capture makes
-        the real ``sys.__stdout__`` a non-tty during the test run, so
-        ``shutil.get_terminal_size``'s real ioctl probe reliably falls
-        through to its ``(80, 24)`` fallback rather than reading an actual
-        terminal's size."""
-        with raw_env() as env:
+        None (Minor: pinned from the RED suite's hedged ``in (80, None)``).
+
+        Minor 3 (fix round 2): patches ``shutil.get_terminal_size`` directly
+        rather than relying on pytest's default fd-level output capture
+        making the real ``sys.__stdout__`` a non-tty — that assumption broke
+        under ``pytest -s`` (capture disabled), where a real tty stdout would
+        make the real ioctl probe return the actual terminal size instead of
+        the fallback. This version is deterministic regardless of capture
+        mode."""
+        with (
+            raw_env() as env,
+            patch("shutil.get_terminal_size", return_value=os.terminal_size((80, 24))),
+        ):
             env.stdout.columns = None
 
             term = RealTerminal()
@@ -614,8 +682,15 @@ class TestTerminalIOIntegration:
             assert term.columns == 80
 
     def test_rows_default_fallback(self):
-        """RealTerminal.rows falls back to exactly 24 if stdout.rows is None."""
-        with raw_env() as env:
+        """RealTerminal.rows falls back to exactly 24 if stdout.rows is None.
+
+        Minor 3 (fix round 2): same ``shutil.get_terminal_size`` patch as
+        ``test_columns_default_fallback``, making this independent of
+        pytest's capture mode / robust under ``pytest -s``."""
+        with (
+            raw_env() as env,
+            patch("shutil.get_terminal_size", return_value=os.terminal_size((80, 24))),
+        ):
             env.stdout.rows = None
 
             term = RealTerminal()

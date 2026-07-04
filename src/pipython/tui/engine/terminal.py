@@ -57,6 +57,21 @@ Declared deviations from upstream:
    negotiated at all, ``_negotiate_kitty_protocol`` treats every
    non-``kitty-flags`` outcome — including ``None`` — as "apply the
    fallback".
+
+   **Fix round 2 disclosure:** the 200ms budget above is a genuine race
+   against network/pty latency, not just a "give up" backstop — if a
+   negotiation reply (Kitty-flags or DA) arrives after the deadline (RTT >
+   200ms: a slow pty, a loaded remote SSH hop, etc.), it will **not** be
+   recognized as a negotiation reply at all; it surfaces downstream as
+   ordinary — and unparseable — input bytes once Task 16/17 wires
+   ``drain_pending()``'s output (or subsequent live stdin) into the input
+   pipeline. Upstream never has this failure mode: its negotiation filter is
+   a resident ``stdinBuffer`` listener with no deadline, so a late reply is
+   still recognized and swallowed whenever it eventually arrives
+   (terminal.ts:181-330). This port's synchronous, bounded probe has no such
+   persistent filter after it returns — Task 16/17 should be aware a
+   slow-answering terminal can leak escape-sequence garbage into the very
+   first real keystrokes it processes.
 2. **No self-``SIGWINCH`` refresh-kick** (terminal.ts:154-156). Upstream
    re-sends itself ``SIGWINCH`` right after enabling raw mode because Node
    caches nothing dimension-wise but still wants one guaranteed resize
@@ -108,6 +123,20 @@ Declared deviations from upstream:
    over and would otherwise be silently lost (typed-ahead keystrokes eaten,
    or worse, a reply-plus-typeahead chunk producing a false-negative Kitty
    detection because the reply pattern wasn't anchored to the whole buffer).
+
+   **Fix round 2 addition:** the initial cut of this probe returned as soon
+   as *any* negotiation reply was found — including a bare Kitty-flags
+   reply — leaving the trailing DA reply (guaranteed by
+   ``KITTY_QUERY_SEQUENCE``'s own ``\x1b[c`` suffix) unconsumed on every
+   Kitty-capable terminal, to be read later as ordinary input bytes.
+   ``_read_negotiation_reply`` now treats the DA reply as the probe's
+   universal terminator (matching upstream, terminal.ts:246-249): a
+   Kitty-flags reply is recorded but does not end the read; the read keeps
+   going, within the same 200ms budget, until DA is also found and excised.
+   Residual case: if DA never arrives before the deadline, ``kitty_enabled``
+   still latches ``True`` off the Kitty-flags reply alone, and everything
+   accumulated so far is preserved via ``drain_pending()`` rather than
+   silently discarded.
 """
 
 from __future__ import annotations
@@ -460,11 +489,26 @@ class RealTerminal(TerminalIO):
         self._enable_modify_other_keys()
 
     def _read_negotiation_reply(self, timeout_s: float) -> tuple[str, int] | None:
-        """Synchronously read stdin until a Kitty/DA negotiation reply is
-        found or ``timeout_s`` elapses, *without dropping any other byte*
-        seen along the way (typed-ahead keystrokes, or a reply-plus-typeahead
-        chunk) — ported from upstream's non-lossy forwarding semantics
+        """Synchronously read stdin until the probe is *terminated* or
+        ``timeout_s`` elapses, *without dropping any other byte* seen along
+        the way (typed-ahead keystrokes, or a reply-plus-typeahead chunk) —
+        ported from upstream's non-lossy forwarding semantics
         (terminal.ts:181-318), see module docstring deviation 6.
+
+        Since ``KITTY_QUERY_SEQUENCE`` always ends with the primary Device
+        Attributes query (``\\x1b[c``), *every* terminal — Kitty-capable or
+        not — answers with a DA reply. Upstream treats that DA reply as the
+        probe's universal terminator: both a Kitty-flags reply *and* the DA
+        reply that follows it get consumed before upstream stops watching
+        for negotiation sequences (terminal.ts:246-249). This port mirrors
+        that: finding a Kitty-flags reply does **not** return immediately —
+        it is recorded, and the read keeps going (within the same
+        ``timeout_s`` budget) until the DA reply is also found and excised.
+        Only a DA reply — whether or not a Kitty-flags reply preceded it —
+        actually ends the probe. See module docstring deviation 6's "Fix
+        round 2" note for the one residual case this can't close: a
+        Kitty-flags reply followed by a DA reply that never arrives before
+        the deadline.
 
         Every exit path funnels leftover/non-reply bytes into
         ``self._pending_input`` (drained via ``drain_pending()``) instead of
@@ -481,37 +525,50 @@ class RealTerminal(TerminalIO):
 
         deadline = time.monotonic() + timeout_s
         buffer = b""
+        # Set once a Kitty-flags reply is found; the read keeps going past
+        # that point (same deadline) looking for the trailing DA reply that
+        # terminates the probe — see the docstring above.
+        kitty_result: tuple[str, int] | None = None
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._pending_input += buffer
-                return None
+                return kitty_result
             try:
                 ready, _, _ = select.select([fd], [], [], remaining)
             except (OSError, ValueError, TypeError):
                 self._pending_input += buffer
-                return None
+                return kitty_result
             if not ready:
                 self._pending_input += buffer
-                return None
+                return kitty_result
             try:
                 chunk = os.read(fd, 64)
             except OSError:
                 self._pending_input += buffer
-                return None
+                return kitty_result
             if not chunk:
                 self._pending_input += buffer
-                return None
+                return kitty_result
             buffer += chunk
 
-            found = _find_negotiation_reply(buffer)
-            if found is not None:
-                negotiation, leftover = found
-                self._pending_input += leftover
-                return negotiation
+            while True:
+                found = _find_negotiation_reply(buffer)
+                if found is None:
+                    break
+                negotiation, buffer = found
+                if negotiation[0] == "device-attributes":
+                    self._pending_input += buffer
+                    return kitty_result if kitty_result is not None else negotiation
+                # Kitty-flags reply: record (first one wins) and keep
+                # searching the same buffer — a same-chunk DA reply must
+                # still be excised before this method returns.
+                if kitty_result is None:
+                    kitty_result = negotiation
+
             if len(buffer) > _KITTY_PROBE_MAX_BUFFER:
                 self._pending_input += buffer
-                return None
+                return kitty_result
 
     def drain_pending(self) -> bytes:
         """Return and clear bytes collected during Kitty negotiation that
