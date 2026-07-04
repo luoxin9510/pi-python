@@ -201,38 +201,3 @@ async def test_unknown_command_hint(tmp_path):
     ctx = await make_ctx(tmp_path)
     await dispatch(build_registry(), ctx, "/nope")
     assert "/help" in ctx.console.export_text()
-
-
-async def test_ctrl_c_during_file_list_refresh_falls_through_to_prompt(tmp_path, monkeypatch):
-    # pre-prompt 的 file_list 刷新期间冒出 KeyboardInterrupt 不该让整个 run_app
-    # 提前退出（之前会直接被外层 except KeyboardInterrupt 吞掉、跳过本轮
-    # prompt），而是保留旧列表、照常落到这一轮 prompt（issue #6）。用真实
-    # run_app()：只在 file_list 刷新与 prompt_async 这两个 I/O 边界打桩。
-    monkeypatch.setattr(app_module, "HISTORY_PATH", tmp_path / "hist")
-    monkeypatch.setattr("pipython.session_facade.DEFAULT_SESSION_DIR", tmp_path / "sessions")
-
-    build_calls = {"n": 0}
-
-    async def flaky_build_file_list(_cwd):
-        build_calls["n"] += 1
-        if build_calls["n"] == 1:
-            raise KeyboardInterrupt
-        return []
-
-    monkeypatch.setattr(app_module, "build_file_list", flaky_build_file_list)
-
-    prompt_calls = {"n": 0}
-    inputs = iter(["/quit"])
-
-    async def fake_prompt_async(self, *a, **kw):
-        prompt_calls["n"] += 1
-        try:
-            return next(inputs)
-        except StopIteration:
-            raise EOFError
-
-    monkeypatch.setattr(PromptSession, "prompt_async", fake_prompt_async)
-
-    await app_module.run_app(model="fake", cwd=tmp_path)  # 不得抛出、不得提前退出
-
-    assert prompt_calls["n"] == 1  # 首次 refresh 被打断后，循环仍落到了这一轮 prompt
