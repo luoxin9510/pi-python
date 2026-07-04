@@ -70,11 +70,45 @@ class TmuxPane:
             f"pattern {pattern!r} not seen within {timeout}s; last screen:\n{last}"
         )
 
+    def wait_dead(self, timeout: float = 10.0) -> str:
+        # exit 断言不能只信 "session: " 这行文字——挂起在横幅后的进程也会打印过
+        # 这行再卡死。remain-on-exit 让 tmux 在被驱动进程退出后于 pane 内追加一行
+        # "Pane is dead ..."；poll 到这行才代表进程真正 exit，而不是恰好卡在同一屏。
+        deadline = time.monotonic() + timeout
+        last = ""
+        while time.monotonic() < deadline:
+            last = self.capture()
+            if "Pane is dead" in last:
+                return last
+            time.sleep(0.2)
+        raise AssertionError(f"pane not dead within {timeout}s; last screen:\n{last}")
+
     def alive(self) -> bool:
         return (
             subprocess.run(["tmux", "has-session", "-t", self.name], capture_output=True).returncode
             == 0
         )
 
+    def _graceful_stop(self, timeout: float = 3.0) -> None:
+        # tmux kill-session 只 SIGHUP pane 里的顶层进程；app 的 bash 工具用
+        # start_new_session=True 起了独立进程组，SIGHUP 到不了那个组，测试失败在
+        # 中断场景里会留下孤儿 `sleep 30`。先发 C-c：这条到达 app 本身，触发
+        # CancelledError，app 自己的 killpg 清理它派生的子进程；poll 到 pane 死亡
+        # 或 session 消失即成功，再由调用方兜底 kill-session。
+        subprocess.run(["tmux", "send-keys", "-t", self.name, "C-c"], capture_output=True)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.alive() or "Pane is dead" in self.capture():
+                return
+            time.sleep(0.2)
+
     def kill(self) -> None:
-        subprocess.run(["tmux", "kill-session", "-t", self.name], capture_output=True)
+        # 优雅路径是尽力而为：无论它成功、超时还是抛异常，都不能掩盖测试本身的
+        # 失败，也必须继续兜底执行 kill-session（否则失败路径上 session 和其
+        # 子进程组都可能残留）。
+        try:
+            self._graceful_stop()
+        except Exception:
+            pass
+        finally:
+            subprocess.run(["tmux", "kill-session", "-t", self.name], capture_output=True)

@@ -39,6 +39,7 @@ def test_full_turn_stream_tool_markdown_tree_exit(pane):
     pane.wait_for(r"do something")  # user 消息摘要在树里
     pane.send_ctrl_d()
     pane.wait_for(r"session: ")  # 统一出口打印路径
+    pane.wait_dead()  # 进程真正退出，不是卡在打印这行之后
     # 滚动区留痕：退出后 capture 仍包含对话内容
     assert "I saw the files" in pane.capture()
 
@@ -65,5 +66,6 @@ def test_ctrl_c_interrupts_back_to_prompt(pane, tmp_path):
         p2.wait_for(r"\[interrupted\]")
         p2.send("/quit")
         p2.wait_for(r"session: ")
+        p2.wait_dead()  # 进程真正退出，不是卡在打印这行之后
     finally:
         p2.kill()
