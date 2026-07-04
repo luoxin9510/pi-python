@@ -105,12 +105,16 @@ async def _tree(ctx: CommandContext, _: str) -> None:
 async def _branch(ctx: CommandContext, arg: str) -> None:
     prefix = arg.strip()
     store = ctx.app.session.store
-    ids = (entry_id(e) for e in store.entries)
+    # 排除 header：header.id 也是合法字符串，前缀能唯一命中它，但它不在
+    # current_path 的候选集里——branch 到它会让 leaf_id 指向一个 current_path
+    # 会剔除的条目，后续 /tree 与每次 prompt 都 ValueError 崩溃（复审发现）。
+    ids = (entry_id(e) for e in store.entries if not isinstance(e, SessionHeader))
     matches = [eid for eid in ids if eid and eid.startswith(prefix)] if prefix else []
     if len(matches) == 1:
         match = matches[0]
         ctx.app.session.branch(match)
-        ctx.console.print(f"branched to {match[:8]}")
+        # Text：match 是任意 id 前缀拼接，走模块的 Text-only 规则（复审裁定）
+        ctx.console.print(Text(f"branched to {match[:8]}"))
     elif not matches:
         ctx.console.print("[red]no match[/red]")
     else:

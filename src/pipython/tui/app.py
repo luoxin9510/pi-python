@@ -76,7 +76,13 @@ async def run_app(*, model: str, cwd: Path) -> None:
                 continue
             if text.startswith("/"):
                 ctx = CommandContext(console=console, app=app)
-                await dispatch(registry, ctx, text)
+                try:
+                    await dispatch(registry, ctx, text)
+                except Exception as exc:
+                    # handler bug 不得掀翻主循环（复审发现：/branch 命中 header id 会崩）
+                    msg = f"[command error] {type(exc).__name__}: {exc}"
+                    console.print(Text(msg, style="red"))
+                    continue
                 if app.should_quit:
                     break
                 continue
