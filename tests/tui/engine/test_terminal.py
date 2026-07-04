@@ -3,9 +3,21 @@ Tests for pipython.tui.engine.terminal module.
 
 Tests cover:
 - Kitty keyboard protocol reply parsing (parse_kitty_reply)
-- Raw mode termios entry/exit sequences and idempotency
+- Raw mode termios entry/exit sequences and idempotency — exercised through
+  the *real* termios/tty/select/os.read boundary via ``raw_env()`` below,
+  not a blanket ``sys.stdin`` mock (fix round 1, Critical 1: the previous
+  version of this file mocked ``sys.stdin`` wholesale, so
+  ``sys.stdin.fileno()`` returned a ``MagicMock``, tripping every
+  ``isinstance(fd, int)`` guard in ``terminal.py`` and short-circuiting
+  before termios/tty/select/os.read ever ran).
+- Kitty/DA negotiation branches (clean reply, timeout, garbage, DA fallback,
+  flags=0 fallback) with non-lossy typeahead preservation via
+  ``drain_pending()`` (fix round 1, Critical 2).
 - RealTerminal TerminalIO protocol implementation
-- SIGWINCH handler registration for resize
+- SIGWINCH handler registration for resize, with zero-arg callback arity
+  (fix round 1, Important 3)
+- atexit registration unconditional on raw-mode success (fix round 1,
+  Important 4), and restartability after stop() (fix round 1, Minor)
 - Exception-safe cleanup guarantees
 - ANSI control sequences for cursor/display control
 
@@ -13,7 +25,10 @@ Upstream reference: ~/Developer/nukcole-pi/packages/tui/src/terminal.ts
 """
 
 import signal
-from unittest.mock import Mock, patch
+import termios
+from contextlib import contextmanager
+from dataclasses import dataclass
+from unittest.mock import MagicMock, Mock, patch
 
 from pipython.tui.engine.terminal import (
     RealTerminal,
@@ -28,6 +43,90 @@ from pipython.tui.engine.terminal import (
     SHOW_CURSOR,
     CLEAR_LINE,
 )
+
+
+# =============================================================================
+# Real-boundary test harness (Critical 1)
+# =============================================================================
+
+
+class _StubStdin:
+    """A real-int-fd stand-in for ``sys.stdin`` — deliberately *not* a
+    ``MagicMock``. A ``MagicMock``'s ``fileno()`` would itself return a
+    ``MagicMock``, which fails ``isinstance(fd, int)`` in ``terminal.py`` and
+    short-circuits raw-mode entry / Kitty negotiation before termios/tty/
+    select/os.read ever execute — the exact mistake this file was rewritten
+    to stop making. Real termios/select/os.read calls are still prevented,
+    just by mocking *those* functions directly instead of hiding the fd
+    behind a mock object.
+    """
+
+    def fileno(self) -> int:
+        return 0
+
+
+@dataclass
+class RawEnv:
+    """Handle to every mock installed by ``raw_env()``."""
+
+    stdout: MagicMock
+    signal: MagicMock
+    tcgetattr: MagicMock
+    tcsetattr: MagicMock
+    setraw: MagicMock
+    select: MagicMock
+    read: MagicMock
+    atexit_register: MagicMock
+    atexit_unregister: MagicMock
+
+
+@contextmanager
+def raw_env(saved_termios=("saved-termios-attrs",)):
+    """Patch the real termios/tty/select/os/signal/atexit boundary that
+    ``RealTerminal`` calls into, with ``sys.stdin`` replaced by
+    ``_StubStdin`` (real int fd, not a MagicMock) so ``start()``/``stop()``
+    exercise their actual raw-mode-entry and Kitty-negotiation code paths
+    end to end.
+
+    Defaults:
+
+    - ``termios.tcgetattr`` returns ``list(saved_termios)`` (a sentinel
+      "saved attrs" value that must round-trip unchanged to ``tcsetattr`` on
+      stop).
+    - ``select.select`` returns ``([], [], [])`` — "not ready" — so the
+      Kitty probe times out immediately with zero bytes read. Tests that
+      don't care about negotiation reach a deterministic
+      ``kitty_enabled=False`` / modifyOtherKeys-fallback-written end state
+      without any real waiting. Override ``env.select.side_effect`` /
+      ``env.read.side_effect`` per test to script other negotiation
+      branches.
+    - ``atexit.register``/``atexit.unregister`` are mocked so no test ever
+      registers a real process-exit callback pointing at a torn-down mock
+      environment.
+    """
+    with (
+        patch("sys.stdin", new=_StubStdin()),
+        patch("sys.stdout") as mock_stdout,
+        patch("signal.signal") as mock_signal,
+        patch("termios.tcgetattr", return_value=list(saved_termios)) as mock_tcgetattr,
+        patch("termios.tcsetattr") as mock_tcsetattr,
+        patch("tty.setraw") as mock_setraw,
+        patch("select.select", return_value=([], [], [])) as mock_select,
+        patch("os.read", return_value=b"") as mock_read,
+        patch("atexit.register") as mock_atexit_register,
+        patch("atexit.unregister") as mock_atexit_unregister,
+    ):
+        yield RawEnv(
+            stdout=mock_stdout,
+            signal=mock_signal,
+            tcgetattr=mock_tcgetattr,
+            tcsetattr=mock_tcsetattr,
+            setraw=mock_setraw,
+            select=mock_select,
+            read=mock_read,
+            atexit_register=mock_atexit_register,
+            atexit_unregister=mock_atexit_unregister,
+        )
 
 
 class TestParseKittyReply:
@@ -78,66 +177,240 @@ class TestParseKittyReply:
 
 
 class TestRawModeSequence:
-    """Test raw mode entry/exit termios call sequences."""
+    """Raw mode entry/exit termios call sequences — exercised for real via
+    ``raw_env()`` (Critical 1: the previous blanket ``sys.stdin`` mock never
+    let these calls execute at all)."""
 
-    def test_start_enters_raw_mode(self):
-        """RealTerminal.start() performs:
-        1. Save stdin isRaw state (terminal.ts line 139)
-        2. Call setRawMode(true) (terminal.ts line 141)
-        3. Set encoding utf8 and resume stdin (terminal.ts 143-144)
-        4. Enable bracketed paste: \\x1b[?2004h (terminal.ts line 147)
-        5. Register resize handler (terminal.ts line 150)
-        6. Query Kitty protocol (terminal.ts line 225)
-        """
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    term = RealTerminal()
-                    term.start()
+    def test_start_enters_raw_mode_and_calls_termios_in_order(self):
+        """start() must: fetch stdin's fd, ``tcgetattr(fd)`` to save state,
+        ``tty.setraw(fd)`` to engage raw mode — then write bracketed paste
+        enable and the Kitty query (terminal.ts:139-147, 225)."""
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
 
-                    # Verify bracketed paste enable written
-                    mock_stdout.write.assert_any_call(BRACKETED_PASTE_ENABLE)
-                    # Verify Kitty query written
-                    mock_stdout.write.assert_any_call(KITTY_QUERY_SEQUENCE)
+            env.tcgetattr.assert_called_once_with(0)
+            env.setraw.assert_called_once_with(0)
+            assert term._raw_fd == 0
 
-    def test_stop_disables_raw_mode(self):
-        """RealTerminal.stop() performs:
-        1. Write disable bracketed paste: \\x1b[?2004l (terminal.ts line 412)
-        2. Disable Kitty protocol: \\x1b[<u (terminal.ts line 419)
-        3. Restore raw mode state (terminal.ts line 450)
-        4. Remove event handlers (terminal.ts 433-441)
-        """
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    term = RealTerminal()
-                    term.start()
-                    term.stop()
+            env.stdout.write.assert_any_call(BRACKETED_PASTE_ENABLE)
+            env.stdout.write.assert_any_call(KITTY_QUERY_SEQUENCE)
 
-                    # Verify bracketed paste disable written
-                    mock_stdout.write.assert_any_call(BRACKETED_PASTE_DISABLE)
-                    # Verify Kitty protocol disable written
-                    mock_stdout.write.assert_any_call(KITTY_PROTOCOL_DISABLE)
+    def test_stop_restores_termios_with_saved_attrs(self):
+        """stop() must call ``tcsetattr(fd, TCSADRAIN, <the attrs tcgetattr
+        returned>)`` — the actual restore call this suite previously never
+        reached (terminal.ts:449-451)."""
+        with raw_env(saved_termios=("SAVED",)) as env:
+            term = RealTerminal()
+            term.start()
+            term.stop()
+
+            env.tcsetattr.assert_called_once_with(0, termios.TCSADRAIN, ["SAVED"])
+
+            env.stdout.write.assert_any_call(BRACKETED_PASTE_DISABLE)
+            env.stdout.write.assert_any_call(KITTY_PROTOCOL_DISABLE)
 
     def test_stop_is_idempotent(self):
-        """Calling stop() twice should not double-restore or raise.
+        """Calling stop() twice should not double-restore or raise."""
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
 
-        Second call should be safe (no double termios restore, no exception).
-        """
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    term = RealTerminal()
-                    term.start()
+            term.stop()
+            first_write_count = env.stdout.write.call_count
+            first_tcsetattr_count = env.tcsetattr.call_count
 
-                    # First stop
-                    term.stop()
-                    first_call_count = mock_stdout.write.call_count
+            term.stop()
 
-                    # Second stop should not duplicate writes or crash
-                    term.stop()
-                    # Call count should not increase (or only for invariant writes)
-                    assert mock_stdout.write.call_count == first_call_count
+            assert env.stdout.write.call_count == first_write_count
+            assert env.tcsetattr.call_count == first_tcsetattr_count
+
+    def test_restart_after_stop_reenters_raw_mode(self):
+        """Minor: stop() resets ``_started`` so ``start()`` after ``stop()``
+        works again — upstream's terminal is likewise restartable."""
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
+            term.stop()
+
+            assert term._started is False
+
+            term.start()
+
+            assert env.tcgetattr.call_count == 2
+            assert env.setraw.call_count == 2
+            enable_writes = [
+                c for c in env.stdout.write.call_args_list if c.args == (BRACKETED_PASTE_ENABLE,)
+            ]
+            assert len(enable_writes) == 2
+
+
+class TestAtexitGating:
+    """Important 4: ``atexit.register(self.stop)`` must be armed
+    unconditionally right after the first state-mutating write in
+    ``start()``, not gated on raw-mode entry having succeeded."""
+
+    def test_atexit_registered_even_when_raw_mode_fails(self):
+        with raw_env() as env:
+            env.tcgetattr.side_effect = termios.error("Inappropriate ioctl for device")
+
+            term = RealTerminal()
+            term.start()
+
+            assert term._raw_fd is None  # raw mode genuinely failed
+            env.atexit_register.assert_called_once_with(term.stop)
+            # Bracketed paste is still written even though raw mode failed.
+            env.stdout.write.assert_any_call(BRACKETED_PASTE_ENABLE)
+
+    def test_atexit_unregistered_on_stop(self):
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
+            term.stop()
+
+            env.atexit_unregister.assert_called_once_with(term.stop)
+
+
+class TestNegotiationBranches:
+    """Critical 1 + Critical 2: script ``select.select``/``os.read`` to drive
+    every Kitty/DA negotiation branch through the real termios/select/
+    os.read boundary, and verify the probe never drops a byte — it searches
+    for the reply pattern anywhere in the accumulating buffer and preserves
+    every other byte via ``drain_pending()``."""
+
+    def test_clean_kitty_reply_enables_kitty(self):
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], [])]
+            env.read.side_effect = [b"\x1b[?7u"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is True
+            assert term.drain_pending() == b""
+            written = [c.args[0] for c in env.stdout.write.call_args_list]
+            assert MODIFY_OTHER_KEYS_ENABLE not in written
+
+    def test_timeout_disables_kitty_and_writes_modify_other_keys_fallback(self):
+        """No reply at all within the probe window (default ``raw_env()``'s
+        immediate "not ready" select) leaves ``kitty_enabled`` False and
+        writes the modifyOtherKeys fallback (fix round 1 addition, see
+        terminal.py module docstring deviation 1)."""
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is False
+            env.stdout.write.assert_any_call(MODIFY_OTHER_KEYS_ENABLE)
+            assert term.drain_pending() == b""
+
+    def test_garbage_then_timeout_disables_kitty_and_preserves_bytes(self):
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], []), ([], [], [])]
+            env.read.side_effect = [b"garbage"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is False
+            env.stdout.write.assert_any_call(MODIFY_OTHER_KEYS_ENABLE)
+            assert term.drain_pending() == b"garbage"
+
+    def test_typeahead_and_reply_mixed_in_one_chunk_preserved(self):
+        """A single stdin chunk containing typed-ahead keystrokes *and* the
+        negotiation reply must both detect the reply and preserve the typed
+        bytes (Critical 2) — not discard everything because the whole
+        buffer doesn't equal the reply."""
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], [])]
+            env.read.side_effect = [b"abc\x1b[?31u"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is True
+            assert term.drain_pending() == b"abc"
+
+    def test_reply_mid_buffer_bytes_before_and_after_preserved(self):
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], [])]
+            env.read.side_effect = [b"ab\x1b[?7uXY"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is True
+            assert term.drain_pending() == b"abXY"
+
+    def test_device_attributes_reply_triggers_modify_other_keys_fallback(self):
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], [])]
+            env.read.side_effect = [b"\x1b[?1;2c"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is False
+            env.stdout.write.assert_any_call(MODIFY_OTHER_KEYS_ENABLE)
+            assert term.drain_pending() == b""
+
+    def test_kitty_flags_zero_triggers_modify_other_keys_fallback(self):
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], [])]
+            env.read.side_effect = [b"\x1b[?0u"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is False
+            env.stdout.write.assert_any_call(MODIFY_OTHER_KEYS_ENABLE)
+
+    def test_timeout_across_multiple_reads_preserves_all_bytes(self):
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], []), ([0], [], []), ([], [], [])]
+            env.read.side_effect = [b"ab", b"cd"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is False
+            assert term.drain_pending() == b"abcd"
+
+    def test_os_read_error_preserves_buffered_bytes(self):
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], []), ([0], [], [])]
+            env.read.side_effect = [b"xy", OSError("boom")]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is False
+            env.stdout.write.assert_any_call(MODIFY_OTHER_KEYS_ENABLE)
+            assert term.drain_pending() == b"xy"
+
+    def test_buffer_overflow_preserves_bytes_and_falls_back(self):
+        with raw_env() as env:
+            chunk = b"z" * 40  # two chunks (80 bytes) exceed _KITTY_PROBE_MAX_BUFFER (64)
+            env.select.side_effect = [([0], [], [])] * 2
+            env.read.side_effect = [chunk, chunk]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.kitty_enabled is False
+            env.stdout.write.assert_any_call(MODIFY_OTHER_KEYS_ENABLE)
+            assert term.drain_pending() == chunk + chunk
+
+    def test_drain_pending_clears_after_read(self):
+        with raw_env() as env:
+            env.select.side_effect = [([0], [], []), ([], [], [])]
+            env.read.side_effect = [b"leftover"]
+
+            term = RealTerminal()
+            term.start()
+
+            assert term.drain_pending() == b"leftover"
+            assert term.drain_pending() == b""
 
 
 class TestStopOnException:
@@ -148,24 +421,22 @@ class TestStopOnException:
 
         Upstream: terminal.ts line 406 - stop() is called, cleanup guaranteed.
         """
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    term = RealTerminal()
-                    term.start()
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
 
-                    # Simulate exception during operation
-                    try:
-                        term.write("test")
-                        raise RuntimeError("Simulated error")
-                    except RuntimeError:
-                        pass
+            # Simulate exception during operation
+            try:
+                term.write("test")
+                raise RuntimeError("Simulated error")
+            except RuntimeError:
+                pass
 
-                    # Manually call stop (in real code this is via finally/atexit)
-                    term.stop()
+            # Manually call stop (in real code this is via finally/atexit)
+            term.stop()
 
-                    # Verify restore sequences were written
-                    mock_stdout.write.assert_any_call(BRACKETED_PASTE_DISABLE)
+            # Verify restore sequences were written
+            env.stdout.write.assert_any_call(BRACKETED_PASTE_DISABLE)
 
 
 class TestTerminalIOProtocol:
@@ -173,15 +444,13 @@ class TestTerminalIOProtocol:
 
     def test_write_method_exists(self):
         """RealTerminal.write(data: str) method required by TerminalIO."""
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    term = RealTerminal()
-                    term.start()
+        with raw_env() as env:
+            term = RealTerminal()
+            term.start()
 
-                    term.write("Hello, terminal!")
+            term.write("Hello, terminal!")
 
-                    mock_stdout.write.assert_called_with("Hello, terminal!")
+            env.stdout.write.assert_called_with("Hello, terminal!")
 
     def test_columns_property_exists(self):
         """RealTerminal.columns: int property required by TerminalIO.
@@ -189,15 +458,13 @@ class TestTerminalIOProtocol:
         Upstream: terminal.ts line 465-467
         Returns stdout.columns or COLUMNS env var or default 80
         """
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    mock_stdout.columns = 100
+        with raw_env() as env:
+            env.stdout.columns = 100
 
-                    term = RealTerminal()
-                    term.start()
+            term = RealTerminal()
+            term.start()
 
-                    assert term.columns == 100
+            assert term.columns == 100
 
     def test_rows_property_exists(self):
         """RealTerminal.rows: int property required by TerminalIO.
@@ -205,52 +472,54 @@ class TestTerminalIOProtocol:
         Upstream: terminal.ts line 469-471
         Returns stdout.rows or LINES env var or default 24
         """
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    mock_stdout.rows = 30
+        with raw_env() as env:
+            env.stdout.rows = 30
 
-                    term = RealTerminal()
-                    term.start()
+            term = RealTerminal()
+            term.start()
 
-                    assert term.rows == 30
+            assert term.rows == 30
 
 
 class TestResizeHandler:
-    """Test on_resize(cb) SIGWINCH handler registration."""
+    """Important 3: ``on_resize(cb)`` wraps ``cb`` in a zero-arg,
+    upstream-shaped adapter (``Callable[[], None]``) rather than passing it
+    to ``signal.signal`` unwrapped. The installed *signal handler* still has
+    ``(signum, frame)`` arity (that's what ``signal.signal`` requires) — but
+    invoking it must call ``cb`` with zero arguments."""
 
-    def test_on_resize_registers_sigwinch_handler(self):
-        """RealTerminal.on_resize(cb) registers callback for SIGWINCH.
+    def test_on_resize_registers_sigwinch(self):
+        """RealTerminal.on_resize(cb) registers a handler for SIGWINCH.
 
         Upstream: terminal.ts line 150, process.stdout.on('resize')
         Python: signal.signal(signal.SIGWINCH, handler)
         """
-        with patch("sys.stdin"):
-            with patch("sys.stdout"):
-                with patch("signal.signal") as mock_signal:
-                    term = RealTerminal()
+        with patch("signal.signal") as mock_signal:
+            term = RealTerminal()
+            callback = Mock()
+            term.on_resize(callback)
 
-                    callback = Mock()
-                    term.on_resize(callback)
+            assert mock_signal.call_count == 1
+            registered_signum, installed_handler = mock_signal.call_args.args
+            assert registered_signum == signal.SIGWINCH
+            assert callable(installed_handler)
 
-                    # Verify SIGWINCH handler registered
-                    mock_signal.assert_any_call(signal.SIGWINCH, callback)
+    def test_installed_handler_invokes_callback_with_zero_args(self):
+        """Wiring test, not identity: invoke the handler actually passed to
+        ``signal.signal`` with real signal-handler arity, and verify ``cb``
+        is invoked with none. (The RED suite's old
+        ``mock_signal.assert_any_call(signal.SIGWINCH, callback)`` identity
+        assertion no longer holds — ``on_resize`` now wraps ``cb`` rather
+        than passing it through unwrapped.)"""
+        with patch("signal.signal") as mock_signal:
+            term = RealTerminal()
+            callback = Mock()
+            term.on_resize(callback)
 
-    def test_resize_callback_invoked_on_sigwinch(self):
-        """When SIGWINCH fires, registered callback is invoked."""
-        with patch("sys.stdin"):
-            with patch("sys.stdout"):
-                with patch("signal.signal") as mock_signal:
-                    term = RealTerminal()
-                    callback = Mock()
-                    term.on_resize(callback)
+            _, installed_handler = mock_signal.call_args.args
+            installed_handler(signal.SIGWINCH, None)
 
-                    # Extract the handler that was registered
-                    calls = mock_signal.call_args_list
-                    assert len(calls) > 0
-                    # signal.signal(signal.SIGWINCH, handler)
-                    sigwinch_call = [c for c in calls if c[0][0] == signal.SIGWINCH]
-                    assert len(sigwinch_call) > 0
+            callback.assert_called_once_with()
 
 
 class TestANSISequences:
@@ -315,42 +584,41 @@ class TestTerminalIOIntegration:
 
     def test_terminal_lifecycle(self):
         """Full terminal start -> write -> stop sequence."""
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    mock_stdout.columns = 80
-                    mock_stdout.rows = 24
+        with raw_env() as env:
+            env.stdout.columns = 80
+            env.stdout.rows = 24
 
-                    term = RealTerminal()
-                    assert hasattr(term, "start")
-                    assert hasattr(term, "stop")
-                    assert hasattr(term, "write")
-                    assert hasattr(term, "columns")
-                    assert hasattr(term, "rows")
-                    assert hasattr(term, "on_resize")
+            term = RealTerminal()
+            assert hasattr(term, "start")
+            assert hasattr(term, "stop")
+            assert hasattr(term, "write")
+            assert hasattr(term, "columns")
+            assert hasattr(term, "rows")
+            assert hasattr(term, "on_resize")
+            assert hasattr(term, "drain_pending")
 
     def test_columns_default_fallback(self):
-        """RealTerminal.columns falls back to 80 if stdout.columns is None."""
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    mock_stdout.columns = None
+        """RealTerminal.columns falls back to exactly 80 if stdout.columns is
+        None (Minor: pinned from the RED suite's hedged
+        ``in (80, None)``). pytest's default fd-level output capture makes
+        the real ``sys.__stdout__`` a non-tty during the test run, so
+        ``shutil.get_terminal_size``'s real ioctl probe reliably falls
+        through to its ``(80, 24)`` fallback rather than reading an actual
+        terminal's size."""
+        with raw_env() as env:
+            env.stdout.columns = None
 
-                    term = RealTerminal()
-                    term.start()
+            term = RealTerminal()
+            term.start()
 
-                    # Should return 80 as default
-                    assert term.columns in (80, None)  # None if not yet implemented
+            assert term.columns == 80
 
     def test_rows_default_fallback(self):
-        """RealTerminal.rows falls back to 24 if stdout.rows is None."""
-        with patch("sys.stdin"):
-            with patch("sys.stdout") as mock_stdout:
-                with patch("signal.signal"):
-                    mock_stdout.rows = None
+        """RealTerminal.rows falls back to exactly 24 if stdout.rows is None."""
+        with raw_env() as env:
+            env.stdout.rows = None
 
-                    term = RealTerminal()
-                    term.start()
+            term = RealTerminal()
+            term.start()
 
-                    # Should return 24 as default
-                    assert term.rows in (24, None)  # None if not yet implemented
+            assert term.rows == 24

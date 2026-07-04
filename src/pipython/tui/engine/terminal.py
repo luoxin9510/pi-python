@@ -20,12 +20,16 @@ Produces (binding, per task-6 brief):
   directly unit-tested (terminal.ts:23-34 ``parseKeyboardProtocolNegotiationSequence``).
 
 Real-terminal behavior (actual pty interaction) is exercised in the e2e suite
-(Task 17) — this module's own tests mock only ``sys.stdin``/``sys.stdout``/
-``signal.signal``; termios/tty are the sole allowed *system* mock boundary
-project-wide, and in practice this module never calls them with a mocked,
-non-integer file descriptor (every termios/tty/select call is guarded so a
-non-tty or mocked stdin degrades to "raw mode / Kitty probe skipped" rather
-than raising).
+(Task 17). This module's own tests mock at the real system boundary —
+``termios.tcgetattr``/``tcsetattr``, ``tty.setraw``, ``select.select``,
+``os.read``, ``signal.signal``, ``sys.stdout`` — plus ``sys.stdin`` replaced
+with a minimal stub whose ``fileno()`` returns a real ``int`` (e.g. ``0``),
+*not* a blanket ``MagicMock`` (whose mocked ``fileno()`` would return another
+``MagicMock``, tripping the ``isinstance(fd, int)`` guards below and
+short-circuiting before termios/tty/select/os.read ever run — the RED
+mistake fixed in fix round 1). Every termios/tty/select/read call is still
+guarded so a genuinely non-tty stdin (no ``fileno()``, or ``fileno()``
+raising) degrades to "raw mode / Kitty probe skipped" rather than raising.
 
 Declared deviations from upstream:
 
@@ -40,6 +44,19 @@ Declared deviations from upstream:
    Since this port's ``start()`` runs synchronously (no event loop wired in
    at this layer), a bounded wait is required to avoid hanging when nothing
    ever answers the probe; the brief fixes that bound at 200ms.
+
+   **Fix round 1 addition:** unlike upstream — which only ever applies the
+   modifyOtherKeys fallback on an *actual* negative reply (DA, or
+   kitty-flags with ``flags == 0``) — this port also applies the fallback
+   when the probe ends with **no classifiable reply at all** (timeout,
+   select/read error, or the max-buffer cap hit with only garbage). A
+   synchronous, bounded probe cannot distinguish "this terminal will never
+   answer" from "this terminal is just slow"; since the risk of a spurious
+   ``\x1b[>4;2m`` write to a Kitty-capable terminal (expected to be
+   ignored/superseded) is far cheaper than silently leaving *no* protocol
+   negotiated at all, ``_negotiate_kitty_protocol`` treats every
+   non-``kitty-flags`` outcome — including ``None`` — as "apply the
+   fallback".
 2. **No self-``SIGWINCH`` refresh-kick** (terminal.ts:154-156). Upstream
    re-sends itself ``SIGWINCH`` right after enabling raw mode because Node
    caches nothing dimension-wise but still wants one guaranteed resize
@@ -48,17 +65,7 @@ Declared deviations from upstream:
    ``columns``/``rows`` are plain properties recomputed on every access
    (never cached), so there is no staleness to correct, and no test requires
    an initial synthetic resize callback; omitted as unnecessary complexity.
-3. **``on_resize(cb)`` registers ``cb`` directly as the raw ``signal.signal``
-   handler** (receives ``(signum, frame)``), rather than wrapping it in a
-   zero-argument adapter closer to upstream's ``onResize: () => void``. The
-   RED test suite's identity-equality assertion
-   (``mock_signal.assert_any_call(signal.SIGWINCH, callback)``) requires the
-   exact callback object to reach ``signal.signal``, which a wrapper closure
-   would break; per this repo's established precedent (see
-   ``stdin_buffer.py`` module docstring, "test contract as source of truth"),
-   the test shape wins. Callers registering a handler with ``on_resize``
-   must accept it being invoked with signal-handler arity.
-4. **Cursor visibility folded into ``stop()``** (writes ``SHOW_CURSOR``
+3. **Cursor visibility folded into ``stop()``** (writes ``SHOW_CURSOR``
    unconditionally on the first ``stop()`` call). Upstream's
    ``ProcessTerminal.stop()`` (terminal.ts:406-452) does not itself restore
    cursor visibility — that is left to app-level shutdown code elsewhere in
@@ -67,7 +74,7 @@ Declared deviations from upstream:
    guaranteed-to-run cleanup path (exception handler / ``atexit``) also
    restores cursor visibility, rather than depending on a second call site
    downstream remembering to do it.
-5. **``columns``/``rows`` fall back through ``shutil.get_terminal_size()``**
+4. **``columns``/``rows`` fall back through ``shutil.get_terminal_size()``**
    rather than upstream's literal ``process.stdout.columns || Number(env) ||
    80`` OR-chain. Real ``sys.stdout`` has no ``.columns``/``.rows``
    attributes (that's a Node ``tty.WriteStream`` affordance); the property
@@ -77,12 +84,30 @@ Declared deviations from upstream:
    layers ``COLUMNS``/``LINES`` env override, then a real ``ioctl`` query,
    then the ``(80, 24)`` fallback, matching upstream's intent through the
    idiomatic Python API instead of hand-rolling the same OR-chain.
-6. **``drainInput``/``setTitle``/``setProgress``/``clearScreen``/
+5. **``drainInput``/``setTitle``/``setProgress``/``clearScreen``/
    ``clearFromCursor``/Windows VT-input enabling are not ported.** The
    task-6 brief's Produces list is exhaustive for this task (``TerminalIO``,
    ``start``/``stop``/``kitty_enabled``/``on_resize``, and the four cursor
    primitives) — these upstream members are out of scope here, not omitted
    by oversight.
+6. **Kitty-probe typeahead bytes are preserved via a pull-based
+   ``drain_pending()``, not upstream's push-based forwarding.** Upstream
+   never drops a byte during negotiation: every chunk that isn't a
+   recognized negotiation reply is forwarded immediately to ``inputHandler``
+   (terminal.ts:181-318, ``forwardInputSequence`` / the "pending" buffering
+   in ``readKeyboardProtocolNegotiationSequence``). This port's probe is a
+   blocking, synchronous ``select``/``os.read`` loop with no input-handler
+   callback wired in yet, so it cannot forward bytes as they arrive; instead
+   it accumulates every byte that isn't part of a matched reply — found by
+   *searching* the growing buffer for the reply pattern anywhere (not
+   requiring the whole buffer to be the reply) and excising just that match
+   — into ``self._pending_input``, drained via ``drain_pending() -> bytes``.
+   **Task 16 MUST call ``drain_pending()`` and feed the result into
+   ``StdinBuffer.feed()`` before attaching ``loop.add_reader(fd, ...)``** —
+   any bytes returned here arrived on stdin *before* the async reader took
+   over and would otherwise be silently lost (typed-ahead keystrokes eaten,
+   or worse, a reply-plus-typeahead chunk producing a false-negative Kitty
+   detection because the reply pattern wasn't anchored to the whole buffer).
 """
 
 from __future__ import annotations
@@ -103,6 +128,7 @@ from typing import Any, Callable, Protocol
 __all__ = [
     "TerminalIO",
     "RealTerminal",
+    "ResizeCallback",
     "parse_kitty_reply",
     "KITTY_QUERY_SEQUENCE",
     "BRACKETED_PASTE_ENABLE",
@@ -146,6 +172,13 @@ _KITTY_PROBE_MAX_BUFFER = 64
 _KITTY_FLAGS_RE = re.compile(r"^\x1b\[\?(\d+)u$")
 _DEVICE_ATTRS_RE = re.compile(r"^\x1b\[\?[\d;]*c$")
 
+# Unanchored byte-string counterparts of the two patterns above, used by
+# ``_find_negotiation_reply`` to *search* a raw, possibly typeahead-polluted
+# stdin buffer for a reply anywhere within it (see module docstring
+# deviation 6) rather than requiring the whole buffer to be the reply.
+_KITTY_FLAGS_SEARCH_RE = re.compile(rb"\x1b\[\?(\d+)u")
+_DEVICE_ATTRS_SEARCH_RE = re.compile(rb"\x1b\[\?[\d;]*c")
+
 
 def _parse_negotiation_sequence(sequence: str) -> tuple[str, int] | None:
     """terminal.ts:23-34 ``parseKeyboardProtocolNegotiationSequence``.
@@ -168,6 +201,32 @@ def parse_kitty_reply(sequence: str) -> bool:
     return _parse_negotiation_sequence(sequence) is not None
 
 
+def _find_negotiation_reply(buffer: bytes) -> tuple[tuple[str, int], bytes] | None:
+    """Search ``buffer`` *anywhere* for a Kitty-flags or device-attributes
+    negotiation reply and excise just the matched span, per upstream's
+    non-lossy forwarding semantics (terminal.ts:181-318) — unlike
+    ``_parse_negotiation_sequence`` (which classifies an already-isolated,
+    fully-matched sequence), this tolerates typed-ahead bytes before and/or
+    after the reply within the same chunk.
+
+    Returns ``(("kitty-flags", flags) | ("device-attributes", 0), leftover)``
+    where ``leftover`` is every byte of ``buffer`` outside the matched reply
+    (both the prefix and suffix, concatenated) — the caller preserves this
+    via ``RealTerminal._pending_input`` / ``drain_pending()`` rather than
+    discarding it. ``None`` if no reply pattern is found anywhere yet.
+    """
+    match = _KITTY_FLAGS_SEARCH_RE.search(buffer)
+    if match:
+        flags = int(match.group(1))
+        leftover = buffer[: match.start()] + buffer[match.end() :]
+        return ("kitty-flags", flags), leftover
+    match = _DEVICE_ATTRS_SEARCH_RE.search(buffer)
+    if match:
+        leftover = buffer[: match.start()] + buffer[match.end() :]
+        return ("device-attributes", 0), leftover
+    return None
+
+
 # =============================================================================
 # TerminalIO protocol
 # =============================================================================
@@ -187,7 +246,13 @@ class TerminalIO(Protocol):
     def rows(self) -> int: ...
 
 
-_ResizeHandler = Callable[[int, "FrameType | None"], object]
+# Public callback shape for on_resize — upstream's `onResize: () => void`
+# (terminal.ts:150). Zero-arg by design; see on_resize()'s docstring.
+ResizeCallback = Callable[[], None]
+
+# Internal: the raw signal.signal handler shape ((signum, frame) -> Any)
+# that ResizeCallback gets wrapped in before reaching signal.signal.
+_RawSignalHandler = Callable[[int, "FrameType | None"], object]
 
 
 class RealTerminal(TerminalIO):
@@ -206,7 +271,8 @@ class RealTerminal(TerminalIO):
         self._modify_other_keys_active = False
         self._raw_fd: int | None = None
         self._saved_termios: Any | None = None
-        self._resize_handler: _ResizeHandler | None = None
+        self._resize_handler: _RawSignalHandler | None = None
+        self._pending_input: bytes = b""
 
     # -- lifecycle -----------------------------------------------------
 
@@ -222,25 +288,36 @@ class RealTerminal(TerminalIO):
 
         self.write(BRACKETED_PASTE_ENABLE)  # terminal.ts:147
 
+        # Restore guarantee, registered unconditionally right after the
+        # first state-mutating write: bracketed paste (and the Kitty query
+        # right below) happen regardless of whether raw-mode entry itself
+        # succeeded, so the "finally"-grade restore must be armed
+        # regardless too — gating this on `_raw_fd is not None` would leave
+        # bracketed paste / the Kitty push enabled forever on a non-tty
+        # stdin (fd lookup or termios failed) if the process exits without
+        # an explicit stop(). stop() is already idempotent and safe to call
+        # even when raw mode never engaged.
+        atexit.register(self.stop)
+
         self._protocol_query_sent = True
         self.write(KITTY_QUERY_SEQUENCE)  # terminal.ts:225
 
         self._negotiate_kitty_protocol()
 
-        # Restore guarantee (deviation: atexit backstop only makes sense —
-        # and only avoids stray writes to an unrelated real stdout in
-        # tests — once we actually engaged real terminal state).
-        if self._raw_fd is not None:
-            atexit.register(self.stop)
-
     def stop(self) -> None:
         """Finally-grade restore: bracketed paste, Kitty/modifyOtherKeys
         flags, termios raw mode, and cursor visibility. Idempotent — safe to
         call from an exception handler or twice in a row (terminal.ts:406-452,
-        plus the task-6 brief's cursor-show addition, see deviation 4)."""
+        plus the task-6 brief's cursor-show addition, see deviation 3).
+
+        Resets ``_started`` so a subsequent ``start()`` call re-enters raw
+        mode and re-negotiates Kitty from scratch (upstream's terminal is
+        likewise restartable — nothing in ``ProcessTerminal`` latches
+        "already started" permanently)."""
         if self._stopped:
             return
         self._stopped = True
+        self._started = False
 
         self.write(BRACKETED_PASTE_DISABLE)  # terminal.ts:412
 
@@ -281,12 +358,27 @@ class RealTerminal(TerminalIO):
 
     # -- resize (terminal.ts:150, ``process.stdout.on("resize", ...)``) --
 
-    def on_resize(self, cb: _ResizeHandler) -> None:
-        """Register ``cb`` for SIGWINCH. ``cb`` is installed directly as the
-        raw signal handler (receives ``(signum, frame)``) — see module
-        docstring deviation 3."""
-        self._resize_handler = cb
-        signal.signal(signal.SIGWINCH, cb)
+    def on_resize(self, cb: ResizeCallback) -> None:
+        """Register ``cb`` — an upstream-shaped zero-arg
+        ``Callable[[], None]`` (``onResize: () => void``, terminal.ts:150)
+        — to run on every SIGWINCH. ``cb`` is wrapped in a signal-arity
+        adapter internally (``lambda signum, frame: cb()``) so callers never
+        need to accept ``(signum, frame)`` themselves.
+
+        WARNING — SIGWINCH is a single, process-wide slot: this method
+        claims it via ``signal.signal`` directly. The app layer must NOT
+        *also* register SIGWINCH through ``asyncio``'s
+        ``loop.add_signal_handler(signal.SIGWINCH, ...)`` — whichever
+        registration runs last silently clobbers the other with no error
+        (see Task 8/16 wiring notes). Resize must be wired through
+        ``on_resize`` only.
+        """
+
+        def _handler(signum: int, frame: FrameType | None) -> None:
+            cb()
+
+        self._resize_handler = _handler
+        signal.signal(signal.SIGWINCH, _handler)
 
     # -- cursor primitives (terminal.ts:473-494) --------------------------
 
@@ -313,10 +405,10 @@ class RealTerminal(TerminalIO):
     def _enter_raw_mode(self) -> None:
         """terminal.ts:139-141 (save ``isRaw`` state, ``setRawMode(true)``).
 
-        Guarded end-to-end: a non-tty or mocked ``stdin`` (this module's own
-        tests patch ``sys.stdin`` wholesale, giving a non-integer
-        ``fileno()``) degrades to "raw mode skipped" rather than raising —
-        real-terminal raw-mode behavior is covered by the e2e suite (Task 17).
+        Guarded end-to-end: a stdin with no ``fileno()``, a ``fileno()`` that
+        raises, or a non-``int`` ``fileno()`` result all degrade to "raw mode
+        skipped" rather than raising — real-terminal raw-mode behavior is
+        covered by the e2e suite (Task 17).
         """
         try:
             fd = sys.stdin.fileno()
@@ -350,20 +442,36 @@ class RealTerminal(TerminalIO):
         """Read the Kitty/DA reply (bounded by ``_KITTY_PROBE_TIMEOUT_S``,
         see module docstring deviation 1) and apply
         ``handleKeyboardProtocolNegotiationSequence`` (terminal.ts:228-250).
-        No reply within the timeout leaves both ``kitty_enabled`` and the
-        modifyOtherKeys fallback untouched, matching upstream's own
-        do-nothing-until-a-reply-arrives behavior.
+
+        Any outcome other than a *positive* Kitty-flags reply
+        (``flags != 0``) — including a negative reply (DA, or kitty-flags
+        with ``flags == 0``) *and* getting no classifiable reply at all
+        (timeout / select or read error / garbage that never resolves) —
+        applies the modifyOtherKeys fallback. See module docstring
+        deviation 1's "Fix round 1 addition" for why the no-reply case is
+        folded into the fallback here rather than left untouched.
         """
         negotiation = self._read_negotiation_reply(_KITTY_PROBE_TIMEOUT_S)
-        if negotiation is None:
-            return
-        kind, flags = negotiation
-        if kind == "kitty-flags" and flags != 0:
-            self.kitty_enabled = True
-            return
+        if negotiation is not None:
+            kind, flags = negotiation
+            if kind == "kitty-flags" and flags != 0:
+                self.kitty_enabled = True
+                return
         self._enable_modify_other_keys()
 
     def _read_negotiation_reply(self, timeout_s: float) -> tuple[str, int] | None:
+        """Synchronously read stdin until a Kitty/DA negotiation reply is
+        found or ``timeout_s`` elapses, *without dropping any other byte*
+        seen along the way (typed-ahead keystrokes, or a reply-plus-typeahead
+        chunk) — ported from upstream's non-lossy forwarding semantics
+        (terminal.ts:181-318), see module docstring deviation 6.
+
+        Every exit path funnels leftover/non-reply bytes into
+        ``self._pending_input`` (drained via ``drain_pending()``) instead of
+        discarding them: a found reply excises just its own span (keeping
+        the surrounding bytes), and a timeout/error/overflow keeps the
+        *entire* accumulated buffer.
+        """
         try:
             fd = sys.stdin.fileno()
         except (AttributeError, OSError, ValueError):
@@ -372,30 +480,52 @@ class RealTerminal(TerminalIO):
             return None
 
         deadline = time.monotonic() + timeout_s
-        buffer = ""
+        buffer = b""
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self._pending_input += buffer
                 return None
             try:
                 ready, _, _ = select.select([fd], [], [], remaining)
             except (OSError, ValueError, TypeError):
+                self._pending_input += buffer
                 return None
             if not ready:
+                self._pending_input += buffer
                 return None
             try:
                 chunk = os.read(fd, 64)
             except OSError:
+                self._pending_input += buffer
                 return None
             if not chunk:
+                self._pending_input += buffer
                 return None
-            buffer += chunk.decode("utf-8", errors="ignore")
+            buffer += chunk
 
-            negotiation = _parse_negotiation_sequence(buffer)
-            if negotiation is not None:
+            found = _find_negotiation_reply(buffer)
+            if found is not None:
+                negotiation, leftover = found
+                self._pending_input += leftover
                 return negotiation
             if len(buffer) > _KITTY_PROBE_MAX_BUFFER:
+                self._pending_input += buffer
                 return None
+
+    def drain_pending(self) -> bytes:
+        """Return and clear bytes collected during Kitty negotiation that
+        were not part of the negotiation reply itself — typed-ahead
+        keystrokes, unrecognized garbage, or a timed-out/overflowed probe's
+        raw buffer (see module docstring deviation 6).
+
+        **Task 16 MUST call this and feed the result into
+        ``StdinBuffer.feed()`` before attaching ``loop.add_reader(fd,
+        ...)``** — any bytes returned here arrived on stdin before the
+        async reader took over and would otherwise be silently lost.
+        """
+        pending, self._pending_input = self._pending_input, b""
+        return pending
 
     def _enable_modify_other_keys(self) -> None:
         """terminal.ts:320-324."""
