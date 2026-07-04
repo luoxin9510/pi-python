@@ -322,7 +322,7 @@ def test_request_render_coalesces(term, tui, event_loop):
 - Test: `tests/tui/components/test_select_list.py`
 
 **Interfaces:**
-- Produces: `SelectList(items: list[str], max_visible: int)`：`move_up()/move_down()`（越界环绕照上游）、`selected: str | None`、`set_items(items)`；render 高亮当前项、超出 max_visible 滚动窗口。
+- Produces: `SelectItem(value: str, label: str, description: str | None = None)`（dataclass，照上游 item 形状）；`SelectList(items: list[SelectItem], max_visible: int)`：`move_up()/move_down()`（越界环绕照上游）、`selected: SelectItem | None`、`set_items(items)`；render 高亮当前项、超出 max_visible 滚动窗口。（Task 13 的 `AutocompleteItem` 即此 `SelectItem` 的别名——补全选中直接拿回结构化条目，无需 index 映射。）
 - Consumes: Task 7 Component、Task 1 utils
 
 **上游规范源**：`select-list.ts`（229 行全量；theme 参数简化为固定 pi 默认样式，样式常量集中模块顶）。
@@ -364,7 +364,7 @@ def test_request_render_coalesces(term, tui, event_loop):
 - Test: `tests/tui/components/test_editor_killring_undo_history.py`
 
 **Interfaces:**
-- Produces（追加动作）：`kill_line`(Ctrl+K)/`kill_word_back`(Ctrl+W)/`yank`(Ctrl+Y)/`yank_pop`(Alt+Y)、`undo`(Ctrl+_)、历史 `history_prev/next`（`Editor.history: list[str]` + `add_history(s)`；编辑中草稿保存语义照 editor.ts）、bracketed paste 经 `handle_paste` 且计入单次 undo 单元。
+- Produces（追加动作）：`kill_line`(Ctrl+K)/`kill_word_back`(Ctrl+W)/`yank`(Ctrl+Y)/`yank_pop`(Alt+Y)、`undo`(Ctrl+_)、历史 `history_prev/next`（`Editor.history: list[str]` + `add_history(s)`；编辑中草稿保存语义照 editor.ts）、bracketed paste 经 `handle_paste` 且计入单次 undo 单元；**大段粘贴折叠为 `[paste #N +M lines]` marker**（阈值与文案照 editor.ts）+ `get_expanded_text() -> str`（把 marker 展开回真实粘贴内容——app 提交必须走它，否则模型收到 marker 字符串）。
 - Consumes: Task 5 KillRing/UndoStack、Task 11 全部
 
 **上游规范源**：`editor.ts` 对应区段；`editor.test.ts` kill-ring/undo/history 域。
@@ -390,7 +390,7 @@ def test_request_render_coalesces(term, tui, event_loop):
     `def apply_completion(self, lines, cursor_line, cursor_col, item: AutocompleteItem, prefix: str) -> tuple[list[str], int, int]`；
     可选 `trigger_characters: str`
   - Editor 追加：`set_autocomplete_provider(provider, tui: TUI)`——**防抖 + 取消 token 照 editor.ts**（`autocompleteDebounceTimer`/`autocompleteStartToken` 语义：新键入使旧请求作废）；触发时 `tui.show_overlay(SelectList(...))`（editor 直接持有 SelectList，照 createAutocompleteList）；Tab/上下/Enter/Esc 浮层开启时改道；选中经 `apply_completion` 回写
-  - `EditorComponent(Protocol)`（editor_protocol.py）——**忠实对照 editor-component.ts 的可插拔面**（该文件存在的唯一目的是允许自定义编辑器实现，三原则同款）：`get_text()/set_text(s)/handle_input(data)/render/invalidate/focused` + 可选 hook `on_submit/on_change/add_to_history(s)/insert_text_at_cursor(s)/set_autocomplete_provider(...)`；app 层依赖此 Protocol 而非具体 Editor
+  - `EditorComponent(Protocol)`（editor_protocol.py）——**忠实对照 editor-component.ts 的可插拔面**（该文件存在的唯一目的是允许自定义编辑器实现，三原则同款）：`get_text()/set_text(s)/handle_input(data)/render/invalidate/focused` + 可选 hook `on_submit/on_change/add_to_history(s)/insert_text_at_cursor(s)/set_autocomplete_provider(...)/get_expanded_text()`（粘贴 marker 展开，Task 12；app 提交路径必须优先调它）；app 层依赖此 Protocol 而非具体 Editor
 - Consumes: Task 10 SelectList、Task 8 overlay、Task 11/12
 
 **上游规范源**：`editor.ts` 补全区段（约 2050-2150 行）+ `editor-component.ts`；`editor.test.ts` 补全域。
@@ -446,7 +446,7 @@ def test_request_render_coalesces(term, tui, event_loop):
 - Test: `tests/tui/test_app2.py`（FakeClient 驱动，RecordingTerm 断言）
 
 **Interfaces:**
-- Produces: `async run_app2(*, model: str, cwd: Path, client: ModelClient | None = None, term: TerminalIO | None = None) -> None`——组件树照 spec §6：会话区 Container（user 回显 Text/流式 Text 增量 invalidate→message_end 原地替换 Markdown/工具行 Text/错误红 Text）+ Loader + Editor 常驻底部；SIGINT 挂/收与 `[interrupted]`、Ctrl+C 清缓冲、Ctrl+D 空缓冲退出+session 横幅——语义与阶段二相同；斜杠命令经 `Sink` 出组件。`term` 可注入（测试传 RecordingTerm 全程无真终端）。
+- Produces: `async run_app2(*, model: str, cwd: Path, client: ModelClient | None = None, term: TerminalIO | None = None) -> None`——组件树照 spec §6：会话区 Container（user 回显 Text/流式 Text 增量 invalidate→message_end 原地替换 Markdown/工具行 Text/错误红 Text）+ Loader + Editor 常驻底部；SIGINT 挂/收与 `[interrupted]`、Ctrl+C 清缓冲、Ctrl+D 空缓冲退出+session 横幅——语义与阶段二相同；**提交取文本走 `get_expanded_text()`**（粘贴 marker 展开，Task 12/13）；斜杠命令经 `Sink` 出组件。`term` 可注入（测试传 RecordingTerm 全程无真终端）。
 - Consumes: Task 7/8 TUI、Task 9-15 组件、pipython 公开 API
 
 - [ ] **Step 1: [TEST]**：FakeClient 两轮脚本驱动 run_app2（注入 RecordingTerm + 脚本化 stdin 帧）：断言流式期 Text 逐步增长、message_end 后屏上出现 markdown 渲染行、工具行出现、Ctrl+D 退出后 ops 含 session 横幅；deny/error 红行。≥8 条，写全。
