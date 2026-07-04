@@ -28,45 +28,51 @@ from pipython.tui.engine.utils import visible_width
 
 
 class PiDefaultTheme:
-    """Pi default theme constants for SelectList styling.
+    """Pi's *real* default (dark) theme constants for SelectList styling.
 
     Simplified fixed theme per task-10 brief (no parameter injection).
     Upstream select-list.ts assumes these styling methods via a
-    SelectListTheme parameter; this port fixes them to pi's default.
+    SelectListTheme parameter; this port fixes them to pi's default theme
+    values, verified against the actual upstream sources (not invented):
+
+    - ``getSelectListTheme`` (theme.ts:1259-1267): ``selectedPrefix``/
+      ``selectedText`` -> ``theme.fg("accent", text)``; ``description``/
+      ``scrollInfo``/``noMatch`` -> ``theme.fg("muted", text)``.
+    - ``theme.fg`` (theme.ts:351-354): ``f"{ansi}{text}\\x1b[39m"`` — a
+      foreground-only reset (``\\x1b[39m``), not the full ``\\x1b[0m``.
+    - ``fgAnsi`` truecolor branch (theme.ts:260-266): hex color ->
+      ``\\x1b[38;2;R;G;Bm``.
+    - dark.json: ``vars.accent = "#8abeb7"`` (line 14) wired to
+      ``colors.accent`` (line 23) -> rgb(138, 190, 183); ``vars.gray =
+      "#808080"`` (line 11) wired to ``colors.muted`` (line 30) ->
+      rgb(128, 128, 128).
     """
 
     @staticmethod
     def selected_text(text: str) -> str:
-        """Selected row: bright white on dark background (inverse mode).
-
-        Upstream uses inverse (SGR 7) for selected rows. Pi's default theme
-        in the reference implementation applies inverse to selectedText.
-        """
-        return f"\x1b[7m{text}\x1b[0m"
+        """Selected row: ``theme.fg("accent", text)`` (theme.ts:1261)."""
+        return f"\x1b[38;2;138;190;183m{text}\x1b[39m"
 
     @staticmethod
     def description(text: str) -> str:
-        """Description text (dim / secondary color).
-
-        Rendered in dim mode (SGR 2) for secondary importance.
-        """
-        return f"\x1b[2m{text}\x1b[0m"
+        """Description text: ``theme.fg("muted", text)`` (theme.ts:1263)."""
+        return f"\x1b[38;2;128;128;128m{text}\x1b[39m"
 
     @staticmethod
     def no_match(text: str) -> str:
-        """'No matching...' message (dim).
+        """'No matching...' message: ``theme.fg("muted", text)`` (theme.ts:1265).
 
         Shown when filtered items list is empty.
         """
-        return f"\x1b[2m{text}\x1b[0m"
+        return f"\x1b[38;2;128;128;128m{text}\x1b[39m"
 
     @staticmethod
     def scroll_info(text: str) -> str:
-        """Scroll indicator '(N/Total)' (dim).
+        """Scroll indicator '(N/Total)': ``theme.fg("muted", text)`` (theme.ts:1264).
 
         Shown when window does not span entire list.
         """
-        return f"\x1b[2m{text}\x1b[0m"
+        return f"\x1b[38;2;128;128;128m{text}\x1b[39m"
 
 
 # ==============================================================================
@@ -213,11 +219,23 @@ class TestSelectListScrollWindow:
         assert sl.selected is not None
         assert sl.selected.value == "opt5"
 
-        # Render and check visible items
+        # startIndex = max(0, min(4 - 5//2, 8 - 5)) = max(0, min(2, 3)) = 2
+        # endIndex = min(2 + 5, 8) = 7 -> visible window is items 3-7 (indices 2-6)
         lines = sl.render(80)
-        # Should show items 3-7 (indices 2-6 inclusive, i.e., items 3-7 by label)
-        # But without yet knowing the exact render format, just verify a render happens
-        assert len(lines) > 0
+        assert len(lines) == 6  # 5 visible items + 1 scroll-info line
+        for offset, label in enumerate(
+            ["Option 3", "Option 4", "Option 5", "Option 6", "Option 7"]
+        ):
+            assert label in lines[offset], f"expected {label!r} in {lines[offset]!r}"
+        # Item 1/2/8 (outside the window) must not be visible.
+        rendered = "\n".join(lines)
+        assert "Option 1" not in rendered
+        assert "Option 2" not in rendered
+        assert "Option 8" not in rendered
+        # The selected row (Option 5, 3rd visible line) carries the accent style.
+        assert lines[2].startswith("\x1b[38;2;138;190;183m→ Option 5")
+        # Scroll info: selectedIndex+1 = 5, total = 8.
+        assert lines[-1] == "\x1b[38;2;128;128;128m  (5/8)\x1b[39m"
 
     def test_window_scrolls_past_bottom(self, many_items):
         """Moving past middle scrolls window to keep cursor visible.
@@ -233,10 +251,23 @@ class TestSelectListScrollWindow:
         assert sl.selected is not None
         assert sl.selected.value == "opt7"
 
-        # Window should have scrolled
+        # startIndex = max(0, min(6 - 5//2, 8 - 5)) = max(0, min(4, 3)) = 3
+        # endIndex = min(3 + 5, 8) = 8 -> visible window is items 4-8 (indices 3-7)
         lines = sl.render(80)
-        # Verify render works
-        assert len(lines) > 0
+        assert len(lines) == 6  # 5 visible items + 1 scroll-info line
+        for offset, label in enumerate(
+            ["Option 4", "Option 5", "Option 6", "Option 7", "Option 8"]
+        ):
+            assert label in lines[offset], f"expected {label!r} in {lines[offset]!r}"
+        # Items 1-3 (outside the window) must not be visible.
+        rendered = "\n".join(lines)
+        assert "Option 1" not in rendered
+        assert "Option 2" not in rendered
+        assert "Option 3" not in rendered
+        # The selected row (Option 7, 4th visible line) carries the accent style.
+        assert lines[3].startswith("\x1b[38;2;138;190;183m→ Option 7")
+        # Scroll info: selectedIndex+1 = 7, total = 8.
+        assert lines[-1] == "\x1b[38;2;128;128;128m  (7/8)\x1b[39m"
 
     def test_window_does_not_scroll_below_zero(self, many_items):
         """startIndex never goes below 0."""
@@ -409,41 +440,47 @@ class TestSelectListRenderHighlight:
         lines = sl.render(80)
 
         # First line should be selected (opt1)
-        # It should contain the "→ " prefix inside the inverse styling
+        # It should contain the "→ " prefix inside the accent-fg styling
         selected_line = lines[0]
-        assert "→ " in selected_line or selected_line.startswith("\x1b[7m→")
+        assert "→ " in selected_line or selected_line.startswith("\x1b[38;2;138;190;183m→")
 
-    def test_selected_row_inverse_ansi(self, sample_items, theme):
-        """Selected row is wrapped in inverse (SGR 7) ANSI code.
+    def test_selected_row_accent_ansi(self, sample_items, theme):
+        """Selected row is wrapped in pi's accent-color foreground ANSI code.
 
         Upstream select-list.ts line 171-172:
             return this.theme.selectedText(`${prefix}${truncatedValue}`);
 
-        Pi's default theme applies inverse mode (SGR 7) to selectedText.
+        Pi's default (dark) theme wires ``selectedText`` to
+        ``theme.fg("accent", text)`` (theme.ts:1259-1267), i.e. the accent
+        truecolor foreground escape (dark.json accent "#8abeb7" ->
+        rgb(138, 190, 183)) followed by the foreground-only reset
+        ``\\x1b[39m`` (theme.ts:351-354) — not SGR 7 inverse video.
         """
         sl = SelectList(items=sample_items, max_visible=5)
         lines = sl.render(80)
 
-        # First line should be selected, start with inverse code
+        # First line should be selected, start with the accent-fg code
         selected_line = lines[0]
-        assert selected_line.startswith("\x1b[7m"), (
-            f"Selected row should start with inverse ANSI code, got: {selected_line!r}"
+        assert selected_line.startswith("\x1b[38;2;138;190;183m"), (
+            f"Selected row should start with accent-fg ANSI code, got: {selected_line!r}"
+        )
+        assert selected_line == theme.selected_text(
+            "→ Option 1                        First option"
         )
 
-    def test_unselected_rows_no_inverse(self, sample_items):
-        """Unselected rows do not have inverse styling."""
+    def test_unselected_rows_no_accent(self, sample_items):
+        """Unselected rows do not have the selected-row accent styling."""
         sl = SelectList(items=sample_items, max_visible=5)
 
         # Move down so second row is visible but not selected
         sl.move_down()
         lines = sl.render(80)
 
-        # Second line in render is now opt1 (not selected)
-        # It should have "  " prefix and no inverse code
+        # First line in render is now opt1 (not selected)
+        # It should have "  " prefix and no accent-fg selected-row code
         unselected_line = lines[0]
-        # If visible, the unselected line should not start with inverse
-        if unselected_line.startswith("  "):
-            assert not unselected_line.startswith("\x1b[7m")
+        assert unselected_line.startswith("  Option 1")
+        assert not unselected_line.startswith("\x1b[38;2;138;190;183m")
 
 
 class TestSelectListRenderWidth:
@@ -690,13 +727,18 @@ class TestSelectListEdgeCases:
         assert len(lines) > 0
 
     def test_render_zero_width(self):
-        """render(width=0) doesn't crash (edge case)."""
+        """render(width=0) doesn't crash and truncates the label to nothing.
+
+        prefix_width("→ ") == 2, so max_width = 0 - 2 - 2 = -4; since
+        truncate_to_width returns "" for any width <= 0 (utils.py:740-741),
+        the label is truncated away entirely, leaving only the accent-styled
+        "→ " prefix.
+        """
         items = [SelectItem(value="opt1", label="Option 1")]
         sl = SelectList(items=items, max_visible=5)
 
         lines = sl.render(0)
-        # Should handle gracefully
-        assert isinstance(lines, list)
+        assert lines == ["\x1b[38;2;138;190;183m→ \x1b[39m"]
 
     def test_unicode_in_labels_and_descriptions(self):
         """Unicode characters in labels/descriptions render correctly."""

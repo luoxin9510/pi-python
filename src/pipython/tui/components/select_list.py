@@ -10,10 +10,18 @@ an injectable object.
 Deviations from upstream select-list.ts:
 
 1. **No ``SelectListTheme`` parameter.** ``_selected_text``/``_description``/
-   ``_no_match``/``_scroll_info`` below are the fixed pi-default styling
-   (inverse SGR 7 for the selected row, dim SGR 2 for description/no-match/
-   scroll-info text) — module-level functions instead of an injected object,
-   per the brief.
+   ``_no_match``/``_scroll_info`` below are the fixed pi-default styling,
+   module-level functions instead of an injected object, per the brief. The
+   actual colors are pi's real default (dark) theme, not invented: upstream
+   ``getSelectListTheme`` (theme.ts:1259-1267) wires ``selectedPrefix``/
+   ``selectedText`` to ``theme.fg("accent", text)`` and ``description``/
+   ``scrollInfo``/``noMatch`` to ``theme.fg("muted", text)``. ``theme.fg``
+   (theme.ts:351-354) emits the color escape then a *foreground-only* reset
+   ``\x1b[39m`` (not the full ``\x1b[0m``). In truecolor mode ``fgAnsi``
+   (theme.ts:260-266) renders a hex color as ``\x1b[38;2;R;G;Bm``. The
+   default dark theme (theme/dark.json) maps ``colors.accent`` to
+   ``vars.accent = "#8abeb7"`` (dark.json:14,23) and ``colors.muted`` to
+   ``vars.gray = "#808080"`` (dark.json:11,30) — see the constants below.
 2. **No ``SelectListLayoutOptions`` parameter** (``minPrimaryColumnWidth``/
    ``maxPrimaryColumnWidth``/``truncatePrimary``, select-list.ts:34-38) — the
    brief's constructor takes only ``(items, max_visible)``. Upstream's own
@@ -78,27 +86,43 @@ def _normalize_to_single_line(text: str) -> str:
 
 # --------------------------------------------------------------------------
 # Fixed pi-default theme — see module docstring deviation 1.
+#
+# Values are pi's real default (dark) theme, not invented constants:
+#   - getSelectListTheme (theme.ts:1259-1267): selectedPrefix/selectedText use
+#     theme.fg("accent", text); description/scrollInfo/noMatch use
+#     theme.fg("muted", text).
+#   - theme.fg (theme.ts:351-354): f"{ansi}{text}\x1b[39m" — foreground-only
+#     reset, not the full "\x1b[0m".
+#   - fgAnsi truecolor branch (theme.ts:260-266): hex -> "\x1b[38;2;R;G;Bm".
+#   - dark.json vars.accent = "#8abeb7" (line 14), wired to colors.accent
+#     (line 23) -> rgb(138, 190, 183).
+#   - dark.json vars.gray = "#808080" (line 11), wired to colors.muted
+#     (line 30) -> rgb(128, 128, 128).
 # --------------------------------------------------------------------------
+
+_ACCENT_FG = "\x1b[38;2;138;190;183m"  # dark.json accent "#8abeb7"
+_MUTED_FG = "\x1b[38;2;128;128;128m"  # dark.json muted/gray "#808080"
+_FG_RESET = "\x1b[39m"  # theme.ts:354 — foreground-only reset
 
 
 def _selected_text(text: str) -> str:
-    """Inverse video (SGR 7) for the selected row."""
-    return f"\x1b[7m{text}\x1b[0m"
+    """``theme.fg("accent", text)`` for the selected row (theme.ts:1261)."""
+    return f"{_ACCENT_FG}{text}{_FG_RESET}"
 
 
 def _description(text: str) -> str:
-    """Dim (SGR 2) for description text."""
-    return f"\x1b[2m{text}\x1b[0m"
+    """``theme.fg("muted", text)`` for description text (theme.ts:1263)."""
+    return f"{_MUTED_FG}{text}{_FG_RESET}"
 
 
 def _no_match(text: str) -> str:
-    """Dim (SGR 2) for the empty-list message."""
-    return f"\x1b[2m{text}\x1b[0m"
+    """``theme.fg("muted", text)`` for the empty-list message (theme.ts:1265)."""
+    return f"{_MUTED_FG}{text}{_FG_RESET}"
 
 
 def _scroll_info(text: str) -> str:
-    """Dim (SGR 2) for the scroll indicator."""
-    return f"\x1b[2m{text}\x1b[0m"
+    """``theme.fg("muted", text)`` for the scroll indicator (theme.ts:1264)."""
+    return f"{_MUTED_FG}{text}{_FG_RESET}"
 
 
 @dataclass
