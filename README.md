@@ -62,7 +62,7 @@ and exits instead of raising a traceback.
 |---|---|
 | `Enter` | Submit the current input |
 | `Alt+Enter` / `Ctrl+J` | Insert a newline (multi-line input) |
-| `Ctrl+C` | During a running turn: interrupt the agent and return to the prompt. At an empty prompt: clear the current input line (prompt_toolkit default) |
+| `Ctrl+C` | During a running turn: interrupt the agent and return to the prompt. At the prompt: discard whatever is typed so far (including a multi-line draft) and start a fresh prompt |
 | `Ctrl+D` | Exit at an empty prompt (readline EOF semantics); on a non-empty line, deletes the character under the cursor |
 | `Ctrl+R` | Reverse history search (prompt_toolkit default, backed by `~/.pi-python/tui-history`) |
 
@@ -88,6 +88,6 @@ below.
 Unknown commands print an error and a `/help` hint instead of failing
 silently.
 
-### Environment variables
+### Environment variable
 
 - `PI_PYTHON_MODEL` — default model id used when `--model` isn't passed.
