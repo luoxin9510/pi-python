@@ -85,6 +85,10 @@ class AgentSession:
                 messages.append(_parse_message(e.message))
         self.agent.messages = messages
 
+    @property
+    def model(self) -> str:
+        return self.agent.model
+
     # -- 公开 API --
     def on(self, name: str, handler: Callable[[Any], Any]) -> None:
         self.agent.bus.on(name, handler)  # 同一份总线，无镜像（spec §4.3）

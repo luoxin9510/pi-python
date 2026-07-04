@@ -40,6 +40,10 @@ async def bash(command: str, timeout: float = 120.0, ctx: ToolContext | None = N
     try:
         await asyncio.wait_for(pump(), timeout=timeout)
         code = await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.CancelledError:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        raise
     except asyncio.TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)

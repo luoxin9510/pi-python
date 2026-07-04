@@ -69,6 +69,12 @@ def entry_parent_id(e: Entry) -> str | None:
     return getattr(e, "parent_id", None)
 
 
+def entry_type(e: Entry) -> str | None:
+    if isinstance(e, dict):
+        return e.get("type")
+    return getattr(e, "type", None)
+
+
 def _dump(e: Entry) -> str:
     if isinstance(e, dict):
         return json.dumps(e, ensure_ascii=False)
