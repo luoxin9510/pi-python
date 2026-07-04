@@ -94,4 +94,7 @@ async def run_app(*, model: str, cwd: Path) -> None:
     except KeyboardInterrupt:
         pass  # handler 摘除后到 pt 接管前的窄窗口兜底
     finally:
-        console.print(Text(f"session: {app.session.store.path}", style="dim"))
+        # soft_wrap=True：路径是不可分割的 token，禁用 Rich 的按词换行（默认会在
+        # "session:" 后的空格处硬拆行，把后续路径拆到下一行），让终端做原生的
+        # 按列软换行——退出横幅在窄终端/长路径下仍保持逻辑上的单行可读。
+        console.print(Text(f"session: {app.session.store.path}", style="dim"), soft_wrap=True)
