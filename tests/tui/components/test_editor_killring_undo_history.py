@@ -932,7 +932,6 @@ class TestUndo:
         editor.handle_input("|")
         assert editor.text == "hello| world"
 
-    @pytest.mark.skip(reason="pending Task 13 insert_text_at_cursor hook")
     def test_undoes_insert_text_at_cursor_atomically(self):
         """Undoes insertTextAtCursor atomically."""
         from pipython.tui.components.editor import Editor
@@ -954,7 +953,6 @@ class TestUndo:
         editor.handle_input("|")
         assert editor.text == "hello| world"
 
-    @pytest.mark.skip(reason="pending Task 13 insert_text_at_cursor hook")
     def test_insert_text_at_cursor_handles_multiline_text(self):
         """insertTextAtCursor handles multiline text."""
         from pipython.tui.components.editor import Editor
@@ -977,7 +975,6 @@ class TestUndo:
         editor.handle_input("\x1b[45;5u")  # Ctrl+- (undo)
         assert editor.text == "hello world"
 
-    @pytest.mark.skip(reason="pending Task 13 insert_text_at_cursor hook")
     def test_insert_text_at_cursor_normalizes_crlf_and_cr_line_endings(self):
         """insertTextAtCursor normalizes CRLF and CR line endings."""
         from pipython.tui.components.editor import Editor
