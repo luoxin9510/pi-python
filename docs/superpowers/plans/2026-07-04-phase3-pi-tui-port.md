@@ -301,7 +301,7 @@ def test_request_render_coalesces(term, tui, event_loop):
 **Interfaces:**
 - Produces:
   - `Text(content: str, style: str = "")`：`set_content(s)`；render 按宽折行（用 utils.wrap_text_with_ansi）
-  - `Box(child: Component, *, padding: int = 0, border: bool = False)`
+  - `Box(child: Component, *, padding: int = 0)`（**无 border**——上游 box.ts 无任何边框代码，先前 border 参数系 brief 发明且全计划零消费方，审核证伪后删除；边框需求属阶段四 dynamic-border/bordered-loader 范畴）
   - `Spacer(lines: int = 1)`
   - `TruncatedText(content: str)`（单行截断加省略号）
   - `Loader(tui_request_render: Callable, frames: list[str] | None = None, interval: float = 0.08)`：`start()/stop()`；spinner 帧推进靠注入的 request_render（测试手动步进，不真 sleep）
