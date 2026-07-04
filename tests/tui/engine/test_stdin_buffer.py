@@ -54,18 +54,13 @@ def buffer_setup():
 
     timer = FakeTimer()
     emitted_sequences = []
-    emitted_paste = []
 
     def on_frame(sequence: str) -> None:
         emitted_sequences.append(sequence)
 
-    def on_paste(data: str) -> None:
-        emitted_paste.append(data)
-
     buffer = StdinBuffer(
         on_frame=on_frame,
-        on_paste=on_paste,
-        esc_timeout=0.01,  # 10ms in seconds
+        esc_timeout=0.01,  # 10ms in seconds - matches upstream's default
         timer=timer,
     )
 
@@ -73,7 +68,6 @@ def buffer_setup():
         "buffer": buffer,
         "timer": timer,
         "emitted_sequences": emitted_sequences,
-        "emitted_paste": emitted_paste,
     }
 
 
@@ -555,70 +549,78 @@ class TestClear:
 
 
 class TestBracketedPaste:
-    """Test bracketed paste mode handling."""
+    """Test bracketed paste mode handling.
 
-    def test_emit_paste_event_for_complete_bracketed_paste(self, buffer_setup):
-        """Complete bracketed paste should emit paste event."""
+    Deviation from upstream (per the phase-3 plan, Task 3 Produces — a hard,
+    mandated contract, not a translation choice): upstream's
+    stdin-buffer.test.ts asserts pastes arrive on a *separate* ``"paste"``
+    event with the ``ESC[200~``/``ESC[201~`` markers already stripped. This
+    port instead delivers bracketed paste as a single frame through the
+    *same* ``on_frame`` channel as every other frame, with both markers
+    preserved in the frame text — downstream ``Editor.handle_input`` detects
+    a paste by scanning for those markers rather than via a second callback.
+    These tests assert that single-channel, marker-preserving contract
+    directly against ``emitted_sequences`` instead of upstream's
+    ``emitted_paste``.
+    """
+
+    PASTE_START = "\x1b[200~"
+    PASTE_END = "\x1b[201~"
+
+    def test_emit_complete_bracketed_paste_as_single_marker_wrapped_frame(self, buffer_setup):
+        """Complete bracketed paste should arrive as one on_frame call, markers intact."""
         buffer = buffer_setup["buffer"]
         emitted_sequences = buffer_setup["emitted_sequences"]
-        emitted_paste = buffer_setup["emitted_paste"]
 
-        paste_start = "\x1b[200~"
-        paste_end = "\x1b[201~"
         content = "hello world"
 
-        buffer.feed((paste_start + content + paste_end).encode())
+        buffer.feed((self.PASTE_START + content + self.PASTE_END).encode())
 
-        assert emitted_paste == ["hello world"]
-        assert emitted_sequences == []  # No data events during paste
+        assert emitted_sequences == [self.PASTE_START + content + self.PASTE_END]
 
-    def test_handle_paste_arriving_in_chunks(self, buffer_setup):
-        """Paste arriving in multiple chunks should complete."""
+    def test_handle_paste_arriving_in_chunks_still_one_frame(self, buffer_setup):
+        """Paste arriving in multiple feed() chunks should still collapse to one frame."""
         buffer = buffer_setup["buffer"]
         emitted_sequences = buffer_setup["emitted_sequences"]
-        emitted_paste = buffer_setup["emitted_paste"]
 
         buffer.feed(b"\x1b[200~")
-        assert emitted_paste == []
-
-        buffer.feed(b"hello ")
-        assert emitted_paste == []
-
-        buffer.feed(b"world\x1b[201~")
-        assert emitted_paste == ["hello world"]
         assert emitted_sequences == []
 
+        buffer.feed(b"hello ")
+        assert emitted_sequences == []
+
+        buffer.feed(b"world\x1b[201~")
+        assert emitted_sequences == [self.PASTE_START + "hello world" + self.PASTE_END]
+
     def test_handle_paste_with_input_before_and_after(self, buffer_setup):
-        """Paste with regular input before and after should emit separately."""
+        """Paste with regular input before and after should emit as three ordered frames."""
         buffer = buffer_setup["buffer"]
         emitted_sequences = buffer_setup["emitted_sequences"]
-        emitted_paste = buffer_setup["emitted_paste"]
 
         buffer.feed(b"a")
         buffer.feed(b"\x1b[200~pasted\x1b[201~")
         buffer.feed(b"b")
 
-        assert emitted_sequences == ["a", "b"]
-        assert emitted_paste == ["pasted"]
+        assert emitted_sequences == ["a", self.PASTE_START + "pasted" + self.PASTE_END, "b"]
 
     def test_handle_paste_with_newlines(self, buffer_setup):
-        """Paste content with newlines should be preserved."""
+        """Paste content with newlines should be preserved, markers intact, one frame."""
         buffer = buffer_setup["buffer"]
-        emitted_paste = buffer_setup["emitted_paste"]
+        emitted_sequences = buffer_setup["emitted_sequences"]
 
         buffer.feed(b"\x1b[200~line1\nline2\nline3\x1b[201~")
 
-        assert emitted_paste == ["line1\nline2\nline3"]
+        assert emitted_sequences == [self.PASTE_START + "line1\nline2\nline3" + self.PASTE_END]
 
     def test_handle_paste_with_unicode(self, buffer_setup):
-        """Paste content with unicode should be handled."""
+        """Paste content with unicode should be handled, markers intact, one frame."""
         buffer = buffer_setup["buffer"]
-        emitted_paste = buffer_setup["emitted_paste"]
+        emitted_sequences = buffer_setup["emitted_sequences"]
 
         content = "Hello 世界 🎉"
         buffer.feed((f"\x1b[200~{content}\x1b[201~").encode("utf-8"))
 
-        assert emitted_paste == [content]
+        assert emitted_sequences == [self.PASTE_START + content + self.PASTE_END]
 
 
 class TestDestroy:

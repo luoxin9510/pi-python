@@ -6,32 +6,38 @@ pass through immediately, complete escape sequences (CSI/OSC/DCS/APC/SS3/
 meta-key) are emitted whole, partial sequences are held until either more
 data completes them or an injectable timer fires (flushing whatever is
 buffered as a single frame), and bracketed-paste content
-(``ESC[200~`` … ``ESC[201~``) is delivered as one block via a dedicated
-``on_paste`` callback rather than split into per-character frames.
+(``ESC[200~`` … ``ESC[201~``) is delivered as **one single frame through the
+same ``on_frame`` channel**, with the ``ESC[200~``/``ESC[201~`` markers
+preserved in the frame content — there is no second callback. Downstream
+``Editor.handle_input`` (Task 11+) detects a paste by checking for those
+markers in the frame it receives from ``on_frame``.
 
-Interface (binding, per task-3 brief): ``StdinBuffer(on_frame, esc_timeout=0.05,
-timer=...)`` with ``feed(data: bytes) -> None``. The frozen RED test fixture
-(``tests/tui/engine/test_stdin_buffer.py``) additionally requires an
-``on_paste`` callback and a ``timer`` object shaped like the tests'
-``FakeTimer`` — ``schedule(delay_ms, callback) -> handle`` /
-``cancel(handle) -> None`` — rather than a bare callable as the brief's
-shorthand ("timer: Callable") suggested; this port follows the test
-contract as the source of truth for that shape (see the ``Timer`` protocol
-below) and falls back to a small asyncio-backed timer when none is
-injected.
+Interface (binding, per the phase-3 plan, Task 3 Produces): ``StdinBuffer(on_frame,
+esc_timeout=0.01, timer=...)`` with ``feed(data: bytes) -> None``. ``0.01``
+(10ms) matches upstream's default exactly (stdin-buffer.ts:284) — the plan's
+earlier ``0.05`` was a units slip in the original brief, corrected by the
+maintainer. The frozen RED test fixture (``tests/tui/engine/test_stdin_buffer.py``)
+requires a ``timer`` object shaped like the tests' ``FakeTimer`` —
+``schedule(delay_ms, callback) -> handle`` / ``cancel(handle) -> None`` —
+rather than a bare callable as an earlier brief's shorthand ("timer: Callable")
+suggested; this port follows the test contract as the source of truth for
+that shape (see the ``Timer`` protocol below) and falls back to a small
+asyncio-backed timer when none is injected.
 
 Deviations from upstream (declared per port convention):
 
-- Default ``esc_timeout`` is 0.05s (50ms), per the binding task-3 interface
-  spec — upstream's ``StdinBufferOptions.timeout`` defaults to 10ms
-  (stdin-buffer.ts:284). Same mechanism, different default; both are
-  overridable exactly as the tests do (``esc_timeout=0.01``).
-- ``on_paste`` is a separate constructor callback rather than a signal
-  upstream expresses via ``EventEmitter``'s ``"paste"`` event
-  (stdin-buffer.ts:265-268, 328, 362). If omitted, paste content is
-  delivered through ``on_frame`` instead of being silently dropped, so
-  bracketed paste is still surfaced as "one frame" even for callers that
-  only supply a single callback.
+- **Single-channel paste, markers preserved** — upstream emits bracketed-paste
+  content via a second ``EventEmitter`` channel, the ``"paste"`` event
+  (stdin-buffer.ts:265-268, 328, 362), with the ``ESC[200~``/``ESC[201~``
+  markers already stripped (``pasteBuffer.slice(0, endIndex)``,
+  stdin-buffer.ts:296-297, 331-332). This port instead re-wraps the
+  extracted content with both markers and emits it as a single frame through
+  ``on_frame`` — the same channel as every other frame. This is a deliberate,
+  plan-mandated deviation (phase3-pi-tui-port plan, Task 3 Produces): single
+  channel is a hard contract here, not an oversight, because the downstream
+  ``Editor`` (Task 11+) is designed to detect paste by scanning the frame
+  text for the markers rather than by having a second callback wired through
+  every layer between ``StdinBuffer`` and the editor component.
 - Each ``feed()`` chunk is decoded with ``errors="replace"``, mirroring
   Node's tolerant ``Buffer.toString("utf8")`` (which does not throw on
   incomplete multi-byte sequences split across chunks). Upstream never
@@ -258,20 +264,20 @@ class StdinBuffer:
     """Buffers stdin input and emits complete frames via ``on_frame``.
 
     Handles partial escape sequences that arrive across multiple ``feed()``
-    calls, and delivers bracketed-paste content as a single block via
-    ``on_paste`` (see the module docstring for the full port-convention
-    notes and declared deviations).
+    calls, and delivers bracketed-paste content as a single frame — with the
+    ``ESC[200~``/``ESC[201~`` markers preserved — through the same
+    ``on_frame`` channel as every other frame (see the module docstring for
+    the full port-convention notes and the declared single-channel
+    deviation from upstream).
     """
 
     def __init__(
         self,
         on_frame: Callable[[str], None],
-        on_paste: Callable[[str], None] | None = None,
-        esc_timeout: float = 0.05,
+        esc_timeout: float = 0.01,
         timer: Timer | None = None,
     ) -> None:
         self._on_frame = on_frame
-        self._on_paste = on_paste if on_paste is not None else on_frame
         self._esc_timeout = esc_timeout
         self._timer: Timer = timer if timer is not None else _AsyncioTimer()
 
@@ -336,7 +342,14 @@ class StdinBuffer:
 
     def _try_complete_paste(self) -> None:
         """Shared tail of the two paste-completion sites in ``process()``
-        (stdin-buffer.ts:319-333 and 353-367)."""
+        (stdin-buffer.ts:319-333 and 353-367).
+
+        Unlike upstream (which strips the markers and emits the bare content
+        on a separate ``"paste"`` event), this port re-wraps the extracted
+        content with both markers and emits it as a single frame through
+        ``on_frame`` — see the module docstring's "Single-channel paste,
+        markers preserved" deviation note.
+        """
         end_index = self._paste_buffer.find(BRACKETED_PASTE_END)
         if end_index == -1:
             return
@@ -348,7 +361,7 @@ class StdinBuffer:
         self._paste_buffer = ""
         self._pending_kitty_codepoint = None
 
-        self._on_paste(pasted_content)
+        self._on_frame(BRACKETED_PASTE_START + pasted_content + BRACKETED_PASTE_END)
 
         if len(remaining) > 0:
             self._process_str(remaining)
