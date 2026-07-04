@@ -1,7 +1,9 @@
 # pi-python 阶段三设计：pi-tui 差分渲染引擎架构级移植
 
 - 日期：2026-07-04
-- 状态：已由维护者逐段评审通过（5 段）
+- 状态：已由维护者逐段评审通过（5 段）；独立 subagent 审核后修订（rev 2：
+  select-list 入目标、native-modifiers 降级裁决、terminal_colors/term_caps/
+  editor_protocol 补入布局、markdown-it 三重坑显式化、CJK 词边界裁决）
 - 上游参考：`earendil-works/pi` `packages/tui`（28 文件 / 约 12,118 行 TS；基线同阶段一 `21cb3807` v0.80.3，本地对照仓库 `~/Developer/nukcole-pi`）
 - 前置：阶段一 SDK 与阶段二 inline TUI 已合入 main（PR #1、#7）
 
@@ -25,9 +27,13 @@
 3. **维护者手感对比验收**：同一任务在 pi 与 pipython 并排跑，逐项确认编辑手感
    /流式刷新/补全浮层/中文 IME 候选窗跟随/滚动历史，维护者点头才算完成。
 
-**非目标**：图片显示（terminal-image/image 组件，SDK 尚无多模态）、
-select-list/settings-list（现阶段无消费方）、主题系统（只做 pi 默认主题一套，
-样式表留注入位）、Windows 支持（POSIX only 不变）、备用屏模式。
+**非目标**：图片显示（terminal-image/image 组件整体，SDK 尚无多模态——但其中
+`hyperlink()`/`isImageLine()`/终端能力探测子集**必须**单独挖出，见 §3 的
+`term_caps.py`，markdown 渲染依赖它们）、settings-list 与 input 组件（无消费
+方；**select-list 除外**——它是 editor 补全下拉的本体，在目标内）、主题系统
+（只做 pi 默认主题一套，样式表留注入位；注意 §3 的 terminal_colors.py 是终端
+背景色/深浅探测，不属于主题系统）、Windows 支持（POSIX only 不变）、备用屏模
+式、macOS 原生修饰键探测（native-modifiers，见 §5 裁决）。
 
 ## 2. 移植策略（方案 A：忠实逐模块，"解析借库、渲染照搬"）
 
@@ -38,14 +44,14 @@ select-list/settings-list（现阶段无消费方）、主题系统（只做 pi 
 
 | 上游 | Python 替代 | 说明 |
 |---|---|---|
-| `marked`（CommonMark 解析） | `markdown-it-py` | 同为 CommonMark token 流，渲染层照抄 pi |
-| `get-east-asian-width` | `wcwidth` | 宽度数据 |
-| `Intl.Segmenter`（字素分割） | `regex` 模块 `\X` | pi 的字符分类正则照抄 |
+| `marked`（CommonMark 解析） | `markdown-it-py`（**gfm-like 预设**，需伴随 `linkify-it-py`） | 默认 commonmark 预设**不解析** GFM 表格/删除线（已实测），必须 gfm-like。token 形状不同：marked 是嵌套树、markdown-it 是扁平 open/close 流——渲染前需**扁平流→树重建适配层**；pi 的 StrictStrikethroughTokenizer 用 marked 子类覆写机制，Python 侧改用 ruler 插件等价实现。此两项是显式任务，不算"照抄"轻量活 |
+| `get-east-asian-width` | `wcwidth` | 宽度数据；pi utils.ts 的宽度分类正则（string-width 同款）照抄 |
+| `Intl.Segmenter`（字素/词分割） | 字素：`regex` 模块 `\X`；词边界：**无轻量等价**（见 §9 风险） | 上游是 JS 引擎内置 ICU，**无可抄源码**——按 UAX #29 语义重实现，金标准测试兜底 |
 | pi 自研 fuzzy.ts（137 行） | 直接移植 | **移除 rapidfuzz 依赖** |
 
-- `[tui]` extra 最终依赖：`markdown-it-py + wcwidth + regex + pathspec`（全部
-  钉精确版）；**prompt_toolkit、rich、rapidfuzz 移除**。核心 SDK 依赖不变
-  （litellm + pydantic）。
+- `[tui]` extra 最终依赖：`markdown-it-py + linkify-it-py + wcwidth + regex +
+  pathspec`（全部钉精确版）；**prompt_toolkit、rich、rapidfuzz 移除**。核心
+  SDK 依赖不变（litellm + pydantic）。
 - SDK 层零改动：引擎只消费 `pipython` 公开 API 的事件流。
 
 ## 3. 模块布局
@@ -62,9 +68,13 @@ src/pipython/tui/
 │   ├── fuzzy.py               #   模糊匹配                           (fuzzy.ts 137)
 │   ├── kill_ring.py           #   剪切环                             (kill-ring.ts)
 │   ├── undo_stack.py          #   撤销栈                             (undo-stack.ts)
-│   └── word_navigation.py     #   词级移动                           (word-navigation.ts 117)
+│   ├── word_navigation.py     #   词级移动                           (word-navigation.ts 117)
+│   ├── terminal_colors.py     #   OSC 11 背景色查询/深浅探测         (terminal-colors.ts 73；tui.ts 核心直接使用，非主题系统)
+│   ├── term_caps.py           #   hyperlink()/isImageLine()/能力子集 (从 terminal-image.ts 488 行中仅挖此三件；图片渲染仍是非目标)
+│   └── editor_protocol.py     #   可插拔编辑器 Protocol              (editor-component.ts 74；对齐三原则之"一切可注入")
 ├── components/
 │   ├── editor.py              #   多行编辑器（功能不阉割，见 §6）    (editor.ts 2307)
+│   ├── select_list.py         #   选择列表——editor 补全下拉的本体    (select-list.ts 229；editor.ts 直接 new SelectList)
 │   ├── markdown.py            #   markdown-it token → pi 风格 ANSI   (markdown.ts 858)
 │   ├── autocomplete.py        #   Provider 接口 + 浮层               (autocomplete.ts 786)
 │   ├── text.py                #   静态 ANSI 文本块                   (text.ts)
@@ -78,7 +88,9 @@ src/pipython/tui/
 ```
 
 删除：`render.py`（rich TurnRenderer）、旧 `keys.py`（pt bindings）及所有
-prompt_toolkit/rich 引用。
+prompt_toolkit/rich 引用。**执行时机见 §8——末位任务才删**，中途任何任务不得
+移除旧 TUI 文件。旧测试里依赖 rich 输出格式的历史回归断言（如 issue #4 的
+/tree dim 样式）须在新组件测试中建立等价覆盖后方可随旧码删除。
 
 ## 4. 引擎核心（engine/tui.py）
 
@@ -118,8 +130,15 @@ prompt_toolkit/rich 引用。
 
 **keys.py 子集边界**：
 - **移**：全部 legacy 序列；kitty CSI-u 基础+修饰键+ **flag 4 alternate keys**
-  （Shift+Enter/Ctrl+Enter 区分依赖它）；native-modifiers（macOS Option）。
+  （Shift+Enter/Ctrl+Enter 区分依赖它）。
 - **不移**：Node/浏览器环境特判、pi 未启用的协议标志。
+- **native-modifiers 裁决（不移，降级）**：上游 native-modifiers.ts 实为
+  darwin 预编译 `.node` 原生插件（轮询 macOS 物理修饰键，terminal.ts 用它在
+  Apple Terminal.app 消歧 Shift+Enter）。Python 复刻需引入 pyobjc 级新依赖，
+  违背依赖纪律。裁决：**不移植**——支持 kitty 协议的终端（iTerm2/kitty/
+  Ghostty/WezTerm）经 CSI-u 天然区分 Shift+Enter；Apple Terminal.app 上
+  Shift+Enter 不可区分，用户以 Alt+Enter / Ctrl+J 换行（各终端通用）。写入
+  README 已知限制。
 - 产出统一 `KeyEvent`；`keybindings.py` 映射到编辑器动作，默认 Emacs 键位与
   pi 一致。
 
@@ -129,12 +148,15 @@ prompt_toolkit/rich 引用。
 ## 6. 组件层与 pipython 接线
 
 **editor.py 功能不阉割**：多行编辑、字/词/行光标移动、kill-ring
-（Ctrl+K/Y/W）、undo 栈、输入历史、bracketed paste 整段插入、占位符、IME 光标
-钉扎、补全钩子。
+（Ctrl+K/Y/W）、undo 栈、输入历史、bracketed paste 整段插入、IME 光标钉扎、补
+全钩子（下拉渲染 = `select_list.py`，editor 直接持有 SelectList 实例，照上游
+结构）。（上游 editor 无占位符功能，不发明。）
 
-**markdown.py**：markdown-it-py token 流 → pi 的 ANSI 渲染规则逐条对齐（标题/
-列表/代码块底色/引用/表格）；链接 OSC-8（helper 在 engine/utils.py）；单一 pi
-默认主题，样式表留注入位。
+**markdown.py**：markdown-it-py（gfm-like 预设）token 流 → **扁平流→树重建适
+配层** → pi 的 ANSI 渲染规则逐条对齐（标题/列表/代码块底色/引用/表格——上游
+`renderTable` 吃嵌套树，适配层负责喂给它同构结构）；严格删除线用 ruler 插件等
+价实现 pi 的 StrictStrikethroughTokenizer；链接 OSC-8（helper 在
+engine/term_caps.py）；单一 pi 默认主题，样式表留注入位。
 
 **autocomplete.py**：Provider 接口 + overlay 浮层列表；`completers.py` 的文件
 列表/gitignore/斜杠命令逻辑包装成两个 Provider；模糊匹配用 engine/fuzzy.py。
@@ -176,8 +198,11 @@ Container
 
 | 风险 | 防线 |
 |---|---|
-| 终端兼容矩阵（Terminal.app/iTerm2/kitty/Ghostty 的 kitty 协议差异） | 能力协商+legacy 回退；验收在维护者实际终端过 |
-| 宽度/字素分歧（最大暗坑） | §7.3 金标准；pi 字符分类正则照抄 |
+| 终端兼容矩阵（Terminal.app/iTerm2/kitty/Ghostty 的 kitty 协议差异） | 能力协商+legacy 回退；验收在维护者实际终端过；Terminal.app 的 Shift+Enter 限制已裁决降级（§5） |
+| 宽度/字素分歧（最大暗坑） | §7.3 金标准；宽度分类正则照抄 string-width 同款；字素按 UAX #29 重实现 |
+| **词边界的 CJK 分词无轻量等价**（Intl.Segmenter word 粒度是 ICU 字典分词） | 裁决：CJK 下词级移动（Alt+F/B 等）按"连续 CJK 段视作一个词"简化，**允许与 pi 行为不同**；西文行为对齐 UAX #29。验收预期照此，写入 README 已知限制 |
+| tui.ts 差分/光标/resize 核心（约 500 行高分支密度，与 editor/keys 同级硬骨头） | 拆分为独立任务（差分算法、overlay 栈、resize/光标修正分开），不与 request_render 归并逻辑合并 |
+| editor/keys 体量（2307+1400 行）；**editor.test.ts 达 4051 行**，测试翻译本身是大活 | editor 拆多任务；测试翻译按行为域分批（编辑/光标/kill-ring/undo/粘贴/补全），每批随对应实现任务走 |
 | IME 光标钉扎难自动化 | 手动验收项，不装自动化 |
-| editor/keys 体量（2307+1400 行） | 任务拆分时 editor 单独成多任务；上游文件为规范性参考 |
 | asyncio stdin 洪泛（大粘贴） | stdin_buffer 切帧专测 bracketed paste 大块 |
+| markdown token 模型差异（marked 嵌套树 vs markdown-it 扁平流） | 适配层显式立项（§6）；gfm-like 预设+linkify-it-py 依赖已入 §2 |
