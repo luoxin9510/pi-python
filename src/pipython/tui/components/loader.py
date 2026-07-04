@@ -110,7 +110,24 @@ class Loader:
         single next ``tick()`` (re-armed from ``_on_timer`` below) rather
         than upstream's self-repeating ``setInterval`` — only when a running
         asyncio loop exists (module docstring deviation 2); single-or-fewer
-        frames never animate (loader.ts:74-76)."""
+        frames never animate (loader.ts:74-76).
+
+        Cancel-before-rearm (bugfix): upstream's ``restartAnimation()``
+        always calls ``this.stop()`` *before* arming a new interval
+        (loader.ts:73), so any previously pending timer is torn down first.
+        This port used to skip that step and just overwrite ``self._handle``
+        with the newly armed one — if ``start()`` was called twice in a row
+        (or ``_schedule_next`` was otherwise re-entered while a handle was
+        already pending), the first handle was orphaned: still live on the
+        real event loop, no longer reachable via ``self._handle`` for
+        ``stop()`` to cancel, so it fired at least once after ``stop()``.
+        Cancelling any existing handle here first — mirroring the upstream
+        stop-before-rearm order — means there is never more than one live
+        timer chain at a time, so ``stop()``'s single ``self._handle.cancel()``
+        always tears down everything pending."""
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
         if not self._running or len(self.frames) <= 1:
             return
         try:
