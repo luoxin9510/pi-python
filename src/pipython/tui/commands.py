@@ -6,10 +6,33 @@ contain message excerpts, and unknown-command handling echoes back arbitrary
 user input. rich's markup parser would silently swallow bracketed substrings
 in any of these if we built them as markup strings, so we route them through
 ``rich.Text`` (which never parses markup) instead.
+
+Task 16 addition — Sink dual-track (task-16-brief.md): every handler used to
+print straight to ``ctx.console``. The new-engine app loop (``app2.py``) has
+no ``rich.Console`` to print to (its transcript is a tree of ``Component``
+objects) — so ``CommandContext`` grows an optional ``sink: Sink | None``, and
+each handler now goes through ``out = ctx.sink or RichSink(ctx.console)``.
+``RichSink`` is the *literal* old behavior (a thin wrapper that still prints
+``rich.Text`` onto ``ctx.console``) — when ``ctx.sink`` is left at its
+default ``None``, every handler's output is byte-identical to before this
+change (verified by ``tests/tui/test_commands.py``, which is untouched).
+
+``_tree`` is the one handler that can't be expressed as a handful of
+``out.emit_text(...)`` calls either way: its rich path builds a real
+``rich.tree.Tree`` object (dim/bold-green styled, ``←`` leaf marker) and
+prints *that* — no ``Sink`` method takes a ``Tree``. So ``_tree`` branches
+explicitly: sink is ``None``/``RichSink`` → build and print the same
+``rich.tree.Tree`` as before (parity pinned by
+``tests/tui/test_commands_sink.py::test_tree_via_none_sink_still_uses_rich_tree_unchanged``);
+a real (non-``RichSink``) sink → a new pure-ANSI tree renderer
+(``_render_ansi_tree_lines``: ``├──``/``└──`` connectors, raw ANSI
+dim/bold-green SGR, ``←`` leaf marker) emitted as a list of lines via
+``out.emit_lines(...)``.
 """
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 from rich.console import Console
 from rich.text import Text
@@ -36,10 +59,40 @@ class AppState:
     should_quit: bool = False
 
 
+class Sink(Protocol):
+    """Output boundary for slash-command handlers (task-16-brief.md): the
+    new-engine app loop implements this over its component tree (appending
+    ``Text``/lines to the transcript ``Container``); ``RichSink`` (below)
+    implements it over a ``rich.Console`` for the legacy path."""
+
+    def emit_text(self, s: str, style: str = "") -> None: ...
+
+    def emit_lines(self, lines: list[str]) -> None: ...
+
+
+class RichSink:
+    """Default ``Sink``: prints straight to a ``rich.Console`` via
+    ``rich.Text`` (never markup — see module docstring). This is the exact
+    implementation ``ctx.sink is None`` falls back to
+    (``RichSink(ctx.console)``), so it *is* the pre-task-16 behavior, not a
+    reimplementation of it — parity is structural, not coincidental."""
+
+    def __init__(self, console: Console) -> None:
+        self.console = console
+
+    def emit_text(self, s: str, style: str = "") -> None:
+        self.console.print(Text(s, style=style))
+
+    def emit_lines(self, lines: list[str]) -> None:
+        for line in lines:
+            self.console.print(Text(line))
+
+
 @dataclass
 class CommandContext:
     console: Console
     app: AppState
+    sink: Sink | None = None
 
 
 @dataclass(frozen=True)
@@ -58,51 +111,110 @@ def _label(e) -> str:
     return f"{eid} {entry_type(e) or '?'}"
 
 
-async def _help(ctx: CommandContext, _: str) -> None:
-    for cmd in sorted(build_registry().values(), key=lambda c: c.name):
-        # Text：描述含 [litellm-id] 这类方括号，markup 拼接会被吞（复审实测）
-        ctx.console.print(Text(f"/{cmd.name:<8} {cmd.description}"))
+# =============================================================================
+# Pure-ANSI tree renderer (task-16): the ``_tree`` handler's real-sink path.
+# No canonical dim/bold-green ANSI convention existed anywhere in this port
+# before this task (task-9's ``Text.style`` is a raw pass-through string with
+# no fixed palette) — these are this module's own pick, plain SGR 2 (dim) and
+# SGR 1+32 (bold green), matching what ``tests/tui/test_commands_sink.py``'s
+# ``_looks_dim``/``_looks_bold_green`` tolerantly accept.
+# =============================================================================
+
+_ANSI_DIM = "\x1b[2m"
+_ANSI_BOLD_GREEN = "\x1b[1;32m"
+_ANSI_RESET = "\x1b[0m"
 
 
-async def _model(ctx: CommandContext, arg: str) -> None:
-    if arg:
-        ctx.app.session.set_model(arg)
-        ctx.console.print(Text(f"model → {arg}"))
-    else:
-        ctx.console.print(Text(f"model: {ctx.app.session.model}"))
-
-
-async def _clear(ctx: CommandContext, _: str) -> None:
-    ctx.app.session = await ctx.app.make_session()
-    ctx.console.rule("new session")
-
-
-async def _tree(ctx: CommandContext, _: str) -> None:
-    store = ctx.app.session.store
-    # 过滤 header：leaf 初始为 None，首条消息 parentId 也是 None，不滤则 header
-    # 会被渲染成根级兄弟节点（审核发现）
+def _render_ansi_tree_lines(store) -> list[str]:
+    """``├──``/``└──``-connector tree, one line per entry, styled dim
+    (off the current path) or bold-green (on it), with the leaf entry
+    suffixed ``" ←"`` — the pure-ANSI counterpart of the ``rich.tree.Tree``
+    the ``RichSink``/``sink=None`` path below still builds verbatim."""
     entries = [e for e in store.entries if entry_id(e) and not isinstance(e, SessionHeader)]
     on_path = {entry_id(e) for e in current_path(store.entries, store.leaf_id)}
     children: dict[str | None, list] = {}
     for e in entries:
         children.setdefault(entry_parent_id(e), []).append(e)
-    tree = Tree("session")
 
-    def attach(node, parent_id):
-        for e in children.get(parent_id, []):
+    lines = ["session"]
+
+    def walk(parent_id: str | None, prefix: str) -> None:
+        kids = children.get(parent_id, [])
+        for i, e in enumerate(kids):
             eid = entry_id(e)
+            is_last = i == len(kids) - 1
+            connector = "└── " if is_last else "├── "
             label = _label(e)
             if eid == store.leaf_id:
                 label += " ←"
-            style = "bold green" if eid in on_path else "dim"
-            # Text 不解析 markup——消息摘要常含方括号（审核实测会被吞）
-            attach(node.add(Text(label, style=style)), eid)
+            style = _ANSI_BOLD_GREEN if eid in on_path else _ANSI_DIM
+            lines.append(f"{prefix}{connector}{style}{label}{_ANSI_RESET}")
+            walk(eid, prefix + ("    " if is_last else "│   "))
 
-    attach(tree, None)
-    ctx.console.print(tree)
+    walk(None, "")
+    return lines
+
+
+async def _help(ctx: CommandContext, _: str) -> None:
+    out = ctx.sink or RichSink(ctx.console)
+    for cmd in sorted(build_registry().values(), key=lambda c: c.name):
+        # Text：描述含 [litellm-id] 这类方括号，markup 拼接会被吞（复审实测）
+        out.emit_text(f"/{cmd.name:<8} {cmd.description}")
+
+
+async def _model(ctx: CommandContext, arg: str) -> None:
+    out = ctx.sink or RichSink(ctx.console)
+    if arg:
+        ctx.app.session.set_model(arg)
+        out.emit_text(f"model → {arg}")
+    else:
+        out.emit_text(f"model: {ctx.app.session.model}")
+
+
+async def _clear(ctx: CommandContext, _: str) -> None:
+    ctx.app.session = await ctx.app.make_session()
+    out = ctx.sink or RichSink(ctx.console)
+    if isinstance(out, RichSink):
+        # console.rule() has no Sink equivalent (Sink is text/lines-only) —
+        # keep the exact legacy visual for the rich path.
+        out.console.rule("new session")
+    else:
+        out.emit_text("new session")
+
+
+async def _tree(ctx: CommandContext, _: str) -> None:
+    store = ctx.app.session.store
+    out = ctx.sink or RichSink(ctx.console)
+
+    if isinstance(out, RichSink):
+        # 过滤 header：leaf 初始为 None，首条消息 parentId 也是 None，不滤则 header
+        # 会被渲染成根级兄弟节点（审核发现）
+        entries = [e for e in store.entries if entry_id(e) and not isinstance(e, SessionHeader)]
+        on_path = {entry_id(e) for e in current_path(store.entries, store.leaf_id)}
+        children: dict[str | None, list] = {}
+        for e in entries:
+            children.setdefault(entry_parent_id(e), []).append(e)
+        tree = Tree("session")
+
+        def attach(node, parent_id):
+            for e in children.get(parent_id, []):
+                eid = entry_id(e)
+                label = _label(e)
+                if eid == store.leaf_id:
+                    label += " ←"
+                style = "bold green" if eid in on_path else "dim"
+                # Text 不解析 markup——消息摘要常含方括号（审核实测会被吞）
+                attach(node.add(Text(label, style=style)), eid)
+
+        attach(tree, None)
+        out.console.print(tree)
+        return
+
+    out.emit_lines(_render_ansi_tree_lines(store))
 
 
 async def _branch(ctx: CommandContext, arg: str) -> None:
+    out = ctx.sink or RichSink(ctx.console)
     prefix = arg.strip()
     store = ctx.app.session.store
     # 排除 header：header.id 也是合法字符串，前缀能唯一命中它，但它不在
@@ -113,12 +225,11 @@ async def _branch(ctx: CommandContext, arg: str) -> None:
     if len(matches) == 1:
         match = matches[0]
         ctx.app.session.branch(match)
-        # Text：match 是任意 id 前缀拼接，走模块的 Text-only 规则（复审裁定）
-        ctx.console.print(Text(f"branched to {match[:8]}"))
+        out.emit_text(f"branched to {match[:8]}")
     elif not matches:
-        ctx.console.print("[red]no match[/red]")
+        out.emit_text("no match", style="red")
     else:
-        ctx.console.print(f"[red]ambiguous prefix ({len(matches)} matches)[/red]")
+        out.emit_text(f"ambiguous prefix ({len(matches)} matches)", style="red")
 
 
 async def _quit(ctx: CommandContext, _: str) -> None:
@@ -141,6 +252,7 @@ async def dispatch(registry: dict[str, Command], ctx: CommandContext, line: str)
     name, _, arg = line[1:].partition(" ")
     cmd = registry.get(name)
     if cmd is None:
-        ctx.console.print(Text(f"unknown command /{name} — try /help", style="red"))
+        out = ctx.sink or RichSink(ctx.console)
+        out.emit_text(f"unknown command /{name} — try /help", style="red")
         return
     await cmd.handler(ctx, arg.strip())
