@@ -375,6 +375,95 @@ class TestPathProviderRealFsIntegration:
 
 
 # =============================================================================
+# PathProvider — bare-word Tab fallback (issue #16): a plain, non-"@"-
+# prefixed path fragment before the cursor must still complete when the
+# caller passes force=True (editor.py's explicit-Tab path,
+# ``_force_file_autocomplete(explicit_tab=True)`` -> ``_request_autocomplete
+# (force=True)`` -> provider.get_suggestions(..., force=True)). Before this
+# fix, ``get_suggestions`` accepted ``force`` but never read it: no ``@``
+# match meant an unconditional ``return [], ""``, silently swallowing every
+# bare-word Tab press.
+# =============================================================================
+
+
+class TestPathProviderBareWordForceFallback:
+    async def test_force_completes_bare_word_path_over_real_fs(self, tmp_path: Path) -> None:
+        """Real tmp_path tree + real ``build_file_list`` (git-less, so the
+        pathspec-walk fallback) — no mocked filesystem, per repo
+        convention."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "comp1.py").write_text("# c1\n")
+        (tmp_path / "src" / "comp2.py").write_text("# c2\n")
+        (tmp_path / "other.py").write_text("# other\n")
+
+        provider = PathProvider(lambda: build_file_list(tmp_path))
+
+        text = "src/comp"
+        items, prefix = await provider.get_suggestions([text], 0, len(text), force=True)
+
+        assert prefix == "src/comp", "bare-word prefix must never carry a leading '@'"
+        assert items, "must actually find the real files under tmp_path"
+        labels = [i.label for i in items]
+        assert all(label.startswith("src/comp") for label in labels)
+        assert {"src/comp1.py", "src/comp2.py"} <= set(labels)
+        assert all(not i.value.startswith("@") for i in items), (
+            "bare-word completion values must never insert an '@' the user never typed"
+        )
+
+    async def test_no_at_and_no_force_still_returns_nothing(self) -> None:
+        """A non-forced (debounced/natural) trigger must still require '@'
+        — the bare-word fallback only fires for an explicit force=True Tab
+        press, never for ordinary typing."""
+        provider = PathProvider(_files_fn(["src/comp1.py", "src/comp2.py"]))
+        text = "src/comp"
+        items, prefix = await provider.get_suggestions([text], 0, len(text), force=False)
+        assert (items, prefix) == ([], "")
+
+    async def test_at_prefix_still_wins_over_bare_word_even_when_forced(self) -> None:
+        """'@' takes priority: an explicit force=True Tab on text that DOES
+        contain a well-formed '@fragment' must still go through the
+        original '@' branch (value stays '@'-prefixed), never the bare-word
+        fallback."""
+        provider = PathProvider(_files_fn(["src/comp1.py"]))
+        text = "@src/comp"
+        items, prefix = await provider.get_suggestions([text], 0, len(text), force=True)
+        assert prefix == "@src/comp"
+        assert len(items) == 1
+        assert items[0].value == "@src/comp1.py"
+
+    def test_apply_completion_bare_word_round_trip_inserts_no_at_symbol(self) -> None:
+        """Full round-trip: get_suggestions(force=True) on a bare word, then
+        apply_completion with the winning item and prefix - the written-back
+        line must contain the completed path with no stray '@'."""
+        provider = PathProvider(_files_fn([]))  # file_list unused by apply_completion
+        item = AutocompleteItem(value="src/comp1.py", label="src/comp1.py")
+        lines = ["open src/comp"]
+        # cursor sits right after "comp" (index 13), bare-word prefix is
+        # "src/comp" (len 8, no leading '@' consumed)
+        new_lines, cursor_line, cursor_col = provider.apply_completion(
+            lines, 0, 13, item, "src/comp"
+        )
+        assert new_lines == ["open src/comp1.py "]
+        assert cursor_line == 0
+        assert cursor_col == len("open src/comp1.py ")
+
+    async def test_force_with_empty_bare_fragment_returns_no_suggestions(self) -> None:
+        """An empty bare-word fragment (cursor at start of an empty/blank
+        line) is treated as "nothing to complete" rather than listing every
+        file — deliberately narrower than upstream's ``extractPathPrefix``
+        (which always returns, even an empty, prefix for a forced
+        extraction): this port's provider contract has no ``None`` sentinel
+        (module docstring note 1), so an empty string prefix here would be
+        indistinguishable from "no match" to ``CombinedProvider`` (whose
+        trigger-priority check is a truthiness test on ``prefix``, design
+        note 6) - scoped out of this bugfix rather than silently
+        miscompiling that composition."""
+        provider = PathProvider(_files_fn(["readme.md"]))
+        items, prefix = await provider.get_suggestions(["   "], 0, 3, force=True)
+        assert (items, prefix) == ([], "")
+
+
+# =============================================================================
 # PathProvider — is_cancelled early-exit (design note 4: two checkpoints).
 # =============================================================================
 

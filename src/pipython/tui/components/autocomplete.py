@@ -11,7 +11,10 @@ be wired up to via ``set_autocomplete_provider``:
   unmodified ``AT_FRAGMENT_RE``), async-bridged to any ``build_file_list``-
   shaped ``file_list`` callable, ``engine.fuzzy.fuzzy_filter`` ordering,
   upstream-style (``autocomplete.ts:107-121`` ``buildCompletionValue``)
-  quoting for paths containing a space.
+  quoting for paths containing a space. **Issue #16 fix**: when no ``@``
+  matches but the caller passes ``force=True`` (editor.py's explicit-Tab
+  path), falls back to completing the bare non-whitespace word before the
+  cursor — the completion value is then never ``@``-prefixed.
 - ``CommandProvider`` — ``/`` trigger, reusing ``completers.py``'s
   ``PiCompleter.get_completions`` guard verbatim (single-line buffer
   starting with ``/``), sorted prefix filtering.
@@ -26,6 +29,7 @@ checkpoints, trigger priority).
 
 from __future__ import annotations
 
+import re
 from typing import Awaitable, Callable
 
 from pipython.tui.completers import AT_FRAGMENT_RE
@@ -35,15 +39,29 @@ from .editor import AutocompleteItem, AutocompleteProvider
 
 __all__ = ["CombinedProvider", "CommandProvider", "PathProvider"]
 
+# Bare-word fallback fragment: the longest run of non-whitespace characters
+# immediately before the cursor (issue #16 — force-Tab on a typed-out path
+# like "src/comp", with no leading "@", used to silently return nothing;
+# see PathProvider.get_suggestions below). Deliberately simpler than
+# upstream's ``extractPathPrefix``/``findLastDelimiter`` (which also treats
+# quotes/"="/tabs as delimiters and special-cases "~/"): this only needs to
+# cover the reported bug's shape (a plain relative/absolute path token), not
+# reproduce every upstream delimiter nuance.
+_BARE_WORD_RE = re.compile(r"(\S*)$")
 
-def _quote_if_needed(path: str) -> str:
+
+def _quote_if_needed(path: str, *, at_prefix: bool = True) -> str:
     """autocomplete.ts:107-121 ``buildCompletionValue``, narrowed to this
     port's file-only (never-a-directory) ``file_list`` shape: quote iff the
-    path contains a space, always ``@``-prefixed (this provider's trigger is
-    always ``@``, so ``isAtPrefix`` is always true here)."""
+    path contains a space. ``at_prefix`` controls whether the completion
+    value is ``@``-prefixed — true for the ``@fragment`` trigger (this
+    provider's original, only path until issue #16), false for the bare-word
+    Tab fallback, which must never insert a literal "@" the user never
+    typed."""
+    prefix = "@" if at_prefix else ""
     if " " in path:
-        return f'@"{path}"'
-    return f"@{path}"
+        return f'{prefix}"{path}"'
+    return f"{prefix}{path}"
 
 
 class PathProvider:
@@ -66,11 +84,26 @@ class PathProvider:
     ) -> tuple[list[AutocompleteItem], str]:
         text = lines[cursor_line][:cursor_col]
         match = AT_FRAGMENT_RE.search(text)
-        if not match:
+        at_prefix = True
+        if match:
+            prefix = match.group(0)
+            fragment = match.group(1)
+        elif force:
+            # issue #16: bare-word Tab (no "@") must still complete a file
+            # path — fall back to the longest non-whitespace run before the
+            # cursor as the fragment, only when the caller explicitly forced
+            # completion (editor.py's explicit-Tab path,
+            # ``_force_file_autocomplete(explicit_tab=True)``); a natural
+            # (debounced) trigger still requires "@", matching
+            # ``AT_FRAGMENT_RE``'s existing behavior above.
+            bare_match = _BARE_WORD_RE.search(text)
+            fragment = bare_match.group(1) if bare_match else ""
+            if not fragment:
+                return [], ""
+            prefix = fragment
+            at_prefix = False
+        else:
             return [], ""
-
-        prefix = match.group(0)
-        fragment = match.group(1)
 
         # Checkpoint 1 (design note 4): never even start the (possibly
         # slow) file_list() fetch for an already-stale request.
@@ -85,7 +118,10 @@ class PathProvider:
             return [], ""
 
         candidates = fuzzy_filter(fragment, files)
-        items = [AutocompleteItem(value=_quote_if_needed(path), label=path) for path in candidates]
+        items = [
+            AutocompleteItem(value=_quote_if_needed(path, at_prefix=at_prefix), label=path)
+            for path in candidates
+        ]
         return items, prefix
 
     def apply_completion(
