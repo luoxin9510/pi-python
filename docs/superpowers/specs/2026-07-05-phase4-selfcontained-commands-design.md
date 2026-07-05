@@ -72,7 +72,10 @@ action` 行），经 `ctx.sink.emit_lines`。
   aborted 判断）。无 assistant 或拼出空 → `emit_text("No agent messages to copy
   yet.", 红)`。
 - 剪贴板 util（`src/pipython/tui/components/clipboard.py`，零新依赖）：`copy_to_clipboard(text)
-  -> None`，按平台探测——macOS `pbcopy`、Wayland `wl-copy`、X11 `xclip -selection clipboard`
+  -> str`（**返回实际所用方法名** `"pbcopy"`/`"wl-copy"`/`"xclip"`/`"xsel"`/`"osc52"`，供
+  调用方/测试断言走了哪条路；rev-1 曾写 `-> None`，改为返回方法名纯为可测性，不影响 `/copy`
+  的用法——`/copy` 忽略返回值只捕获异常），按平台探测——macOS `pbcopy`、Wayland `wl-copy`、
+  X11 `xclip -selection clipboard`
   /`xsel`；`subprocess` 管道写入。**OSC 52 远程兜底（对齐上游 clipboard.ts）**：检测到
   远程会话（`SSH_CONNECTION`/`SSH_TTY`/`MOSH_CONNECTION` 环境变量）或本地工具全不可用
   时，退到写 OSC 52 序列（`\x1b]52;c;<base64(text)>\x07` 到 stdout，纯 stdlib base64）

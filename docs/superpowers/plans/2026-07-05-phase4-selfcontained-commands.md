@@ -37,7 +37,7 @@
 
 **Interfaces:**
 - Consumes: 无
-- Produces: `copy_to_clipboard(text: str) -> str`——把 text 送到剪贴板，返回用的方法名（`"pbcopy"`/`"wl-copy"`/`"xclip"`/`"xsel"`/`"osc52"`，供调用方/测试断言）。全部路径失败 raise `ClipboardError`。远程会话（`SSH_CONNECTION`/`SSH_TTY`/`MOSH_CONNECTION` 任一非空）或本地工具全不可用 → OSC 52（`\x1b]52;c;<base64(utf-8)>\x07` 写 `sys.stdout` 并 flush）。
+- Produces: `copy_to_clipboard(text: str) -> str`——把 text 送到剪贴板，返回用的方法名（`"pbcopy"`/`"wl-copy"`/`"xclip"`/`"xsel"`/`"osc52"`，供调用方/测试断言）。**声明偏离**：spec rev-1 曾写 `-> None`，改为返回方法名纯为可测性（`/copy` 忽略返回值只捕异常，用法不变）；spec §3.3 已同步更正为 `-> str`。全部路径失败 raise `ClipboardError`。远程会话（`SSH_CONNECTION`/`SSH_TTY`/`MOSH_CONNECTION` 任一非空）或本地工具全不可用 → OSC 52（`\x1b]52;c;<base64(utf-8)>\x07` 写 `sys.stdout` 并 flush）。
 
 - [ ] **Step 1: [TEST]** `tests/tui/components/test_clipboard.py`
 
@@ -77,6 +77,7 @@ def test_macos_uses_pbcopy(monkeypatch):
 def test_linux_wayland_uses_wl_copy(monkeypatch):
     _clear_remote(monkeypatch)
     monkeypatch.setattr(clipboard.sys, "platform", "linux")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")  # _local_tools gates wl-copy on this
     monkeypatch.setattr(clipboard, "_which", lambda name: name == "wl-copy")
     ran = {}
     monkeypatch.setattr(
@@ -87,15 +88,31 @@ def test_linux_wayland_uses_wl_copy(monkeypatch):
     assert ran["cmd"][0] == "wl-copy"
 
 
-def test_linux_x11_falls_to_xclip_then_xsel(monkeypatch):
+def test_linux_x11_uses_xclip_first(monkeypatch):
     _clear_remote(monkeypatch)
     monkeypatch.setattr(clipboard.sys, "platform", "linux")
-    monkeypatch.setattr(clipboard, "_which", lambda name: name in ("xclip",))
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)  # force X11 branch (no wl-copy)
+    monkeypatch.setattr(clipboard, "_which", lambda name: name in ("xclip", "xsel"))
     monkeypatch.setattr(
         clipboard.subprocess, "run",
         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0),
     )
     assert copy_to_clipboard("x") == "xclip"
+
+
+def test_linux_x11_falls_to_xsel_when_xclip_fails(monkeypatch):
+    _clear_remote(monkeypatch)
+    monkeypatch.setattr(clipboard.sys, "platform", "linux")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(clipboard, "_which", lambda name: name in ("xclip", "xsel"))
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "xclip":
+            raise subprocess.CalledProcessError(1, cmd)  # xclip present but errors
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(clipboard.subprocess, "run", fake_run)
+    assert copy_to_clipboard("x") == "xsel"
 
 
 def test_remote_session_uses_osc52(monkeypatch, capsys):
@@ -147,7 +164,7 @@ import shutil
 import subprocess
 import sys
 
-_OSC52_MAX = 100_000  # upstream caps OSC 52 payload; skip if larger
+_OSC52_MAX = 100_000  # cap payload: very large clipboards can hang some terminals over OSC 52
 
 
 class ClipboardError(Exception):
@@ -217,11 +234,19 @@ def copy_to_clipboard(text: str) -> str:
 
 - [ ] **Step 1: [TEST]** `tests/tui/test_commands_selfcontained.py`
 
-```python
-import pytest
+> 关键：**不造 duck-typed 假 app/session**（`CommandContext.app` 标注为具体类 `AppState`，喂 duck-typed 对象会 pyright 报 `reportArgumentType` 挂四道门）。照 `tests/tui/test_commands.py` 的既有约定，用**真实 `AppState` + `create_agent_session` + `FakeClient`** 构造 session，真实 `store.append` 手工铺 entry（真写 tmp JSONL，非 mock）。分支感知测试构造「物理最后一条 assistant 离开当前路径」的场景——若实现误用 `store.entries` 物理序而非 `current_path`，这些测试会失败。
 
+```python
+from pipython import (
+    AgentSessionConfig,
+    MessageEntry,
+    create_agent_session,
+)
+from pipython.session import ids
+from pipython.testing import FakeClient
 from pipython.tui import commands
 from pipython.tui.commands import (
+    AppState,
     CommandContext,
     _changelog,
     _copy,
@@ -233,56 +258,45 @@ from pipython.tui.commands import (
 )
 
 
-class _Sink:
-    def __init__(self):
-        self.lines: list[str] = []
+class RecordingSink:
+    def __init__(self) -> None:
+        self.texts: list[tuple[str, str]] = []
+        self.lines: list[list[str]] = []
 
-    def emit_text(self, s, style=""):
-        self.lines.append(s)
+    def emit_text(self, s: str, style: str = "") -> None:
+        self.texts.append((s, style))
 
-    def emit_lines(self, lines):
-        self.lines.extend(lines)
+    def emit_lines(self, lines: list[str]) -> None:
+        self.lines.append(list(lines))
 
-
-class _Store:
-    def __init__(self, entries, leaf_id):
-        self.entries = entries
-        self.leaf_id = leaf_id
-
-
-class _Session:
-    def __init__(self, entries, leaf_id, model="fake/model"):
-        self.store = _Store(entries, leaf_id)
-        self.model = model
+    def flat_text(self) -> str:
+        parts = [s for s, _ in self.texts]
+        for group in self.lines:
+            parts.extend(group)
+        return "\n".join(parts)
 
 
-class _App:
-    def __init__(self, session):
-        self.session = session
-        self._made = None
+async def make_ctx(tmp_path, *, sink=None, script=None) -> CommandContext:
+    async def factory():
+        return await create_agent_session(
+            AgentSessionConfig(
+                model="fake",
+                cwd=tmp_path,
+                session_dir=tmp_path / "s",
+                client=FakeClient(script=script or []),
+            )
+        )
 
-    async def make_session(self):
-        self._made = _Session([], None)
-        return self._made
-
-
-def _ctx(session):
-    return CommandContext(app=_App(session), sink=_Sink())
-
-
-# MessageEntry-like stub: has .type and .message dict; entry_id via .id
-class _E:
-    def __init__(self, eid, parent, message):
-        from pipython import MessageEntry  # real type for isinstance in handlers
-
-        self._m = MessageEntry(id=eid, parent_id=parent, timestamp="t", message=message)
-        self.id = eid
-
-    def __getattr__(self, k):
-        return getattr(self._m, k)
+    session = await factory()
+    return CommandContext(app=AppState(session=session, make_session=factory), sink=sink or RecordingSink())
 
 
-def _asst(eid, parent, text=None, tool=False, usage=None):
+def _append(store, eid, parent, message) -> None:
+    """Append a hand-built entry to the REAL store (writes real JSONL; sets leaf_id=eid)."""
+    store.append(MessageEntry(id=eid, parent_id=parent, timestamp=ids.iso_now(), message=message))
+
+
+def _asst_msg(text=None, *, tool=False, usage=None) -> dict:
     content = []
     if text is not None:
         content.append({"type": "text", "text": text})
@@ -291,18 +305,10 @@ def _asst(eid, parent, text=None, tool=False, usage=None):
     msg = {"role": "assistant", "content": content}
     if usage is not None:
         msg["usage"] = usage
-    from pipython import MessageEntry
-
-    return MessageEntry(id=eid, parent_id=parent, timestamp="t", message=msg)
+    return msg
 
 
-def _user(eid, parent, text):
-    from pipython import MessageEntry
-
-    return MessageEntry(id=eid, parent_id=parent, timestamp="t", message={"role": "user", "content": text})
-
-
-# --- _format_key ---
+# --- _format_key (pure) ---
 
 def test_format_key_capitalizes_and_joins():
     assert _format_key("ctrl+b") == "Ctrl+B"
@@ -310,86 +316,146 @@ def test_format_key_capitalizes_and_joins():
     assert _format_key("enter") == "Enter"
 
 
+def test_format_key_camelcase_preserved():
+    # .capitalize() would wrongly yield "Pageup"; must keep interior caps
+    assert _format_key("pageUp") == "PageUp"
+
+
+def test_format_key_macos_option(monkeypatch):
+    monkeypatch.setattr(commands.sys, "platform", "darwin")
+    assert _format_key("alt+b") == "Option+B"
+
+
+def test_format_key_non_macos_alt(monkeypatch):
+    monkeypatch.setattr(commands.sys, "platform", "linux")
+    assert _format_key("alt+b") == "Alt+B"
+
+
 # --- /hotkeys ---
 
-async def test_hotkeys_lists_key_help():
-    ctx = _ctx(_Session([], None))
+async def test_hotkeys_lists_key_help(tmp_path):
+    ctx = await make_ctx(tmp_path)
     await _hotkeys(ctx, "")
-    joined = "\n".join(ctx.sink.lines)
-    assert "Ctrl+B" in joined or "Left" in joined  # cursor movement rendered, formatted
+    joined = ctx.sink.flat_text()
+    assert "Navigation" in joined
+    assert "History" in joined  # history nav is implemented (editor cursorUp/Down)
+    assert "Completion" in joined  # autocomplete is implemented (tui.select.*)
+    assert "Ctrl+B" in joined or "Left" in joined  # formatted cursor keys
     assert "Ctrl+O" in joined  # app.tools.expand in-table
+    assert "Ctrl+C" in joined and "Ctrl+D" in joined  # hardcoded app-level bytes
 
 
 # --- /new ---
 
-async def test_new_swaps_session():
-    ctx = _ctx(_Session([_user("a", None, "hi")], "a"))
+async def test_new_swaps_session(tmp_path):
+    ctx = await make_ctx(tmp_path)
     old = ctx.app.session
     await _new(ctx, "")
     assert ctx.app.session is not old
+    assert "new session" in ctx.sink.flat_text()
 
 
 # --- /copy ---
 
-async def test_copy_takes_last_assistant_text_on_current_path(monkeypatch):
-    entries = [
-        _user("u1", None, "hi"),
-        _asst("a1", "u1", text="first answer", usage={"inputTokens": 1, "outputTokens": 1, "cost": 0.0}),
-        _user("u2", "a1", "more"),
-        _asst("a2", "u2", text="second answer", usage={"inputTokens": 1, "outputTokens": 1, "cost": 0.0}),
-    ]
-    ctx = _ctx(_Session(entries, "a2"))
+async def test_copy_takes_last_assistant_text_on_path(tmp_path, monkeypatch):
+    ctx = await make_ctx(tmp_path)
+    store = ctx.app.session.store
+    _append(store, "u1", None, {"role": "user", "content": "hi"})
+    _append(store, "a1", "u1", _asst_msg("first answer"))
+    _append(store, "u2", "a1", {"role": "user", "content": "more"})
+    _append(store, "a2", "u2", _asst_msg("second answer"))
     got = {}
     monkeypatch.setattr(commands, "copy_to_clipboard", lambda t: got.setdefault("text", t) or "pbcopy")
     await _copy(ctx, "")
     assert got["text"] == "second answer"
-    assert any("Copied" in x for x in ctx.sink.lines)
+    assert "Copied" in ctx.sink.flat_text()
 
 
-async def test_copy_no_assistant_message(monkeypatch):
-    ctx = _ctx(_Session([_user("u1", None, "hi")], "u1"))
+async def test_copy_is_branch_aware(tmp_path, monkeypatch):
+    # a2 ("second") is physically last but OFF the current path; leaf → a1 ("first").
+    ctx = await make_ctx(tmp_path)
+    store = ctx.app.session.store
+    _append(store, "u1", None, {"role": "user", "content": "hi"})
+    _append(store, "a1", "u1", _asst_msg("first answer"))
+    _append(store, "u2", "a1", {"role": "user", "content": "more"})
+    _append(store, "a2", "u2", _asst_msg("second answer"))
+    store.leaf_id = "a1"  # branch back — current path is now [u1, a1]
+    got = {}
+    monkeypatch.setattr(commands, "copy_to_clipboard", lambda t: got.setdefault("text", t) or "pbcopy")
+    await _copy(ctx, "")
+    assert got["text"] == "first answer"  # on-path, NOT physical-last "second answer"
+
+
+async def test_copy_no_assistant_message(tmp_path, monkeypatch):
+    ctx = await make_ctx(tmp_path)
+    _append(ctx.app.session.store, "u1", None, {"role": "user", "content": "hi"})
     monkeypatch.setattr(commands, "copy_to_clipboard", lambda t: "pbcopy")
     await _copy(ctx, "")
-    assert any("No agent messages" in x for x in ctx.sink.lines)
+    assert "No agent messages" in ctx.sink.flat_text()
 
 
-async def test_copy_pure_toolcall_is_no_message(monkeypatch):
-    entries = [_user("u", None, "x"), _asst("a", "u", text=None, tool=True)]
-    ctx = _ctx(_Session(entries, "a"))
+async def test_copy_pure_toolcall_is_no_message(tmp_path, monkeypatch):
+    ctx = await make_ctx(tmp_path)
+    store = ctx.app.session.store
+    _append(store, "u1", None, {"role": "user", "content": "x"})
+    _append(store, "a1", "u1", _asst_msg(text=None, tool=True))  # toolCall only, no text
     monkeypatch.setattr(commands, "copy_to_clipboard", lambda t: "pbcopy")
     await _copy(ctx, "")
-    assert any("No agent messages" in x for x in ctx.sink.lines)
+    assert "No agent messages" in ctx.sink.flat_text()
 
 
 # --- /session ---
 
-async def test_session_stats():
-    entries = [
-        _user("u1", None, "hi"),
-        _asst("a1", "u1", text="hi", tool=True, usage={"inputTokens": 100, "outputTokens": 20, "cost": 0.01}),
-        _user("u2", "a1", "again"),
-        _asst("a2", "u2", text="ok", usage={"inputTokens": 50, "outputTokens": 10, "cost": 0.005}),
-    ]
-    ctx = _ctx(_Session(entries, "a2"))
+async def test_session_stats(tmp_path):
+    ctx = await make_ctx(tmp_path)
+    store = ctx.app.session.store
+    _append(store, "u1", None, {"role": "user", "content": "hi"})
+    _append(store, "a1", "u1", _asst_msg("hi", tool=True, usage={"inputTokens": 100, "outputTokens": 20, "cost": 0.01}))
+    _append(store, "u2", "a1", {"role": "user", "content": "again"})
+    _append(store, "a2", "u2", _asst_msg("ok", usage={"inputTokens": 50, "outputTokens": 10, "cost": 0.005}))
     await _session(ctx, "")
-    joined = "\n".join(ctx.sink.lines)
-    assert "2" in joined  # 2 user, 2 assistant
-    assert "150" in joined or "↑" in joined  # tokens accumulated
-    assert "1" in joined  # 1 tool call
+    joined = ctx.sink.flat_text()
+    assert "2 user, 2 assistant" in joined
+    assert "Tool calls: 1" in joined
+    assert "↑150 ↓30" in joined
+    assert "$0.0150" in joined
+    assert "fake" in joined  # model line
 
 
-async def test_session_empty():
-    ctx = _ctx(_Session([], None))
+async def test_session_counts_toolresult(tmp_path):
+    ctx = await make_ctx(tmp_path)
+    store = ctx.app.session.store
+    _append(store, "u1", None, {"role": "user", "content": "hi"})
+    _append(store, "a1", "u1", _asst_msg("run", tool=True))
+    _append(store, "t1", "a1", {"role": "toolResult", "content": "output"})
     await _session(ctx, "")
-    assert ctx.sink.lines  # renders without crash
+    assert "1 tool result" in ctx.sink.flat_text()
+
+
+async def test_session_is_branch_aware(tmp_path):
+    ctx = await make_ctx(tmp_path)
+    store = ctx.app.session.store
+    _append(store, "u1", None, {"role": "user", "content": "hi"})
+    _append(store, "a1", "u1", _asst_msg("first"))
+    _append(store, "u2", "a1", {"role": "user", "content": "more"})
+    _append(store, "a2", "u2", _asst_msg("second"))
+    store.leaf_id = "a1"  # off-path: u2/a2 excluded; current path [u1, a1]
+    await _session(ctx, "")
+    assert "1 user, 1 assistant" in ctx.sink.flat_text()
+
+
+async def test_session_empty(tmp_path):
+    ctx = await make_ctx(tmp_path)
+    await _session(ctx, "")
+    assert ctx.sink.flat_text()  # renders without crash (empty session → all zero)
 
 
 # --- /changelog ---
 
-async def test_changelog_shows_version_and_repo():
-    ctx = _ctx(_Session([], None))
+async def test_changelog_shows_version_and_repo(tmp_path):
+    ctx = await make_ctx(tmp_path)
     await _changelog(ctx, "")
-    joined = "\n".join(ctx.sink.lines)
+    joined = ctx.sink.flat_text()
     from pipython import __version__
 
     assert __version__ in joined
@@ -406,19 +472,24 @@ def test_registry_has_11_commands():
     assert len(reg) == 11
 ```
 
+> `pyproject.toml` 已 `asyncio_mode = "auto"`（已核实，line 36；既有 async 测试同款），无需 `@pytest.mark.asyncio`。导入位置（已实证）：`AgentSessionConfig`/`create_agent_session`/`MessageEntry` 从 `pipython` 顶层；**`AppState`/`CommandContext` 从 `pipython.tui.commands`**（`AppState` 未在 `pipython.__init__` 导出，同 `test_commands.py` 的导入方式）；`ids` 从 `pipython.session`（`ids.iso_now()`/`ids.new_entry_id()`）；`FakeClient` 从 `pipython.testing`（被 `make_ctx` 的 factory 闭包引用，非未使用）。entry 全部手工构造，不走 FakeClient 脚本，故不导入 `AssistantMessage/TextContent/Usage`（避免 ruff F401）。已跑通验证：full path=2u/2a、branch 回 a1 后 path=1u/1a、`session.model=='fake'`。
+
 - [ ] **Step 2: 确认失败** → FAIL (ImportError on new symbols)
-- [ ] **Step 3: [PORT] 实现** —— 加进 `src/pipython/tui/commands.py`（handler 放在 `_quit` 之后、`build_registry` 之前；顶部 import 加 `from pipython import __version__`、`from pipython.tui.components.clipboard import ClipboardError, copy_to_clipboard`、`from pipython.tui.engine.keybindings import DEFAULT_EDITOR_BINDINGS`）：
+- [ ] **Step 3: [PORT] 实现** —— 加进 `src/pipython/tui/commands.py`（handler 放在 `_quit` 之后、`build_registry` 之前；顶部 import 加：stdlib `import sys`（供 `_format_key` 的 macOS 判定）；`from pipython import __version__`；`from pipython.tui.components.clipboard import ClipboardError, copy_to_clipboard`；`from pipython.tui.engine.keybindings import DEFAULT_EDITOR_BINDINGS`。若 `commands.py` 顶部已有 `import sys` 则勿重复）：
 
 ```python
 def _format_key(key: "str | list[str]") -> str:
+    def cap(p: str) -> str:
+        # NOT str.capitalize() — that lowercases the tail ("pageUp" → "Pageup").
+        return p[:1].upper() + p[1:] if p else p
+
     def fmt(k: str) -> str:
-        parts = k.split("+")
         out = []
-        for p in parts:
-            if p == "alt" and __import__("sys").platform == "darwin":
+        for p in k.split("+"):
+            if p == "alt" and sys.platform == "darwin":
                 out.append("Option")
             else:
-                out.append(p.capitalize())
+                out.append(cap(p))
         return "+".join(out)
 
     if isinstance(key, list):
@@ -426,7 +497,9 @@ def _format_key(key: "str | list[str]") -> str:
     return fmt(key)
 
 
-# /hotkeys grouping: (section title, [(action, label)]) mirroring upstream
+# /hotkeys grouping: (section title, [(action, label)]) — hand-grouped per
+# upstream handleHotkeysCommand (Navigation/Editing/History/Completion/Other).
+# Every action referenced here is verified present in DEFAULT_EDITOR_BINDINGS.
 _HOTKEY_SECTIONS = [
     ("Navigation", [
         ("tui.editor.cursorLeft", "Move left"),
@@ -449,6 +522,20 @@ _HOTKEY_SECTIONS = [
         ("tui.editor.yankPop", "Yank pop"),
         ("tui.editor.undo", "Undo"),
     ]),
+    # Up/Down navigate prompt history when the editor is empty / at the first
+    # or last visual line (editor.py _navigate_history reuses cursorUp/Down).
+    ("History", [
+        ("tui.editor.cursorUp", "Previous prompt (at first line)"),
+        ("tui.editor.cursorDown", "Next prompt (in history)"),
+    ]),
+    # Autocomplete overlay keys (editor.py consumes these via kb.matches).
+    ("Completion", [
+        ("tui.input.tab", "Trigger / apply completion"),
+        ("tui.select.up", "Select previous"),
+        ("tui.select.down", "Select next"),
+        ("tui.select.confirm", "Confirm selection"),
+        ("tui.select.cancel", "Cancel completion"),
+    ]),
     ("Other", [
         ("app.tools.expand", "Expand/collapse tool output"),
     ]),
@@ -456,25 +543,26 @@ _HOTKEY_SECTIONS = [
 
 
 async def _hotkeys(ctx: CommandContext, _: str) -> None:
+    # `\x1b[1m…\x1b[0m` (full reset) matches this module's _tree ANSI convention.
     lines: list[str] = []
     for title, rows in _HOTKEY_SECTIONS:
-        lines.append(f"\x1b[1m{title}\x1b[22m")
+        lines.append(f"\x1b[1m{title}\x1b[0m")
         for action, label in rows:
             key = DEFAULT_EDITOR_BINDINGS.get(action)
             if key is None:
                 continue
             lines.append(f"  {_format_key(key):<24} {label}")
         lines.append("")
-    # app-level bytes not in the bindings table:
-    lines.append("\x1b[1mSession\x1b[22m")
+    # app-level bytes not in the bindings table (app.py _on_stdin_frame):
+    lines.append("\x1b[1mSession\x1b[0m")
     lines.append(f"  {'Ctrl+C':<24} Interrupt turn / clear input")
     lines.append(f"  {'Ctrl+D':<24} Exit (empty prompt)")
     ctx.sink.emit_lines(lines)
 
 
 async def _new(ctx: CommandContext, _: str) -> None:
-    ctx.app.session = await ctx.app.make_session()
-    ctx.sink.emit_text("new session")
+    # Upstream /new calls handleClearCommand — delegate to keep them identical.
+    await _clear(ctx, _)
 
 
 def _last_assistant_text(session) -> str | None:
@@ -528,7 +616,7 @@ async def _session(ctx: CommandContext, _: str) -> None:
             if cst:
                 cost += cst
     ctx.sink.emit_lines([
-        "\x1b[1mSession Info\x1b[22m",
+        "\x1b[1mSession Info\x1b[0m",
         f"  Messages:   {users} user, {assts} assistant, {tools_res} tool result",
         f"  Tool calls: {tool_calls}",
         f"  Tokens:     ↑{tin} ↓{tout}",
@@ -565,10 +653,10 @@ async def _changelog(ctx: CommandContext, _: str) -> None:
 
 ## 验收核对清单（对照 spec rev 2）
 
-- [ ] §3.1 /hotkeys：action→key 方向 + _format_key（Ctrl+B）+ Ctrl+O 在表 + Ctrl+C/D 硬编码 → Task 2
-- [ ] §3.2 /new == /clear 语义 → Task 2
-- [ ] §3.3 /copy：current_path 分支感知 + 单条目语义（空→无消息）+ 剪贴板 util → Task 1 + Task 2
-- [ ] §3.4 /session：current_path 统计 + 空会话不崩 → Task 2
+- [ ] §3.1 /hotkeys：action→key 方向 + _format_key（Ctrl+B，camelCase 保留 PageUp）+ 导航/编辑/**历史/补全**四组 + Ctrl+O 在表 + Ctrl+C/D 硬编码 → Task 2
+- [ ] §3.2 /new == /clear 语义（`_new` 委托 `_clear`） → Task 2
+- [ ] §3.3 /copy：current_path **分支感知**（物理最后一条离开路径的测试）+ 单条目语义（空→无消息）+ 剪贴板 util → Task 1 + Task 2
+- [ ] §3.4 /session：current_path 统计（含 **toolResult 计数** + **分支感知** + token/cost 精确断言）+ 空会话不崩 → Task 2
 - [ ] §3.5 /changelog：版本 + 仓库链接、不伪造 → Task 2
-- [ ] §4 测试五类（handler 单测/clipboard mock+OSC52/注册 11 条/e2e） → Task 1/2
-- [ ] §5 剪贴板 OSC 52 兜底、mock 子进程例外标注 → Task 1
+- [ ] §4 测试（handler 单测用**真实 AppState/session/store**非 duck-typed / clipboard mock+OSC52 + xsel 兜底 + wayland 环境 / 注册 11 条 / e2e） → Task 1/2
+- [ ] §5 剪贴板 OSC 52 兜底、mock 子进程例外标注、`copy_to_clipboard -> str` 偏离声明 → Task 1
