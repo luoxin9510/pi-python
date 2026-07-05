@@ -76,12 +76,6 @@ and exits instead of raising a traceback.
 | `Ctrl+D` | Exit at an empty prompt (readline EOF semantics); on a non-empty line, deletes the character under the cursor |
 | `Up` / `Down` | At the start/end of the draft: browse prompt history (your current, unsent draft is preserved and restored when you arrow back down past it). Elsewhere: move the cursor a line up/down |
 | `Ctrl+O` | Toggle expand/collapse of tool call output — applies to every tool execution shown so far this session, not just the most recent one |
-
-Prompt history is per-session and in-memory, matching upstream pi (the old
-`~/.pi-python/tui-history` file from the previous prompt_toolkit UI is no
-longer used; history replay on `/resume` is planned alongside that command).
-There is no `Ctrl+R` reverse search — that was a prompt_toolkit extra with no
-upstream pi equivalent.
 | `Ctrl+A` / `Home`, `Ctrl+E` / `End` | Move to the start/end of the line |
 | `Ctrl+B`/`Ctrl+F`, `Left`/`Right` | Move the cursor one character left/right |
 | `Alt+B`/`Alt+F`, `Ctrl+Left`/`Ctrl+Right`, `Alt+Left`/`Alt+Right` | Move the cursor one word left/right |
@@ -93,6 +87,12 @@ upstream pi equivalent.
 | `Ctrl+-` | Undo |
 | `Ctrl+]`, then any character | Jump the cursor forward to the next occurrence of that character (`Ctrl+Alt+]` jumps backward) |
 | `Tab` | Accept the highlighted autocomplete suggestion (see below); a no-op otherwise |
+
+Prompt history is per-session and in-memory, matching upstream pi (the old
+`~/.pi-python/tui-history` file from the previous prompt_toolkit UI is no
+longer used; history replay on `/resume` is planned alongside that command).
+There is no `Ctrl+R` reverse search — that was a prompt_toolkit extra with no
+upstream pi equivalent.
 
 **Declared deviation from upstream pi:** `Alt+Enter` is *not* one of
 upstream's default newline keys (upstream only binds `Shift+Enter` and
