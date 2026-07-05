@@ -136,6 +136,17 @@ async def test_provider_stop_cancels_cleanly(repo: Path):
     await p.start(on_change=lambda: None)
     await p.stop()
     await p.stop()  # idempotent, no raise
+
+
+def test_read_branch_invalid_sentinel_falls_back(repo: Path):
+    # HEAD holding the .invalid sentinel must route to the git-subprocess
+    # fallback (upstream footer-data-provider.ts:243-245), not return
+    # ".invalid" as a literal branch name.
+    head = find_git_head(repo)
+    assert head is not None
+    head.write_text("ref: refs/heads/.invalid\n")
+    # subprocess symbolic-ref on this bogus HEAD fails/empty → "detached"
+    assert read_branch(repo) == "detached"
 ```
 
 - [ ] **Step 2: 跑测试确认失败** — Run: `uv run pytest tests/tui/components/test_git_branch.py -q` → FAIL (ModuleNotFoundError)
@@ -179,8 +190,10 @@ def read_branch(cwd: Path) -> str | None:
         return None
     content = head.read_text(errors="replace").strip()
     if content.startswith("ref: refs/heads/"):
-        return content[len("ref: refs/heads/") :]
-    if content == ".invalid":
+        branch = content[len("ref: refs/heads/") :]
+        if branch != ".invalid":
+            return branch
+        # rare .invalid sentinel: fall back to git subprocess (upstream :243-245)
         try:
             r = subprocess.run(
                 ["git", "--no-optional-locks", "symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -203,6 +216,11 @@ class GitBranchProvider:
         self._interval = poll_interval
         self._head = find_git_head(self._cwd)
         self.current_branch: str | None = read_branch(self._cwd)
+        # B2 fix: capture mtime baseline at construction (same instant as
+        # current_branch), NOT inside _poll — start() has no await, so _poll's
+        # body first runs only after the caller yields, by which point the
+        # branch may already have changed → a body-local baseline would miss it.
+        self._last_mtime = self._mtime()
         self._task: asyncio.Task[None] | None = None
 
     async def start(self, on_change: Callable[[], None]) -> None:
@@ -216,13 +234,12 @@ class GitBranchProvider:
             self._task = None
 
     async def _poll(self, on_change: Callable[[], None]) -> None:
-        last_mtime = self._mtime()
         while True:
             await asyncio.sleep(self._interval)
             m = self._mtime()
-            if m == last_mtime:
+            if m == self._last_mtime:
                 continue
-            last_mtime = m
+            self._last_mtime = m
             new_branch = read_branch(self._cwd)
             if new_branch != self.current_branch:
                 self.current_branch = new_branch
@@ -280,6 +297,9 @@ def test_format_tokens_bands():
     assert format_tokens(1_000_000) == "1.0M"
     assert format_tokens(9_999_999) == "10.0M"
     assert format_tokens(10_000_000) == "10M"
+    # round-half-up (JS Math.round parity, not banker's rounding):
+    assert format_tokens(10500) == "11k"      # 10.5 → 11, not 10
+    assert format_tokens(10_500_000) == "11M"  # 10.5 → 11
 
 
 def test_format_cwd_home(tmp_path: Path):
@@ -327,9 +347,7 @@ class _Git:
 
 
 def _msg_entry(role, usage=None):
-    # mimic MessageEntry: has .type and .message dict; usage in camelCase
-    from pipython.tui.components.footer import _is_message_entry  # noqa
-
+    # mimic MessageEntry: has .type == "message" and .message dict; camelCase usage
     class E:
         type = "message"
 
@@ -422,6 +440,7 @@ not yet expose (cache tokens, context %, OAuth sub, session name, auto-compact)
 are omitted per spec §1/§6.
 """
 
+import math
 import os
 from pathlib import Path
 
@@ -438,23 +457,31 @@ def _dim(text: str) -> str:
     return f"{_DIM}{text}{_FG_RESET}"
 
 
+def _round_half_up(x: float) -> int:
+    # JS Math.round rounds .5 UP; Python round() is banker's rounding. Match JS.
+    return math.floor(x + 0.5)
+
+
 def format_tokens(count: int) -> str:
     if count < 1000:
         return str(count)
     if count < 10000:
         return f"{count / 1000:.1f}k"
     if count < 1_000_000:
-        return f"{round(count / 1000)}k"
+        return f"{_round_half_up(count / 1000)}k"
     if count < 10_000_000:
         return f"{count / 1_000_000:.1f}M"
-    return f"{round(count / 1_000_000)}M"
+    return f"{_round_half_up(count / 1_000_000)}M"
 
 
 def format_cwd(cwd: str, home: str | None) -> str:
     if not home:
         return cwd
-    resolved_cwd = Path(cwd).resolve()
-    resolved_home = Path(home).resolve()
+    # R1: normpath+abspath, NOT resolve() — do not follow symlinks (upstream
+    # path.resolve() doesn't either; on macOS /tmp→/private/tmp would otherwise
+    # flip an in-HOME path to out-of-HOME). POSIX only, so str(rel) is posix.
+    resolved_cwd = Path(os.path.normpath(os.path.abspath(cwd)))
+    resolved_home = Path(os.path.normpath(os.path.abspath(home)))
     try:
         rel = resolved_cwd.relative_to(resolved_home)
     except ValueError:
@@ -509,7 +536,7 @@ class Footer:
         return [line1, line2]
 ```
 
-（注意：测试里的 `_is_message_entry` import 只是占位——实现不需要它；若 haiku RED 写了该 import，GREEN 删掉那行 noqa import，改为 duck-typed `getattr(e, "type", None)`，如上。RED 修正记报告。）
+（命名说明：spec rev2 用私有约定 `_format_tokens`/`_format_cwd`，本计划改用公开名 `format_tokens`/`format_cwd`（无下划线）便于测试直接 import——声明偏离，功能无影响。`_round_half_up` 为对齐 JS Math.round 的辅助。）
 
 - [ ] **Step 4: 跑测试 + 四道门** → 全 PASS
 - [ ] **Step 5: Commit** `feat(tui): footer component — pwd/branch line + token/cost/model line`
@@ -528,19 +555,19 @@ class Footer:
 - Consumes: Task 1 `GitBranchProvider`、Task 2 `Footer`
 - Produces: footer 在 root Container 末尾常驻；git 轮询挂 `tui.request_render`，生命周期 try/finally；每回合末刷新。
 
-- [ ] **Step 1: [TEST] 写接线测试**（`tests/tui/test_app.py` 追加；沿用该文件既有的 FakeClient + RecordingTerm + 脚本 stdin 帧驱动 run_app 的 harness 模式——实现者读该文件现有测试照搬 fixture）：
+**这步派 sonnet（不派 haiku）**：接线测试是百行级异步多 fixture，需先通读 `tests/tui/test_app.py` 的 module docstring + fixtures（约第 1-334 行）。**真实 harness 名字**（已核实，勿臆造）：
+- `running_app(**kwargs)`（`@asynccontextmanager`，后台跑 run_app、退出自动 cancel）
+- `stdin_pipe` fixture（真 `os.pipe()`）；`send(fd, data)`；`wait_until(predicate, timeout=2.0, interval=0.01)`
+- `screen_text(term)` / `full_ops_text(term)`；`FakeRealTerm`（RecordingTerm + kitty_enabled/on_resize/drain_pending）
+- `SteppedFakeClient`（带真实 wall-clock 延迟，普通 FakeClient 看不到流式中间态）；`done(text="done")`
+- footer token 断言需构造带 usage 的 assistant 消息：`from pipython.ai.types import AssistantMessage, TextContent, Usage`，脚本条目 `AssistantMessage(content=[TextContent(text="done")], usage=Usage(input_tokens=1200, output_tokens=340, cost=0.012))`
 
-```python
-# 追加到 tests/tui/test_app.py（伪代码骨架，实现者对齐文件既有 harness）
-async def test_footer_shows_cwd_and_tokens_and_updates_on_clear(...):
-    # FakeClient 脚本：一回合返回带 usage 的 assistant 消息
-    # 驱动 run_app（RecordingTerm，注入 client），提交一次 prompt
-    # 断言：RecordingTerm.screen() 底部两行含 cwd 段 与 ↑/↓ token、model
-    # 然后经 stdin 帧提交 "/clear"，断言 footer token 段归零（新 session store 空）、cwd 仍在
-    ...
-```
+参照文件里已有的 `test_slash_clear_mid_turn_does_not_swap_session_under_running_turn`（/clear 场景）与两回合流式测试的结构，写一条：
 
-（实现者按 test_app.py 现有 `_run_app_in_task` / 帧注入 / `wait_for_screen` 等工具写全断言；关键断言：底部 footer 两行存在、token 累加正确、`/clear` 后 token 归零 cwd 不变。）
+- [ ] **Step 1: [TEST] 写接线测试** `tests/tui/test_app.py` 追加 `test_footer_shows_tokens_and_resets_on_clear`：
+  - 用 `running_app` 起 app（cwd 传一个 tmp 目录、client 注入 FakeClient 脚本=一条带 usage 的 assistant 消息）。
+  - 提交一次 prompt（`send(stdin_pipe, b"hi\r")`），`wait_until` 直到 `screen_text(term)` 底部出现 footer 的 token 段（`"↑"` 与 model 名）——断言 `↑1.2k`/`↓340` 段与 cwd 段都在底部两行。
+  - 再 `send(stdin_pipe, b"/clear\r")`，`wait_until` 屏幕出现新 session 的分隔提示；断言 footer token 段归零（新 store 无 assistant usage → line2 无 `↑`），cwd 段不变——证明 Footer 持 app_state 现取 session、不是冻结旧引用（spec §2.1 C1 修复的回归钉）。
 
 - [ ] **Step 2: 确认失败** → FAIL（footer 未接线，screen 无 footer 行）
 - [ ] **Step 3: 实现接线** `src/pipython/tui/app.py`：
@@ -551,7 +578,7 @@ async def test_footer_shows_cwd_and_tokens_and_updates_on_clear(...):
     footer = Footer(app_state, git)
     root.add_child(footer)  # after editor — bottom of the tree
     ```
-  - git 生命周期：把 `git.start(...)` 放进护住 setup 全程的 try/finally（扩大或新包一层 try，finally 里 `await git.stop()`）：
+  - git 生命周期（R3，边界明确）：`_run` 现有的 finally（约 571 行）只护 `quit_event.wait()` 之后的清理，不含 setup。改法：**从 `git = GitBranchProvider(cwd)`（约 312 行后构造点）到 `await quit_event.wait()`（571 行现有 finally 之前）整段降一级缩进套进一个 try**，`await git.stop()` 作为该 try 对应 finally 的第一行（可与现有 571 行 finally 合并成同一个 finally——git.stop 在最前，其余 fd/signal/turn_task 清理照旧）。这样 `detect_caps`/`add_reader`/`tui.start()` 等 setup 中途抛异常也保证 `git.stop()` 执行、不泄漏轮询任务。start 调用：
     ```python
     await git.start(on_change=tui.request_render)
     ```
