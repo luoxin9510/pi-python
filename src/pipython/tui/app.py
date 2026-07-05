@@ -373,9 +373,19 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
     loop = asyncio.get_running_loop()
     fd: int | None = None
     # Issue #14: monotonic timestamp (loop.time()) of the most recent Ctrl+C,
-    # or None if there hasn't been one yet (or the double-tap window already
-    # expired) — see ``_on_stdin_frame``'s "\\x03" branch.
+    # or None until the first Ctrl+C. Not reset after use — a stale timestamp
+    # simply falls outside the 0.5s window on the next compare (see
+    # ``_on_stdin_frame``'s "\\x03" branch).
     last_ctrl_c: float | None = None
+    # Issue #15: external-termination signals routed into quit_event so they
+    # unwind through the normal teardown (restoring the terminal). Built with
+    # getattr so a platform missing SIGHUP (Windows) just drops it, rather than
+    # raising AttributeError when the tuple is evaluated outside the suppress.
+    term_signals = tuple(
+        s
+        for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None))
+        if s is not None
+    )
 
     # From here through `await quit_event.wait()` is wrapped in one try so
     # that ANY setup failure below (detect_caps, add_reader, tui.start(),
@@ -648,12 +658,11 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
         # are wired for `_run`'s entire lifetime, so they fire even while
         # idle. Deliberately NOT SIGWINCH (obligation (b) above — that's
         # engine/terminal.py's own process-level `signal.signal` slot, never
-        # touched via asyncio here) and guarded for platforms where the
-        # signal or `add_signal_handler` itself doesn't exist (e.g. Windows
-        # has no SIGHUP; some event loop policies don't implement signal
-        # handling at all).
-        for _sig in (signal.SIGTERM, signal.SIGHUP):
-            with contextlib.suppress(ValueError, AttributeError, NotImplementedError):
+        # touched via asyncio here). Guarded for event loop policies that don't
+        # implement add_signal_handler at all (term_signals already dropped any
+        # signal absent on this platform).
+        for _sig in term_signals:
+            with contextlib.suppress(ValueError, NotImplementedError):
                 loop.add_signal_handler(_sig, quit_event.set)
 
         # Obligation (a): drain_pending() bytes MUST be fed before the live
@@ -694,8 +703,8 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
                 loop.remove_reader(fd)
         with contextlib.suppress(ValueError):
             loop.remove_signal_handler(signal.SIGINT)
-        for _sig in (signal.SIGTERM, signal.SIGHUP):
-            with contextlib.suppress(ValueError, AttributeError, NotImplementedError):
+        for _sig in term_signals:
+            with contextlib.suppress(ValueError, NotImplementedError):
                 loop.remove_signal_handler(_sig)
         if turn_task is not None and not turn_task.done():
             turn_task.cancel()

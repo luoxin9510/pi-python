@@ -332,7 +332,9 @@ def test_ctrl_c_does_not_interrupt_but_double_tap_exits(tmp_path):
         p2.wait_for(r"an unsent draft")
 
         p2.send_ctrl_c()  # first Ctrl+C: clears the draft, does not quit
-        time.sleep(0.3)
+        # Keep the gap comfortably under the 500ms double-tap window — capture()
+        # + send overhead below still has to land the 2nd press inside it.
+        time.sleep(0.2)
         scr = p2.capture()
         assert "an unsent draft" not in scr
         assert p2.alive()
