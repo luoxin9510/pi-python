@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 新代码：`src/pipython/tui/components/clipboard.py`；handler 加进现有 `src/pipython/tui/commands.py`。
-- 四道门：提交前 `uv run pytest -q && uv run ruff check . && uv run ruff format --check . && uv run pyright` 全绿；e2e 变动加 `uv run pytest tests/e2e/ -v`。
+- 四道门：提交前 `uv run pytest -q && uv run ruff check . && uv run ruff format --check . && uv run pyright` 全绿；e2e 变动加 `uv run pytest tests/e2e/ -v`。**注意**：本计划贴的代码块按可读性手排，未必符合 ruff 排版；每个任务 Step 4 跑 check 门**之前先** `uv run ruff check --fix . && uv run ruff format .` 自动整形，再跑 `ruff format --check` 才会绿（纯排版差异，无语义变化）。
 - **测试例外（已获维护者认可）**：clipboard util 的平台工具路径 monkeypatch subprocess——这是对 CLAUDE.md "不 mock 子进程" 的**明确例外**，因 headless CI 无 pbcopy/xclip/剪贴板设备。OSC 52 路径不涉子进程（纯 stdout 写），真实断言字节。其余一切真实执行。
 - 模型分工：`[TEST]` 步骤派 haiku，实现派 sonnet；测试失败修复回 sonnet。
 - commit 格式 `{feat,fix,test,docs}(scope): message`，scope=tui；消息尾加：
@@ -144,6 +144,17 @@ def test_subprocess_failure_falls_to_osc52(monkeypatch, capsys):
     monkeypatch.setattr(clipboard.subprocess, "run", boom)
     assert copy_to_clipboard("z") == "osc52"
     assert "\x1b]52;c;" in capsys.readouterr().out
+
+
+def test_all_paths_fail_raises_clipboard_error(monkeypatch):
+    # No local tools + OSC 52 also unavailable (payload cap forced to 0) → raise.
+    # Covers spec §3.3 "全部路径失败才 raise"; also makes the pytest/ClipboardError imports used.
+    _clear_remote(monkeypatch)
+    monkeypatch.setattr(clipboard.sys, "platform", "linux")
+    monkeypatch.setattr(clipboard, "_which", lambda name: False)
+    monkeypatch.setattr(clipboard, "_OSC52_MAX", 0)  # any non-empty payload exceeds → ClipboardError
+    with pytest.raises(ClipboardError):
+        copy_to_clipboard("x")
 ```
 
 - [ ] **Step 2: 确认失败** — `uv run pytest tests/tui/components/test_clipboard.py -q` → FAIL (ImportError)
@@ -332,11 +343,16 @@ def test_format_key_non_macos_alt(monkeypatch):
 
 
 # --- /hotkeys ---
+# NOTE: assert via a LOCAL `sink = RecordingSink()` (concrete type), never
+# `ctx.sink.flat_text()` — CommandContext.sink is typed as the Sink Protocol,
+# which has no flat_text, so pyright errors on ctx.sink.flat_text(). This
+# mirrors test_commands.py's convention.
 
 async def test_hotkeys_lists_key_help(tmp_path):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     await _hotkeys(ctx, "")
-    joined = ctx.sink.flat_text()
+    joined = sink.flat_text()
     assert "Navigation" in joined
     assert "History" in joined  # history nav is implemented (editor cursorUp/Down)
     assert "Completion" in joined  # autocomplete is implemented (tui.select.*)
@@ -348,17 +364,19 @@ async def test_hotkeys_lists_key_help(tmp_path):
 # --- /new ---
 
 async def test_new_swaps_session(tmp_path):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     old = ctx.app.session
     await _new(ctx, "")
     assert ctx.app.session is not old
-    assert "new session" in ctx.sink.flat_text()
+    assert "new session" in sink.flat_text()
 
 
 # --- /copy ---
 
 async def test_copy_takes_last_assistant_text_on_path(tmp_path, monkeypatch):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     store = ctx.app.session.store
     _append(store, "u1", None, {"role": "user", "content": "hi"})
     _append(store, "a1", "u1", _asst_msg("first answer"))
@@ -368,7 +386,7 @@ async def test_copy_takes_last_assistant_text_on_path(tmp_path, monkeypatch):
     monkeypatch.setattr(commands, "copy_to_clipboard", lambda t: got.setdefault("text", t) or "pbcopy")
     await _copy(ctx, "")
     assert got["text"] == "second answer"
-    assert "Copied" in ctx.sink.flat_text()
+    assert "Copied" in sink.flat_text()
 
 
 async def test_copy_is_branch_aware(tmp_path, monkeypatch):
@@ -387,34 +405,37 @@ async def test_copy_is_branch_aware(tmp_path, monkeypatch):
 
 
 async def test_copy_no_assistant_message(tmp_path, monkeypatch):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     _append(ctx.app.session.store, "u1", None, {"role": "user", "content": "hi"})
     monkeypatch.setattr(commands, "copy_to_clipboard", lambda t: "pbcopy")
     await _copy(ctx, "")
-    assert "No agent messages" in ctx.sink.flat_text()
+    assert "No agent messages" in sink.flat_text()
 
 
 async def test_copy_pure_toolcall_is_no_message(tmp_path, monkeypatch):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     store = ctx.app.session.store
     _append(store, "u1", None, {"role": "user", "content": "x"})
     _append(store, "a1", "u1", _asst_msg(text=None, tool=True))  # toolCall only, no text
     monkeypatch.setattr(commands, "copy_to_clipboard", lambda t: "pbcopy")
     await _copy(ctx, "")
-    assert "No agent messages" in ctx.sink.flat_text()
+    assert "No agent messages" in sink.flat_text()
 
 
 # --- /session ---
 
 async def test_session_stats(tmp_path):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     store = ctx.app.session.store
     _append(store, "u1", None, {"role": "user", "content": "hi"})
     _append(store, "a1", "u1", _asst_msg("hi", tool=True, usage={"inputTokens": 100, "outputTokens": 20, "cost": 0.01}))
     _append(store, "u2", "a1", {"role": "user", "content": "again"})
     _append(store, "a2", "u2", _asst_msg("ok", usage={"inputTokens": 50, "outputTokens": 10, "cost": 0.005}))
     await _session(ctx, "")
-    joined = ctx.sink.flat_text()
+    joined = sink.flat_text()
     assert "2 user, 2 assistant" in joined
     assert "Tool calls: 1" in joined
     assert "↑150 ↓30" in joined
@@ -423,17 +444,19 @@ async def test_session_stats(tmp_path):
 
 
 async def test_session_counts_toolresult(tmp_path):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     store = ctx.app.session.store
     _append(store, "u1", None, {"role": "user", "content": "hi"})
     _append(store, "a1", "u1", _asst_msg("run", tool=True))
     _append(store, "t1", "a1", {"role": "toolResult", "content": "output"})
     await _session(ctx, "")
-    assert "1 tool result" in ctx.sink.flat_text()
+    assert "1 tool result" in sink.flat_text()
 
 
 async def test_session_is_branch_aware(tmp_path):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     store = ctx.app.session.store
     _append(store, "u1", None, {"role": "user", "content": "hi"})
     _append(store, "a1", "u1", _asst_msg("first"))
@@ -441,21 +464,23 @@ async def test_session_is_branch_aware(tmp_path):
     _append(store, "a2", "u2", _asst_msg("second"))
     store.leaf_id = "a1"  # off-path: u2/a2 excluded; current path [u1, a1]
     await _session(ctx, "")
-    assert "1 user, 1 assistant" in ctx.sink.flat_text()
+    assert "1 user, 1 assistant" in sink.flat_text()
 
 
 async def test_session_empty(tmp_path):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     await _session(ctx, "")
-    assert ctx.sink.flat_text()  # renders without crash (empty session → all zero)
+    assert "0 user, 0 assistant, 0 tool result" in sink.flat_text()  # empty → all zero
 
 
 # --- /changelog ---
 
 async def test_changelog_shows_version_and_repo(tmp_path):
-    ctx = await make_ctx(tmp_path)
+    sink = RecordingSink()
+    ctx = await make_ctx(tmp_path, sink=sink)
     await _changelog(ctx, "")
-    joined = ctx.sink.flat_text()
+    joined = sink.flat_text()
     from pipython import __version__
 
     assert __version__ in joined
