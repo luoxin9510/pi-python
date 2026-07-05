@@ -33,6 +33,7 @@ kept as plain formatted strings here since there is no markup parser left in
 this module to guard against.
 """
 
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -42,11 +43,14 @@ from pipython import (
     MessageEntry,
     ModelChangeEntry,
     SessionHeader,
+    __version__,
     current_path,
     entry_id,
     entry_parent_id,
     entry_type,
 )
+from pipython.tui.components.clipboard import ClipboardError, copy_to_clipboard
+from pipython.tui.engine.keybindings import DEFAULT_EDITOR_BINDINGS
 
 _SUMMARY_TRUNC = 50
 
@@ -204,6 +208,180 @@ async def _quit(ctx: CommandContext, _: str) -> None:
     ctx.app.should_quit = True
 
 
+def _format_key(key: "str | list[str]") -> str:
+    def cap(p: str) -> str:
+        # NOT str.capitalize() — that lowercases the tail ("pageUp" → "Pageup").
+        return p[:1].upper() + p[1:] if p else p
+
+    def fmt(k: str) -> str:
+        out = []
+        for p in k.split("+"):
+            if p == "alt" and sys.platform == "darwin":
+                out.append("Option")
+            else:
+                out.append(cap(p))
+        return "+".join(out)
+
+    if isinstance(key, list):
+        return " / ".join(fmt(k) for k in key)
+    return fmt(key)
+
+
+# /hotkeys grouping: (section title, [(action, label)]) — hand-grouped per
+# upstream handleHotkeysCommand (Navigation/Editing/History/Completion/Other).
+# Every action referenced here is verified present in DEFAULT_EDITOR_BINDINGS.
+_HOTKEY_SECTIONS = [
+    (
+        "Navigation",
+        [
+            ("tui.editor.cursorLeft", "Move left"),
+            ("tui.editor.cursorRight", "Move right"),
+            ("tui.editor.cursorWordLeft", "Word left"),
+            ("tui.editor.cursorWordRight", "Word right"),
+            ("tui.editor.cursorLineStart", "Line start"),
+            ("tui.editor.cursorLineEnd", "Line end"),
+            ("tui.editor.jumpForward", "Jump to char forward"),
+            ("tui.editor.jumpBackward", "Jump to char backward"),
+        ],
+    ),
+    (
+        "Editing",
+        [
+            ("tui.input.submit", "Submit"),
+            ("tui.input.newLine", "New line"),
+            ("tui.editor.deleteWordBackward", "Delete word back"),
+            ("tui.editor.deleteWordForward", "Delete word forward"),
+            ("tui.editor.deleteToLineStart", "Kill to line start"),
+            ("tui.editor.deleteToLineEnd", "Kill to line end"),
+            ("tui.editor.yank", "Yank"),
+            ("tui.editor.yankPop", "Yank pop"),
+            ("tui.editor.undo", "Undo"),
+        ],
+    ),
+    # Up/Down navigate prompt history when the editor is empty / at the first
+    # or last visual line (editor.py _navigate_history reuses cursorUp/Down).
+    (
+        "History",
+        [
+            ("tui.editor.cursorUp", "Previous prompt (at first line)"),
+            ("tui.editor.cursorDown", "Next prompt (in history)"),
+        ],
+    ),
+    # Autocomplete overlay keys (editor.py consumes these via kb.matches).
+    (
+        "Completion",
+        [
+            ("tui.input.tab", "Trigger / apply completion"),
+            ("tui.select.up", "Select previous"),
+            ("tui.select.down", "Select next"),
+            ("tui.select.confirm", "Confirm selection"),
+            ("tui.select.cancel", "Cancel completion"),
+        ],
+    ),
+    (
+        "Other",
+        [
+            ("app.tools.expand", "Expand/collapse tool output"),
+        ],
+    ),
+]
+
+
+async def _hotkeys(ctx: CommandContext, _: str) -> None:
+    # `\x1b[1m…\x1b[0m` (full reset) matches this module's _tree ANSI convention.
+    lines: list[str] = []
+    for title, rows in _HOTKEY_SECTIONS:
+        lines.append(f"\x1b[1m{title}\x1b[0m")
+        for action, label in rows:
+            key = DEFAULT_EDITOR_BINDINGS.get(action)
+            if key is None:
+                continue
+            lines.append(f"  {_format_key(key):<24} {label}")
+        lines.append("")
+    # app-level bytes not in the bindings table (app.py _on_stdin_frame):
+    lines.append("\x1b[1mSession\x1b[0m")
+    lines.append(f"  {'Ctrl+C':<24} Interrupt turn / clear input")
+    lines.append(f"  {'Ctrl+D':<24} Exit (empty prompt)")
+    ctx.sink.emit_lines(lines)
+
+
+async def _new(ctx: CommandContext, _: str) -> None:
+    # Upstream /new calls handleClearCommand — delegate to keep them identical.
+    await _clear(ctx, _)
+
+
+def _last_assistant_text(session) -> str | None:
+    path = current_path(session.store.entries, session.store.leaf_id)
+    for e in reversed(path):
+        if isinstance(e, MessageEntry) and e.message.get("role") == "assistant":
+            text = "".join(
+                c.get("text", "")
+                for c in e.message.get("content", [])
+                if isinstance(c, dict) and c.get("type") == "text"
+            )
+            return text or None  # empty (pure toolCall) → treated as no message
+    return None
+
+
+async def _copy(ctx: CommandContext, _: str) -> None:
+    text = _last_assistant_text(ctx.app.session)
+    if not text:
+        ctx.sink.emit_text("No agent messages to copy yet.", style="red")
+        return
+    try:
+        copy_to_clipboard(text)
+        ctx.sink.emit_text("Copied last agent message to clipboard", style="dim")
+    except ClipboardError as e:
+        ctx.sink.emit_text(str(e), style="red")
+
+
+async def _session(ctx: CommandContext, _: str) -> None:
+    session = ctx.app.session
+    path = current_path(session.store.entries, session.store.leaf_id)
+    users = assts = tools_res = tool_calls = 0
+    tin = tout = 0
+    cost = 0.0
+    for e in path:
+        if not isinstance(e, MessageEntry):
+            continue
+        role = e.message.get("role")
+        if role == "user":
+            users += 1
+        elif role == "toolResult":
+            tools_res += 1
+        elif role == "assistant":
+            assts += 1
+            for c in e.message.get("content", []):
+                if isinstance(c, dict) and c.get("type") == "toolCall":
+                    tool_calls += 1
+            usage = e.message.get("usage") or {}
+            tin += usage.get("inputTokens") or 0
+            tout += usage.get("outputTokens") or 0
+            cst = usage.get("cost")
+            if cst:
+                cost += cst
+    ctx.sink.emit_lines(
+        [
+            "\x1b[1mSession Info\x1b[0m",
+            f"  Messages:   {users} user, {assts} assistant, {tools_res} tool result",
+            f"  Tool calls: {tool_calls}",
+            f"  Tokens:     ↑{tin} ↓{tout}",
+            f"  Cost:       ${cost:.4f}",
+            f"  Model:      {session.model}",
+        ]
+    )
+
+
+async def _changelog(ctx: CommandContext, _: str) -> None:
+    ctx.sink.emit_lines(
+        [
+            f"pi-python {__version__}",
+            "https://github.com/luoxin9510/pi-python",
+            "Full history in git log / GitHub releases.",
+        ]
+    )
+
+
 def build_registry() -> dict[str, Command]:
     cmds = [
         Command("help", "列出全部命令", _help),
@@ -212,6 +390,11 @@ def build_registry() -> dict[str, Command]:
         Command("tree", "查看会话树", _tree),
         Command("branch", "回到历史节点分叉：/branch <id前缀>", _branch),
         Command("quit", "退出", _quit),
+        Command("hotkeys", "查看键位帮助", _hotkeys),
+        Command("new", "开新会话（同 /clear）", _new),
+        Command("copy", "复制最后一条助手消息到剪贴板", _copy),
+        Command("session", "查看会话统计", _session),
+        Command("changelog", "查看版本信息", _changelog),
     ]
     return {c.name: c for c in cmds}
 

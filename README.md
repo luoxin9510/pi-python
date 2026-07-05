@@ -136,6 +136,11 @@ word movement is unaffected and follows the same rules as upstream.
 | `/tree` | Render the session's entry tree (connector-drawn, dim off the current path / bold-green on it), highlighting the path to the current leaf and marking it with `←` |
 | `/branch <id-prefix>` | Branch to the entry whose id starts with the given prefix; errors on no match or an ambiguous (multi-match) prefix |
 | `/quit` | Quit (equivalent to Ctrl+D) |
+| `/hotkeys` | Show the key-help table (Navigation/Editing/History/Completion/Other), with each binding formatted per-platform (e.g. `Option+B` on macOS, `Alt+B` elsewhere) |
+| `/new` | Start a new session (same as `/clear`) |
+| `/copy` | Copy the last agent message on the current path to the clipboard |
+| `/session` | Show session stats (message/tool-call counts, token usage, cost, model) for the current path |
+| `/changelog` | Show the installed version and a link to the repo for release history |
 
 Unknown commands print an error and a `/help` hint instead of failing
 silently.
