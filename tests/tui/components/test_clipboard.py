@@ -103,6 +103,19 @@ def test_subprocess_failure_falls_to_osc52(monkeypatch, capsys):
     assert "\x1b]52;c;" in capsys.readouterr().out
 
 
+def test_subprocess_timeout_falls_to_osc52(monkeypatch, capsys):
+    _clear_remote(monkeypatch)
+    monkeypatch.setattr(clipboard.sys, "platform", "darwin")
+    monkeypatch.setattr(clipboard, "_which", lambda name: name == "pbcopy")
+
+    def boom(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(clipboard.subprocess, "run", boom)
+    assert copy_to_clipboard("z") == "osc52"
+    assert "\x1b]52;c;" in capsys.readouterr().out
+
+
 def test_all_paths_fail_raises_clipboard_error(monkeypatch):
     # No local tools + OSC 52 also unavailable (payload cap forced to 0) → raise.
     # Covers spec §3.3 "全部路径失败才 raise"; also makes the pytest/ClipboardError imports used.

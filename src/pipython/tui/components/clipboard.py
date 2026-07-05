@@ -56,7 +56,14 @@ def copy_to_clipboard(text: str) -> str:
         if not _which(name):
             continue
         try:
-            subprocess.run(cmd, input=text.encode("utf-8"), check=True)
+            subprocess.run(
+                cmd,
+                input=text.encode("utf-8"),
+                check=True,
+                timeout=5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             return name
         except (OSError, subprocess.SubprocessError):
             continue
