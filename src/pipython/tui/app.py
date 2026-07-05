@@ -576,6 +576,31 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
         if callable(on_resize):
             on_resize(tui.on_resize)
 
+        # Issue #15: a bare `atexit.register(self.stop)` (this module's own
+        # caller, `run_app`'s `finally: real_term.stop()` below) never runs
+        # on SIGTERM/SIGHUP — their default disposition is to terminate the
+        # process outright, atexit hooks and all, so `kill <pid>` (or a
+        # hung-up controlling terminal) used to leave a REAL terminal stuck
+        # in raw mode: kitty keyboard flags, bracketed paste, and possibly a
+        # hidden cursor, all never undone. Routed through the very same
+        # `quit_event` a clean `/quit`/Ctrl+D already uses (rather than
+        # calling `term.stop()` directly here) so the *entire* existing
+        # clean-shutdown path — this try's own finally below, then
+        # `run_app`'s `finally: real_term.stop()` — runs exactly once, the
+        # same way, regardless of what triggered the quit. Unlike the
+        # per-turn `loop.add_signal_handler(signal.SIGINT, ...)` in
+        # `_run_turn` (registered/removed around a single turn), these two
+        # are wired for `_run`'s entire lifetime, so they fire even while
+        # idle. Deliberately NOT SIGWINCH (obligation (b) above — that's
+        # engine/terminal.py's own process-level `signal.signal` slot, never
+        # touched via asyncio here) and guarded for platforms where the
+        # signal or `add_signal_handler` itself doesn't exist (e.g. Windows
+        # has no SIGHUP; some event loop policies don't implement signal
+        # handling at all).
+        for _sig in (signal.SIGTERM, signal.SIGHUP):
+            with contextlib.suppress(ValueError, AttributeError, NotImplementedError):
+                loop.add_signal_handler(_sig, quit_event.set)
+
         # Obligation (a): drain_pending() bytes MUST be fed before the live
         # reader attaches (engine/terminal.py's own binding requirement).
         drain_pending = getattr(term, "drain_pending", None)
@@ -614,6 +639,9 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
                 loop.remove_reader(fd)
         with contextlib.suppress(ValueError):
             loop.remove_signal_handler(signal.SIGINT)
+        for _sig in (signal.SIGTERM, signal.SIGHUP):
+            with contextlib.suppress(ValueError, AttributeError, NotImplementedError):
+                loop.remove_signal_handler(_sig)
         if turn_task is not None and not turn_task.done():
             turn_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

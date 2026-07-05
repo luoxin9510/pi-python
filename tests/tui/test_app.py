@@ -572,6 +572,159 @@ async def test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted(tmp
 
 
 # =============================================================================
+# 5b. SIGTERM / SIGHUP -> quit_event.set() -> clean exit, terminal restored
+#     (issue #15). The TUI used to rely solely on `atexit.register(self.stop)`
+#     (its caller) to restore the terminal -- but SIGTERM/SIGHUP's default
+#     disposition is to terminate the process outright, atexit hooks and
+#     all, so `kill <pid>` (or a hung-up controlling terminal) left a REAL
+#     terminal stuck in raw mode with no cleanup at all. `_run` now installs
+#     `loop.add_signal_handler(signal.SIGTERM/SIGHUP, quit_event.set)` for
+#     its *entire* lifetime -- unlike the per-turn SIGINT handler in
+#     `_run_turn`, this must fire even while completely idle -- routing
+#     through the exact same clean-quit path (`await quit_event.wait()` ->
+#     `_run`'s finally -> `run_app`'s finally -> `real_term.stop()`) Ctrl+D
+#     already exercises (see `test_ctrl_d_empty_buffer_exits_with_session_banner`
+#     above).
+# =============================================================================
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+async def test_external_sigterm_sighup_quits_cleanly_even_when_idle(tmp_path, stdin_pipe, sig):
+    """No turn needs to be in flight -- unlike SIGINT (only wired inside
+    `_run_turn`, around a single turn), SIGTERM/SIGHUP must be wired for
+    `_run`'s entire lifetime so a signal sent while the app is sitting idle
+    at the prompt still triggers a clean quit."""
+    client = FakeClient(script=[])
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term) as task:
+        # Wait until `_run`'s setup has actually reached `tui.start()` (its
+        # own `request_render()` is the first thing that produces any
+        # output at all) -- the new handlers are registered earlier in that
+        # same setup, so this also guarantees they're already active.
+        await wait_until(lambda: bool(term.ops))
+
+        os.kill(os.getpid(), sig)
+
+        await wait_until(lambda: task.done(), timeout=3.0)
+        assert task.exception() is None, f"run_app must exit cleanly on {sig!r}, not raise"
+
+
+class _FakeStdinTTY:
+    """Like this module's `_FakeStdin`, but also answers `isatty()`
+    truthily so `run_app`'s owns_term branch (the real-terminal-required
+    check at app.py:281) proceeds instead of printing and returning --
+    needed only by `test_sigterm_restores_the_owned_real_terminal` below,
+    which is the one test in this file exercising that branch without a
+    real tty."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def isatty(self) -> bool:
+        return True
+
+
+class _TTYStdoutWrapper:
+    """Delegates everything to the real `sys.stdout` except `isatty()`,
+    which it forces `True` -- same rationale as `_FakeStdinTTY` above,
+    without disturbing pytest's own output capturing (which continues to
+    receive real writes via `__getattr__`)."""
+
+    def __init__(self, wrapped) -> None:
+        self._wrapped = wrapped
+
+    def isatty(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str):
+        return getattr(self._wrapped, name)
+
+
+class RecordingRealTerminal:
+    """Stub swapped in for `pipython.tui.app.RealTerminal` itself -- not the
+    injected `term=` fake every other test in this file uses -- so this one
+    test can observe the *actual* production chain issue #15 is about:
+    `run_app`'s own `real_term = RealTerminal(); real_term.start()` /
+    `finally: real_term.stop()` around `_run` (app.py:284-291), exercised
+    end-to-end with no real tty by monkeypatching the class the module
+    calls."""
+
+    def __init__(self) -> None:
+        self.kitty_enabled = False
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def write(self, data: str) -> None:
+        pass
+
+    @property
+    def columns(self) -> int:
+        return 80
+
+    @property
+    def rows(self) -> int:
+        return 24
+
+    def on_resize(self, cb) -> None:
+        pass
+
+    def drain_pending(self) -> bytes:
+        return b""
+
+
+async def test_sigterm_restores_the_owned_real_terminal(tmp_path, monkeypatch):
+    """The end-to-end regression test for issue #15 itself: with `term=None`
+    (the real CLI's own call shape), `run_app` constructs and owns a
+    `RealTerminal` -- it must still get `.stop()`'d when SIGTERM arrives,
+    exactly like a clean `/quit` or Ctrl+D would, instead of being left
+    stuck in raw mode by a process death that skips atexit entirely."""
+    r_fd, w_fd = os.pipe()
+    monkeypatch.setattr(sys, "stdin", _FakeStdinTTY(r_fd))
+    monkeypatch.setattr(sys, "stdout", _TTYStdoutWrapper(sys.stdout))
+
+    fake_terms: list[RecordingRealTerminal] = []
+
+    def _fake_real_terminal() -> RecordingRealTerminal:
+        inst = RecordingRealTerminal()
+        fake_terms.append(inst)
+        return inst
+
+    monkeypatch.setattr("pipython.tui.app.RealTerminal", _fake_real_terminal)
+
+    client = FakeClient(script=[])
+    task = asyncio.create_task(run_app(model="fake/model", cwd=tmp_path, client=client, term=None))
+    try:
+        await wait_until(lambda: bool(fake_terms and fake_terms[0].started))
+
+        os.kill(os.getpid(), signal.SIGTERM)
+
+        await wait_until(lambda: task.done(), timeout=3.0)
+        assert task.exception() is None
+        assert fake_terms[0].stopped, (
+            "run_app's owned RealTerminal must be .stop()'d on SIGTERM (issue #15)"
+        )
+    finally:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        with contextlib.suppress(OSError):
+            os.close(w_fd)
+        with contextlib.suppress(OSError):
+            os.close(r_fd)
+
+
+# =============================================================================
 # 6. Ctrl+C clears the editor buffer (Editor itself no-ops on ctrl+c --
 #    editor.py handle_key: "Ctrl+C: parent's job (exit/clear)" -- the app must
 #    do the clearing itself)
