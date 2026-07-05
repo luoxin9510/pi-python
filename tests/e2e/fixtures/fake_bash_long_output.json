@@ -1,0 +1,6 @@
+[
+  {"role": "assistant", "content": [
+    {"type": "toolCall", "id": "t1", "name": "bash", "arguments": {"command": "seq 1 30"}}]},
+  {"role": "assistant", "content": [
+    {"type": "text", "text": "counted them all"}]}
+]

@@ -85,6 +85,22 @@ write-up):
   and the echo/``add_to_history`` calls only run once the gate is clear.
   Full upstream queueing (``restoreQueuedMessagesToEditor``) is a phase-4
   parity item, not built here — this is a minimal correctness fix.
+
+Task 19 acceptance follow-up (maintainer side-by-side finding #2, pulled
+forward from phase-4 — see ``.superpowers/sdd/progress.md``'s "Task 19 验收
+追加发现 2" entry and ``components/tool_execution.py``'s module docstring):
+``ToolCallEvent``/``ToolResultEvent`` now build/resolve a styled
+``ToolExecution`` component (keyed by ``tool_call.id`` in
+``tool_components``) instead of a plain ``Text`` line, and Ctrl+O
+(``"\\x0f"``) is intercepted in ``_on_stdin_frame`` — the same layer that
+already special-cases Ctrl+C/Ctrl+D — toggling a global ``tools_expanded``
+flag applied to every live component (upstream's
+``toggleToolOutputExpansion``, ``interactive-mode.ts:3636``). This is an
+app-level concern, not an editor one, so it is *not* routed through
+``engine/keybindings.py``'s ``DEFAULT_EDITOR_BINDINGS`` table (which maps
+editor-internal actions only). The separate red-foreground line previously
+shown for a tool-result error is gone — the component's own error-tinted
+background is now the sole error indicator, matching upstream.
 """
 
 from __future__ import annotations
@@ -118,6 +134,7 @@ from pipython.tui.components.editor import Editor
 from pipython.tui.components.loader import Loader
 from pipython.tui.components.markdown import Markdown
 from pipython.tui.components.text import Text
+from pipython.tui.components.tool_execution import ToolExecution
 from pipython.tui.engine.stdin_buffer import StdinBuffer
 from pipython.tui.engine.term_caps import TermCaps, detect_caps
 from pipython.tui.engine.terminal import RealTerminal, TerminalIO
@@ -130,9 +147,6 @@ __all__ = ["run_app", "make_client", "load_fake_client", "extract_text"]
 _RED = "\x1b[31m"
 _YELLOW = "\x1b[33m"
 _DIM = "\x1b[2m"
-
-_ARG_TRUNC = 100
-_ERR_TRUNC = 200
 
 
 def extract_text(message: AssistantMessage) -> str:
@@ -163,10 +177,6 @@ def make_client(model: str) -> ModelClient | None:
     if fake:
         return load_fake_client(fake)
     return None
-
-
-def _clip(s: str, n: int) -> str:
-    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 # =============================================================================
@@ -312,6 +322,14 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
     quit_event = asyncio.Event()
     turn_task: asyncio.Task[None] | None = None
 
+    # Ctrl+O ("app.tools.expand", interactive-mode.ts:2513/3636): a single
+    # global expand/collapse flag applied to every ToolExecution component
+    # ever created this session (upstream's toggleToolOutputExpansion —
+    # keyed by tool_call.id so a ToolResultEvent can find the component its
+    # ToolCallEvent already created and pushed into the transcript).
+    tools_expanded = False
+    tool_components: dict[str, ToolExecution] = {}
+
     def _append(text: str, style: str = "", *, wrap: bool = True) -> None:
         transcript.add_child(Text(text, style=style, wrap=wrap))
         tui.request_render()
@@ -400,13 +418,28 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
                     slot = None
                     tui.request_render()
                 elif isinstance(event, ToolCallEvent):
-                    args = _clip(
-                        json.dumps(event.tool_call.arguments, ensure_ascii=False), _ARG_TRUNC
-                    )
-                    _append(f"[tool] {event.tool_call.name} {args}")
+                    # Maintainer side-by-side finding (task-19 acceptance,
+                    # pulled forward from phase-4): a styled ToolExecution
+                    # component (bold title + state-tinted background)
+                    # replaces the old plain "[tool] <name> <args>" Text
+                    # line. Keyed by tool_call.id so the matching
+                    # ToolResultEvent below can find it again.
+                    comp = ToolExecution(event.tool_call.name, event.tool_call.arguments)
+                    comp.set_expanded(tools_expanded)
+                    tool_components[event.tool_call.id] = comp
+                    transcript.add_child(comp)
+                    tui.request_render()
                 elif isinstance(event, ToolResultEvent):
-                    if event.result.is_error:
-                        _append(_clip(event.result.content, _ERR_TRUNC), style=_RED)
+                    # The component's own error-tinted background is now
+                    # the error indicator (matches upstream: there is no
+                    # separate red error line for tool-result errors,
+                    # tool-execution.ts's state background is the sole
+                    # indicator) — replaces the old separate red `_append`
+                    # for `is_error` tool results.
+                    tool_comp = tool_components.get(event.tool_call.id)
+                    if tool_comp is not None:
+                        tool_comp.set_result(event.result.content, event.result.is_error)
+                    tui.request_render()
                 elif isinstance(event, ErrorEvent):
                     _append(event.message, style=_RED)
                 elif isinstance(event, AgentEnd):
@@ -424,6 +457,22 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
             tui.request_render()
 
     def _on_stdin_frame(frame: str) -> None:
+        nonlocal tools_expanded
+        if frame == "\x0f":  # Ctrl+O ("app.tools.expand")
+            # Upstream wires this as `this.defaultEditor.onAction
+            # ("app.tools.expand", ...)` (interactive-mode.ts:2513) — an
+            # editor-level action binding. This port's `keybindings.py`/
+            # `DEFAULT_EDITOR_BINDINGS` maps *editor* actions only (cursor
+            # motion, kill-ring, etc.); toggling every ToolExecution
+            # component in the transcript is an app-level concern, not an
+            # editor one, so it is intercepted here — at the exact same
+            # layer this app already special-cases Ctrl+C/Ctrl+D — instead
+            # of being threaded through the editor's action-binding table.
+            tools_expanded = not tools_expanded
+            for tool_comp in tool_components.values():
+                tool_comp.set_expanded(tools_expanded)
+            tui.request_render()
+            return
         if frame == "\x03":  # Ctrl+C
             # Critical finding 1 (task-16 fix round 1): raw mode
             # (engine/terminal.py) clears ISIG for the whole session, so a

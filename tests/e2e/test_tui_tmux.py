@@ -32,9 +32,11 @@ Engine notes:
 - All assertions are poll-based via ``tmux_util`` (no bare sleeps).
 """
 
+import re
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -46,6 +48,7 @@ pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux requi
 FIXTURES = Path(__file__).parent / "fixtures"
 TWO_TURN = FIXTURES / "fake_two_turn.json"
 THREE_TURNS = FIXTURES / "fake_three_turns.json"
+LONG_BASH_OUTPUT = FIXTURES / "fake_bash_long_output.json"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -98,6 +101,24 @@ def _capture_raw(pane: TmuxPane) -> str:
     return out.stdout
 
 
+def _wait_for_in_history(pane: TmuxPane, pattern: str, timeout: float = 10.0) -> str:
+    """Like ``TmuxPane.wait_for``, but polls the full scrollback
+    (``capture -S -``) instead of just the current visible screen — needed
+    when the awaited content may have already scrolled past the top of a
+    fixed-height (30-row) tmux window by the time we poll (e.g. a tool
+    header rendered above a long, still-growing collapsed-preview body)."""
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        last = _capture_history(pane)
+        if re.search(pattern, last):
+            return last
+        time.sleep(0.2)
+    raise AssertionError(
+        f"pattern {pattern!r} not seen in scrollback within {timeout}s; last:\n{last}"
+    )
+
+
 def _assert_no_marker_leak(pane: TmuxPane) -> None:
     raw = _capture_raw(pane)
     assert CURSOR_MARKER not in raw
@@ -134,8 +155,45 @@ def test_stream_full_turn_and_exit(pane):
 
 def test_tool_call_line(pane):
     pane.send("do something")
-    pane.wait_for(r"\[tool\] ls")  # 工具行（含参数 JSON 截断渲染）
+    # Task-19 acceptance follow-up: the tool line is now a styled
+    # ToolExecution component (bold header + state-tinted background),
+    # not a plain "[tool] <name> <args>" line — header still shows the
+    # tool name + truncated args JSON, and (new) a successful result's
+    # content is shown too (collapsed inside the component), not silently
+    # dropped.
+    pane.wait_for(r'ls \{"path"')  # 工具头（含参数 JSON 截断渲染）
+    pane.wait_for(r"hello\.txt")  # 成功结果内容现在会显示（收纳进组件背景内）
     pane.wait_for(r"I saw the files")  # 回合完整走完
+
+
+def test_tool_execution_styled_header_and_ctrl_o_expands(tmp_path):
+    """New scenario (task-19 acceptance follow-up): a bash tool call whose
+    output exceeds the collapsed preview (5 lines, ``core/tools/bash.ts``'s
+    real ``BASH_PREVIEW_LINES``) renders a styled "$ <command>" header,
+    collapses to its tail with a "more lines" hint, and
+    Ctrl+O (``\\x0f``) expands it to show a marker line from the otherwise-
+    hidden head of the output (``seq 1 30``'s first line, "1", polled via
+    the full scrollback since the 30-row tmux window may have already
+    scrolled the header/early lines past the visible screen by the time
+    the turn finishes)."""
+    p = _start_pane(tmp_path, LONG_BASH_OUTPUT)
+    try:
+        p.send("count please")
+        _wait_for_in_history(p, r"\$ seq 1 30")  # styled bash header
+        p.wait_for(r"counted them all")  # turn completed
+        _wait_for_in_history(p, r"more lines")  # collapsed hint present
+        # Trailing spaces are real here: apply_background_to_line pads every
+        # row out to the full terminal width so the tinted background fills
+        # it — "1" is followed by padding, never immediately by "$".
+        assert not re.search(r"(?m)^1\s*$", _capture_history(p)), (
+            "line '1' (seq's first output line) must be hidden while collapsed"
+        )
+
+        _send_raw(p, "C-o")  # Ctrl+O: expand
+
+        _wait_for_in_history(p, r"(?m)^1\s*$")  # now visible: full output expanded
+    finally:
+        p.kill()
 
 
 def test_markdown_rerender_at_message_end(pane):
@@ -166,7 +224,10 @@ def test_ctrl_c_interrupts_and_continues(tmp_path):
     p2 = _start_pane(tmp_path, slow)
     try:
         p2.send("go")
-        p2.wait_for(r"\[tool\] bash")
+        # Task-19 acceptance follow-up: bash's ToolExecution header is
+        # "$ <command>" (bash-execution.ts format), not the old
+        # "[tool] bash ..." plain-text line.
+        p2.wait_for(r"\$ sleep 30")
         # 真字节路径（Task 16 C1）：raw mode 已清 ISIG，send-keys C-c 送达的是
         # stdin 字节 \x03，走 _on_stdin_frame 的 turn_task.cancel() 分支
         p2.send_ctrl_c()

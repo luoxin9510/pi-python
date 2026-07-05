@@ -75,6 +75,7 @@ and exits instead of raising a traceback.
 | `Ctrl+C` | During a running turn: interrupt the agent and return to the prompt. At the prompt: discard whatever is typed so far (including a multi-line draft) and start a fresh prompt |
 | `Ctrl+D` | Exit at an empty prompt (readline EOF semantics); on a non-empty line, deletes the character under the cursor |
 | `Up` / `Down` | At the start/end of the draft: browse prompt history (your current, unsent draft is preserved and restored when you arrow back down past it). Elsewhere: move the cursor a line up/down |
+| `Ctrl+O` | Toggle expand/collapse of tool call output — applies to every tool execution shown so far this session, not just the most recent one |
 
 Prompt history is per-session and in-memory, matching upstream pi (the old
 `~/.pi-python/tui-history` file from the previous prompt_toolkit UI is no

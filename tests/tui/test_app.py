@@ -456,11 +456,21 @@ async def test_loader_visible_during_turn_and_gone_after(tmp_path, stdin_pipe):
 
 
 # =============================================================================
-# 4. Tool-result error renders a reddish line ("deny/error" red line)
+# 4. Tool-result error tints the ToolExecution component's own background
+#    (task-19 acceptance follow-up: styled tool-execution components)
 # =============================================================================
 
+# dark.json vars.toolErrorBg "#3c2828" -> "\x1b[48;2;60;40;40m" (see
+# components/tool_execution.py's _TOOL_ERROR_BG). Prior to this feature,
+# a tool-result error was surfaced as a *separate* reddish foreground Text
+# line appended after the (plain-text) tool-call line -- upstream
+# tool-execution.ts has no such separate line: the component's own
+# error-tinted background is the sole error indicator, and this port now
+# matches that (see app.py's ToolResultEvent handling).
+_TOOL_ERROR_BG = "\x1b[48;2;60;40;40m"
 
-async def test_tool_result_error_renders_reddish_line(tmp_path, stdin_pipe):
+
+async def test_tool_result_error_tints_the_tool_component_error_background(tmp_path, stdin_pipe):
     script = [
         AssistantMessage(
             content=[ToolCallContent(id="1", name="totally_bogus_tool_xyz", arguments={})]
@@ -479,7 +489,9 @@ async def test_tool_result_error_renders_reddish_line(tmp_path, stdin_pipe):
         ops = list(term.ops)
         error_ops = [op for op in ops if "totally_bogus_tool_xyz" in op or "Unknown tool" in op]
         assert error_ops, "expected an op containing the tool-error text"
-        assert any(_has_reddish_styling(op) for op in error_ops)
+        assert any(_TOOL_ERROR_BG in op for op in error_ops), (
+            "expected the tool-error background to tint the op containing the error text"
+        )
 
 
 # =============================================================================
@@ -951,9 +963,14 @@ def test_extract_text_joins_blocks_skipping_tool_calls():
 
 async def test_tool_call_line_args_truncated(tmp_path, stdin_pipe):
     # Gap closure: the retired test_render.py's test_tool_call_line_truncated
-    # asserted long tool-call arguments get clipped in the "[tool] <name>
-    # <args>" line (_ARG_TRUNC in app.py) — no prior test against this
-    # engine pinned that truncation actually happens.
+    # asserted long tool-call arguments get clipped — no prior test against
+    # this engine pinned that truncation actually happens.
+    #
+    # Task-19 acceptance follow-up (styled ToolExecution components): the
+    # tool line is no longer a plain "[tool] <name> <args>" Text line —
+    # it's a ToolExecution component whose header is the bold, toolTitle-
+    # colored tool name (bash's own header format is "$ <command>", per
+    # bash-execution.ts, with no raw "[tool] " prefix at all upstream).
     long_cmd = "x" * 500
     script = [
         AssistantMessage(
@@ -967,19 +984,28 @@ async def test_tool_call_line_args_truncated(tmp_path, stdin_pipe):
     async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
         send(stdin_pipe, "go")
         send(stdin_pipe, "\r")
-        await wait_until(lambda: "[tool] bash" in full_ops_text(term))
+        # A lone "$" (word-wrapping the long truncated command at the
+        # terminal's width can land a line break right after "$ ", so
+        # checking for a longer contiguous "$ xxx" substring is unreliable).
+        await wait_until(lambda: "$" in full_ops_text(term))
+        await wait_until(lambda: "x" * 20 in full_ops_text(term))  # truncated prefix did render
         assert long_cmd not in full_ops_text(term), (
             "tool-call arguments must be truncated, never echoed in full"
         )
         await wait_until(lambda: "finished" in full_ops_text(term))
 
 
-async def test_tool_result_success_content_not_echoed(tmp_path, stdin_pipe):
-    # Gap closure: the retired test_render.py's
-    # test_tool_result_only_errors_printed asserted a *successful* tool
-    # result's content is never printed (only errors are, via
-    # test_tool_result_error_renders_reddish_line above) — no prior test
-    # against this engine pinned the "success is silent" half of that rule.
+async def test_tool_result_success_content_shown_inside_tool_component(tmp_path, stdin_pipe):
+    # Task-19 acceptance follow-up (styled ToolExecution components):
+    # reverses the prior behavior this test used to pin (a successful
+    # tool result's content was never printed at all). Upstream
+    # tool-execution.ts's createResultFallback always shows the result
+    # (`theme.fg("toolOutput", output)`) inside the component's own
+    # success-tinted background, regardless of error/success — that IS
+    # the maintainer's side-by-side finding ("pi shows styled
+    # tool-execution components", this port showed a bare call line and
+    # silently dropped success content). This is a deliberate, disclosed
+    # behavior change, not a regression.
     (tmp_path / "success_marker_9f3a.txt").write_text("x")
     script = [
         AssistantMessage(content=[ToolCallContent(id="1", name="ls", arguments={})]),
@@ -992,9 +1018,48 @@ async def test_tool_result_success_content_not_echoed(tmp_path, stdin_pipe):
         send(stdin_pipe, "go")
         send(stdin_pipe, "\r")
         await wait_until(lambda: "all good" in full_ops_text(term))
-        assert "success_marker_9f3a.txt" not in full_ops_text(term), (
-            "a successful tool result's content must never be echoed"
+        assert "success_marker_9f3a.txt" in full_ops_text(term), (
+            "a successful tool result's content must now be shown, "
+            "collapsed inside the ToolExecution component's own background"
         )
+
+
+# =============================================================================
+# Ctrl+O ("app.tools.expand", task-19 acceptance follow-up): toggles every
+# live ToolExecution component's expand state (interactive-mode.ts:2513/3636)
+# =============================================================================
+
+
+async def test_ctrl_o_toggles_tool_output_expand_collapse(tmp_path, stdin_pipe):
+    script = [
+        AssistantMessage(
+            content=[ToolCallContent(id="1", name="bash", arguments={"command": "seq 1 30"})]
+        ),
+        done("counted"),
+    ]
+    client = FakeClient(script=script)
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
+        send(stdin_pipe, "go")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "counted" in full_ops_text(term))
+        await wait_until(lambda: "more lines" in full_ops_text(term))
+
+        # Collapsed by default: the tail ~20 lines are shown ("30" visible),
+        # the very first output line ("1") is hidden from the *current*
+        # screen (unlike full_ops_text, which never loses an earlier write
+        # even after it scrolls off/gets replaced on-screen).
+        def _visible_lines() -> list[str]:
+            return [_visible_text(row).strip() for row in term.screen()]
+
+        assert "30" in screen_text(term)
+        assert "1" not in _visible_lines(), "expected line '1' hidden while collapsed"
+
+        send(stdin_pipe, b"\x0f")  # Ctrl+O
+
+        await wait_until(lambda: "1" in _visible_lines())
+        assert "ctrl+o to collapse" in full_ops_text(term)
 
 
 async def test_error_event_and_agent_end_error_reason_rendered(tmp_path, stdin_pipe):
