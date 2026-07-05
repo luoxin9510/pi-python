@@ -208,7 +208,7 @@ async def _quit(ctx: CommandContext, _: str) -> None:
     ctx.app.should_quit = True
 
 
-def _format_key(key: "str | list[str]") -> str:
+def _format_key(key: str | list[str]) -> str:
     def cap(p: str) -> str:
         # NOT str.capitalize() — that lowercases the tail ("pageUp" → "Pageup").
         return p[:1].upper() + p[1:] if p else p
@@ -299,7 +299,7 @@ async def _hotkeys(ctx: CommandContext, _: str) -> None:
             lines.append(f"  {_format_key(key):<24} {label}")
         lines.append("")
     # app-level bytes not in the bindings table (app.py _on_stdin_frame):
-    lines.append("\x1b[1mSession\x1b[0m")
+    lines.append("\x1b[1mGlobal\x1b[0m")
     lines.append(f"  {'Ctrl+C':<24} Interrupt turn / clear input")
     lines.append(f"  {'Ctrl+D':<24} Exit (empty prompt)")
     ctx.sink.emit_lines(lines)
