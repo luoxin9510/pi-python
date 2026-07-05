@@ -137,7 +137,7 @@ from typing import Callable
 
 import pytest
 
-from pipython import AssistantMessage, TextContent, ToolCallContent
+from pipython import AssistantMessage, TextContent, ToolCallContent, Usage
 from pipython.testing import FakeClient
 from pipython.tui.app import extract_text, load_fake_client, make_client
 from pipython.tui.components.loader import DEFAULT_FRAMES
@@ -255,6 +255,19 @@ def _visible_text(row: str) -> str:
     substring like "first" into "\\x1b[7mf\\x1b[0mirst" when the cursor sits
     at column 0)."""
     return _CSI_RE.sub("", row)
+
+
+def _footer_lines(term: RecordingTerm) -> tuple[str, str]:
+    """The footer (Task 3) is wired as the *last* child of the root
+    Container -- after the editor -- so its two rendered lines are always
+    the last two non-blank rows of the current screen, regardless of how
+    tall the transcript above it has grown (`RecordingTerm.screen()` is a
+    fixed-size `rows`-length array, trailing-padded with "" for rows never
+    written to; see engine/conftest.py). Returns (pwd-line, stats-line),
+    ANSI-stripped for plain substring assertions."""
+    rows = [r for r in term.screen() if _visible_text(r).strip()]
+    assert len(rows) >= 2, "expected at least the footer's own two rows to be rendered"
+    return _visible_text(rows[-2]), _visible_text(rows[-1])
 
 
 # =============================================================================
@@ -1160,3 +1173,59 @@ async def test_command_handler_exception_does_not_crash_app_loop(tmp_path, stdin
         send(stdin_pipe, "/help")
         send(stdin_pipe, "\r")
         await wait_until(lambda: "quit" in full_ops_text(term))
+
+
+# =============================================================================
+# Task 3 (phase-4 footer): Footer wired into the root Container, reading
+# app_state.session fresh on every render (spec §2.1 C1's own regression
+# guard). This is the wiring test, not a Footer-internals test (those live
+# in tests/tui/components/test_footer.py against Footer directly) -- it
+# only needs to prove that (a) run_app actually constructs and mounts a
+# Footer at all, and (b) /clear's session swap is visible to it immediately
+# (no frozen app_state.session reference captured at construction time).
+# =============================================================================
+
+
+async def test_footer_shows_tokens_and_resets_on_clear(tmp_path, stdin_pipe):
+    script = [
+        AssistantMessage(
+            content=[TextContent(text="done")],
+            usage=Usage(input_tokens=1200, output_tokens=340, cost=0.012),
+        )
+    ]
+    client = FakeClient(script=script)
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
+        send(stdin_pipe, "hi")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "↑1.2k" in full_ops_text(term))
+
+        pwd_line, stats_line = _footer_lines(term)
+        # stats segment: accumulated usage from the one scripted assistant
+        # message, plus the model name -- both the token/cost figures and
+        # the pwd segment must be live in the bottom two rows of the screen.
+        assert "↑1.2k" in stats_line
+        assert "↓340" in stats_line
+        assert "$0.012" in stats_line
+        assert "fake/model" in stats_line
+        assert pwd_line.strip(), "expected a non-empty cwd segment on the footer's own line"
+
+        send(stdin_pipe, "/clear")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "new session" in full_ops_text(term))
+
+        # Regression guard (spec §2.1 C1): /clear swaps app_state.session
+        # out for a brand-new (empty) one. If Footer had captured that
+        # session object once at construction time instead of re-reading
+        # `self._app.session` on every render, the token segment would
+        # still show the old totals forever. The new session's store has
+        # no assistant-usage entries at all, so the "↑"/"↓" segment must be
+        # gone entirely -- not just re-zeroed -- while the cwd segment
+        # (untouched by /clear) stays exactly as it was.
+        await wait_until(lambda: "↑" not in _footer_lines(term)[1])
+        pwd_line_after, stats_line_after = _footer_lines(term)
+        assert "↑" not in stats_line_after
+        assert "↓" not in stats_line_after
+        assert "fake/model" in stats_line_after
+        assert pwd_line_after == pwd_line, "cwd segment must be unaffected by /clear"
