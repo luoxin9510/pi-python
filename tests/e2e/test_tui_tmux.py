@@ -36,6 +36,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -70,6 +71,42 @@ def _start_pane(agent_cwd: Path, fixture: Path) -> TmuxPane:
         f"uv run --extra tui pipython --model fake/model --cwd {shlex.quote(str(agent_cwd))}",
         env={"PI_PYTHON_FAKE_SCRIPT": str(fixture)},
         cwd=str(REPO_ROOT),
+    )
+    p.wait_for(READY)
+    return p
+
+
+def _start_pane_sized(agent_cwd: Path, fixture: Path, *, cols: int, rows: int) -> TmuxPane:
+    """Task 3 (phase-4 footer) narrow-pane scenario: `TmuxPane.start` itself
+    hardcodes a fixed 100x30 `-x`/`-y` (its own module docstring), so this
+    duplicates its two `tmux` calls (new-session + remain-on-exit) verbatim
+    with a caller-chosen size instead of touching `tmux_util.py` (out of
+    this task's file list) -- everything *after* the pane exists (`wait_for`/
+    `capture`/`kill`, all from the shared `TmuxPane` instance) is still the
+    real, unduplicated `tmux_util` machinery."""
+    p = TmuxPane()
+    env_prefix = f"PI_PYTHON_FAKE_SCRIPT={shlex.quote(str(fixture))}"
+    cmd = f"uv run --extra tui pipython --model fake/model --cwd {shlex.quote(str(agent_cwd))}"
+    subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            p.name,
+            "-x",
+            str(cols),
+            "-y",
+            str(rows),
+            "-c",
+            str(REPO_ROOT),
+            f"{env_prefix} {cmd}",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["tmux", "set-option", "-t", p.name, "remain-on-exit", "on"],
+        check=True,
     )
     p.wait_for(READY)
     return p
@@ -299,3 +336,64 @@ def test_multiline_submit_via_ctrl_j(pane):
     # 编辑器已清空，两行都以 user 回显形式留在 transcript
     assert "first multiline row" in cap
     assert "second multiline row" in cap
+
+
+# =============================================================================
+# Task 3 (phase-4 footer): footer wired in against a REAL git repo (not the
+# fakes tests/tui/test_app.py drives GitBranchProvider through), plus a
+# narrow/short real-pty pane proving the footer's 2 extra bottom rows don't
+# push the editor's own cursor out of the viewport.
+# =============================================================================
+
+_FOOTER_BRANCH = "e2ebranch"
+
+
+def _make_short_git_repo(branch: str) -> Path:
+    """A real `git init`'d repo for `GitBranchProvider` to read HEAD from.
+    Deliberately NOT pytest's own `tmp_path` fixture: that fixture nests
+    under the test's own (often long, node-id-derived) directory name, and
+    the footer truncates its pwd+branch line to the terminal's width
+    (footer.py's `truncate_to_width`, keeps the *front*, drops the tail) --
+    a long enough tmp_path would silently truncate away the very
+    `(<branch>)` suffix this scenario asserts on, even on the default
+    100-column pane. A short, manually-managed dir under `/tmp` avoids that
+    entirely, on any pane width this test uses."""
+    d = Path(tempfile.mkdtemp(prefix="pyfoot-", dir="/tmp"))
+    subprocess.run(["git", "init", "-q", "-b", branch], cwd=str(d), check=True)
+    return d
+
+
+def test_footer_shows_real_git_branch_and_survives_narrow_pane():
+    repo = _make_short_git_repo(_FOOTER_BRANCH)
+    try:
+        # -- default-size pane: footer's cwd line shows the real branch,
+        # resolved from the repo's actual .git/HEAD (GitBranchProvider,
+        # Task 1) -- not a FakeClient/test-double stand-in.
+        p = _start_pane(repo, TWO_TURN)
+        try:
+            p.wait_for(rf"\({re.escape(_FOOTER_BRANCH)}\)")
+        finally:
+            p.kill()
+
+        # -- narrow/short pane: the footer is wired as the LAST child of
+        # the root Container (app.py), after the editor, so it occupies
+        # the tree's bottom-most 2 rows -- exactly where engine/tui.py's
+        # viewport math (`viewport_top = max(0, len(lines) - height)`,
+        # `_extract_cursor_position` only scans the bottom `height` rows)
+        # could in principle clip the editor's own cursor row once the
+        # terminal is short enough that editor+footer alone approach the
+        # full height. A regression here would surface as: what you just
+        # typed genuinely never appears in the capture -- editor.py always
+        # re-renders its own row with the typed text every frame regardless
+        # of hardware-cursor visibility, so a missing echo means the row
+        # itself scrolled out of the visible window, not just a hidden
+        # cursor.
+        p2 = _start_pane_sized(repo, TWO_TURN, cols=50, rows=12)
+        try:
+            p2.wait_for(rf"\({re.escape(_FOOTER_BRANCH)}\)")
+            _send_raw(p2, "narrow pane echo check")
+            p2.wait_for(r"narrow pane echo check")
+        finally:
+            p2.kill()
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)

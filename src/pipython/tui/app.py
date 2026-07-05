@@ -144,6 +144,8 @@ from pipython.testing import FakeClient
 from pipython.tui.completers import build_file_list
 from pipython.tui.components.autocomplete import CombinedProvider, CommandProvider, PathProvider
 from pipython.tui.components.editor import Editor
+from pipython.tui.components.footer import Footer
+from pipython.tui.components.git_branch import GitBranchProvider
 from pipython.tui.components.loader import Loader
 from pipython.tui.components.markdown import Markdown
 from pipython.tui.components.text import Text
@@ -309,266 +311,304 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
     # default via getattr.
     editor.kitty_enabled = bool(getattr(term, "kitty_enabled", False))
 
+    # Task 3 (phase-4 footer): git-branch polling + the footer itself, wired
+    # in right alongside the rest of the component tree. GitBranchProvider's
+    # constructor is a synchronous, internally-guarded HEAD read (never
+    # raises — see git_branch.py), so it's safe to construct up here, before
+    # the try/finally below that owns its lifecycle.
+    git = GitBranchProvider(cwd)
+    footer = Footer(app_state, git)
+
     root = Container()
     root.add_child(transcript)
     root.add_child(loader_slot)
     root.add_child(editor)
+    root.add_child(footer)  # after editor — bottom of the tree
     tui.set_root(root)
     tui.set_focus(editor)
 
-    provider = CombinedProvider(
-        [
-            PathProvider(lambda: build_file_list(cwd)),
-            CommandProvider({name: cmd.description for name, cmd in registry.items()}),
-        ]
-    )
-    editor.set_autocomplete_provider(provider, tui)
-
-    sink: Sink = _ComponentSink(transcript, tui)
-    caps: TermCaps = detect_caps(dict(os.environ))
-
-    # Task 18: `CommandContext.console`/`RichSink` are gone (rich dropped
-    # from pyproject entirely) — `sink` is now the context's only output
-    # boundary, and it is always this real `_ComponentSink`.
-    cmd_ctx = CommandContext(app=app_state, sink=sink)
-
+    # R3 (git lifecycle): `turn_task`/`fd` are pre-declared as their "not yet
+    # started" sentinel here, before the try below, and `loop` is resolved
+    # unconditionally too — so that if setup inside the try raises *before*
+    # reaching each variable's real assignment (detect_caps, add_reader,
+    # tui.start(), ...), the shared finally can still safely reference all
+    # three (`if fd is not None` / `if turn_task is not None` / `loop....`)
+    # instead of a bare `NameError` masking the original exception. This
+    # doesn't change any cleanup *behavior* from before this task — it only
+    # guarantees the names already exist by the time the (now much bigger)
+    # try's finally runs.
     quit_event = asyncio.Event()
     turn_task: asyncio.Task[None] | None = None
-
-    # Ctrl+O ("app.tools.expand", interactive-mode.ts:2513/3636): a single
-    # global expand/collapse flag applied to every ToolExecution component
-    # ever created this session (upstream's toggleToolOutputExpansion —
-    # keyed by tool_call.id so a ToolResultEvent can find the component its
-    # ToolCallEvent already created and pushed into the transcript).
-    tools_expanded = False
-    tool_components: dict[str, ToolExecution] = {}
-
-    def _on_app_action(action: str) -> None:
-        # Task-19 acceptance bug 2 fix: this used to be a raw
-        # `frame == "\x0f"` string comparison inlined in
-        # `_on_stdin_frame` — silently inert on any terminal where Kitty
-        # keyboard-protocol negotiation succeeded, since Ctrl+O then
-        # arrives as CSI-u ("\x1b[111;5u"), never the legacy byte. Now
-        # registered as `editor.on_app_action` (components/editor.py):
-        # `Editor.handle_key` recognizes "app.tools.expand"
-        # (engine/keybindings.py) through the normal `parse_key` ->
-        # `key_id` -> binding-lookup pipeline, which normalizes both
-        # encodings identically, and calls this callback — the app-level
-        # concern (toggling every ToolExecution component in the
-        # transcript) stays here, not in the editor.
-        nonlocal tools_expanded
-        if action == "app.tools.expand":
-            tools_expanded = not tools_expanded
-            for tool_comp in tool_components.values():
-                tool_comp.set_expanded(tools_expanded)
-            tui.request_render()
-
-    editor.on_app_action = _on_app_action
-
-    def _append(text: str, style: str = "", *, wrap: bool = True) -> None:
-        transcript.add_child(Text(text, style=style, wrap=wrap))
-        tui.request_render()
-
-    def _do_quit() -> None:
-        # wrap=False (components/text.py deviation 5): the session path is an
-        # unbreakable token after "session: " -- word-wrapping this banner can
-        # land the wrap point exactly on that space on a narrow real pty,
-        # splitting "session:" and the path across two captured rows with no
-        # rejoinable space (breaks `pane.wait_for(r"session: ")` — see
-        # .superpowers/sdd/task-17-report.md). Matches phase-2 app.py's
-        # deliberate `soft_wrap=True` for this exact line: let the terminal
-        # soft-wrap natively instead of hard-wrapping at a word boundary.
-        _append(f"session: {app_state.session.store.path}", style=_DIM, wrap=False)
-        quit_event.set()
-
-    def _on_submit(text: str) -> None:
-        nonlocal turn_task
-        if not text:
-            return
-        # Important finding 2 (task-16 fix round 1): slash commands
-        # serialize with turns under the exact same single-flight gate
-        # plain-text turns already used — a command submitted while a turn
-        # is in flight is ignored (not queued), matching phase 2's
-        # ignore-while-busy semantics, rather than racing a second command
-        # (e.g. `/clear` swapping app_state.session) against the running
-        # turn's still-iterating `session.prompt()` generator.
-        busy = turn_task is not None and not turn_task.done()
-        if busy:
-            # Fix round 2 (task-16 re-review): the echo + add_to_history
-            # calls used to happen BEFORE this busy check, even though
-            # `Editor._submit_value` had already cleared the buffer on
-            # Enter — the text looked "accepted" (echoed into the
-            # transcript, recorded in history) but never reached the model,
-            # and the draft was destroyed. Restore it into the editor
-            # instead (cursor lands at the end, `set_text`'s own default)
-            # so nothing is lost and nothing pretends to be accepted. Full
-            # upstream queueing (`restoreQueuedMessagesToEditor`) is a
-            # phase-4 parity item, not built here.
-            editor.set_text(text)
-            return
-        editor.add_to_history(text)
-        _append(text)
-        if text.startswith("/"):
-            asyncio.create_task(_run_command(text))
-        else:
-            turn_task = asyncio.create_task(_run_turn(text))
-
-    async def _run_command(text: str) -> None:
-        try:
-            await dispatch(registry, cmd_ctx, text)
-        except Exception as exc:  # handler bug must not crash the app loop
-            _append(f"[command error] {type(exc).__name__}: {exc}", style=_RED)
-            return
-        if app_state.should_quit:
-            _do_quit()
-
-    async def _run_turn(text: str) -> None:
-        loop = asyncio.get_running_loop()
-        loader_slot.active = True
-        loader.start()
-        tui.request_render()
-
-        this_task = asyncio.current_task()
-        assert this_task is not None
-        loop.add_signal_handler(signal.SIGINT, this_task.cancel)
-
-        buf = ""
-        slot: Text | None = None
-        try:
-            async for event in app_state.session.prompt(text):
-                if isinstance(event, MessageStart):
-                    buf = ""
-                    slot = Text("")
-                    transcript.add_child(slot)
-                elif isinstance(event, TextDelta):
-                    buf += event.text
-                    if slot is not None:
-                        slot.set_content(buf)
-                        slot.invalidate()
-                    tui.request_render()
-                elif isinstance(event, MessageEnd):
-                    full = extract_text(event.message)
-                    if slot is not None and full.strip():
-                        transcript.replace_child(slot, Markdown(full, caps))
-                    slot = None
-                    tui.request_render()
-                elif isinstance(event, ToolCallEvent):
-                    # Maintainer side-by-side finding (task-19 acceptance,
-                    # pulled forward from phase-4): a styled ToolExecution
-                    # component (bold title + state-tinted background)
-                    # replaces the old plain "[tool] <name> <args>" Text
-                    # line. Keyed by tool_call.id so the matching
-                    # ToolResultEvent below can find it again.
-                    comp = ToolExecution(event.tool_call.name, event.tool_call.arguments)
-                    comp.set_expanded(tools_expanded)
-                    tool_components[event.tool_call.id] = comp
-                    transcript.add_child(comp)
-                    tui.request_render()
-                elif isinstance(event, ToolResultEvent):
-                    # The component's own error-tinted background is now
-                    # the error indicator (matches upstream: there is no
-                    # separate red error line for tool-result errors,
-                    # tool-execution.ts's state background is the sole
-                    # indicator) — replaces the old separate red `_append`
-                    # for `is_error` tool results.
-                    tool_comp = tool_components.get(event.tool_call.id)
-                    if tool_comp is not None:
-                        tool_comp.set_result(event.result.content, event.result.is_error)
-                    tui.request_render()
-                elif isinstance(event, ErrorEvent):
-                    _append(event.message, style=_RED)
-                elif isinstance(event, AgentEnd):
-                    if event.reason != "done":
-                        _append(f"[end] {event.reason}")
-        except asyncio.CancelledError:
-            _append("[interrupted]", style=_YELLOW)
-        except Exception as exc:  # rendering/session-layer surprise must not crash the app loop
-            _append(f"[error] {type(exc).__name__}: {exc}", style=_RED)
-        finally:
-            with contextlib.suppress(ValueError):
-                loop.remove_signal_handler(signal.SIGINT)
-            loader.stop()
-            loader_slot.active = False
-            tui.request_render()
-
-    def _on_stdin_frame(frame: str) -> None:
-        # Ctrl+O ("app.tools.expand") is no longer intercepted here as a raw
-        # frame comparison (task-19 acceptance bug 2 fix: that only ever
-        # matched the legacy "\x0f" byte, silently missing the CSI-u
-        # encoding a real Kitty-capable terminal sends post-negotiation).
-        # It now falls through to `tui.handle_input(frame)` below like any
-        # other key, reaching `editor.handle_key` via the normal
-        # `parse_key` -> `key_id` -> binding-lookup pipeline, which
-        # dispatches it through `editor.on_app_action` (`_on_app_action`
-        # above) — see that function's docstring for the full trace.
-        if frame == "\x03":  # Ctrl+C
-            # Critical finding 1 (task-16 fix round 1): raw mode
-            # (engine/terminal.py) clears ISIG for the whole session, so a
-            # REAL terminal's Ctrl+C never arrives as a process signal —
-            # only as this stdin byte. If a turn is in flight, cancel it
-            # (routes through _run_turn's existing `asyncio.CancelledError`
-            # handler -> "[interrupted]"); otherwise fall back to
-            # editor.py's documented behavior of no-oping on Ctrl+C
-            # ("parent's job (exit/clear)") by clearing the draft buffer
-            # ourselves. `loop.add_signal_handler(signal.SIGINT, ...)` in
-            # `_run_turn` remains wired as a secondary path for a genuine
-            # *external* signal (e.g. `kill -INT <pid>` from another
-            # process) — not the primary Ctrl+C path anymore.
-            if turn_task is not None and not turn_task.done():
-                turn_task.cancel()
-            else:
-                editor.set_text("")
-                tui.request_render()
-            return
-        if frame == "\x04" and editor.text == "":  # Ctrl+D, empty buffer: exit
-            _do_quit()
-            return
-        # Important finding 1 (task-16 fix round 1): TUI.handle_input now
-        # requests its own render after dispatching (upstream parity,
-        # tui.ts:827-834) — no separate request_render() call needed here
-        # anymore.
-        tui.handle_input(frame)
-
-    stdin_buffer = StdinBuffer(on_frame=_on_stdin_frame)
-
-    # Obligation (b): resize goes through term.on_resize only — never
-    # loop.add_signal_handler(signal.SIGWINCH, ...).
-    on_resize = getattr(term, "on_resize", None)
-    if callable(on_resize):
-        on_resize(tui.on_resize)
-
-    # Obligation (a): drain_pending() bytes MUST be fed before the live
-    # reader attaches (engine/terminal.py's own binding requirement).
-    drain_pending = getattr(term, "drain_pending", None)
-    if callable(drain_pending):
-        pending = drain_pending()
-        if isinstance(pending, bytes) and pending:
-            stdin_buffer.feed(pending)
-
     loop = asyncio.get_running_loop()
-    try:
-        fd = sys.stdin.fileno()
-    except (AttributeError, OSError, ValueError):
-        fd = None
+    fd: int | None = None
 
-    def _readable() -> None:
-        assert fd is not None
+    # From here through `await quit_event.wait()` is wrapped in one try so
+    # that ANY setup failure below (detect_caps, add_reader, tui.start(),
+    # ...) — not just a clean quit — still runs the finally's cleanup,
+    # `git.stop()` first of all: without this, an exception raised partway
+    # through setup would leak GitBranchProvider's background polling task
+    # (spec §3 "git 生命周期 try/finally").
+    try:
+        provider = CombinedProvider(
+            [
+                PathProvider(lambda: build_file_list(cwd)),
+                CommandProvider({name: cmd.description for name, cmd in registry.items()}),
+            ]
+        )
+        editor.set_autocomplete_provider(provider, tui)
+
+        sink: Sink = _ComponentSink(transcript, tui)
+        caps: TermCaps = detect_caps(dict(os.environ))
+
+        # Task 18: `CommandContext.console`/`RichSink` are gone (rich dropped
+        # from pyproject entirely) — `sink` is now the context's only output
+        # boundary, and it is always this real `_ComponentSink`.
+        cmd_ctx = CommandContext(app=app_state, sink=sink)
+
+        # Ctrl+O ("app.tools.expand", interactive-mode.ts:2513/3636): a single
+        # global expand/collapse flag applied to every ToolExecution component
+        # ever created this session (upstream's toggleToolOutputExpansion —
+        # keyed by tool_call.id so a ToolResultEvent can find the component its
+        # ToolCallEvent already created and pushed into the transcript).
+        tools_expanded = False
+        tool_components: dict[str, ToolExecution] = {}
+
+        def _on_app_action(action: str) -> None:
+            # Task-19 acceptance bug 2 fix: this used to be a raw
+            # `frame == "\x0f"` string comparison inlined in
+            # `_on_stdin_frame` — silently inert on any terminal where Kitty
+            # keyboard-protocol negotiation succeeded, since Ctrl+O then
+            # arrives as CSI-u ("\x1b[111;5u"), never the legacy byte. Now
+            # registered as `editor.on_app_action` (components/editor.py):
+            # `Editor.handle_key` recognizes "app.tools.expand"
+            # (engine/keybindings.py) through the normal `parse_key` ->
+            # `key_id` -> binding-lookup pipeline, which normalizes both
+            # encodings identically, and calls this callback — the app-level
+            # concern (toggling every ToolExecution component in the
+            # transcript) stays here, not in the editor.
+            nonlocal tools_expanded
+            if action == "app.tools.expand":
+                tools_expanded = not tools_expanded
+                for tool_comp in tool_components.values():
+                    tool_comp.set_expanded(tools_expanded)
+                tui.request_render()
+
+        editor.on_app_action = _on_app_action
+
+        def _append(text: str, style: str = "", *, wrap: bool = True) -> None:
+            transcript.add_child(Text(text, style=style, wrap=wrap))
+            tui.request_render()
+
+        def _do_quit() -> None:
+            # wrap=False (components/text.py deviation 5): the session path is an
+            # unbreakable token after "session: " -- word-wrapping this banner can
+            # land the wrap point exactly on that space on a narrow real pty,
+            # splitting "session:" and the path across two captured rows with no
+            # rejoinable space (breaks `pane.wait_for(r"session: ")` — see
+            # .superpowers/sdd/task-17-report.md). Matches phase-2 app.py's
+            # deliberate `soft_wrap=True` for this exact line: let the terminal
+            # soft-wrap natively instead of hard-wrapping at a word boundary.
+            _append(f"session: {app_state.session.store.path}", style=_DIM, wrap=False)
+            quit_event.set()
+
+        def _on_submit(text: str) -> None:
+            nonlocal turn_task
+            if not text:
+                return
+            # Important finding 2 (task-16 fix round 1): slash commands
+            # serialize with turns under the exact same single-flight gate
+            # plain-text turns already used — a command submitted while a turn
+            # is in flight is ignored (not queued), matching phase 2's
+            # ignore-while-busy semantics, rather than racing a second command
+            # (e.g. `/clear` swapping app_state.session) against the running
+            # turn's still-iterating `session.prompt()` generator.
+            busy = turn_task is not None and not turn_task.done()
+            if busy:
+                # Fix round 2 (task-16 re-review): the echo + add_to_history
+                # calls used to happen BEFORE this busy check, even though
+                # `Editor._submit_value` had already cleared the buffer on
+                # Enter — the text looked "accepted" (echoed into the
+                # transcript, recorded in history) but never reached the model,
+                # and the draft was destroyed. Restore it into the editor
+                # instead (cursor lands at the end, `set_text`'s own default)
+                # so nothing is lost and nothing pretends to be accepted. Full
+                # upstream queueing (`restoreQueuedMessagesToEditor`) is a
+                # phase-4 parity item, not built here.
+                editor.set_text(text)
+                return
+            editor.add_to_history(text)
+            _append(text)
+            if text.startswith("/"):
+                asyncio.create_task(_run_command(text))
+            else:
+                turn_task = asyncio.create_task(_run_turn(text))
+
+        async def _run_command(text: str) -> None:
+            try:
+                await dispatch(registry, cmd_ctx, text)
+            except Exception as exc:  # handler bug must not crash the app loop
+                _append(f"[command error] {type(exc).__name__}: {exc}", style=_RED)
+                return
+            if app_state.should_quit:
+                _do_quit()
+
+        async def _run_turn(text: str) -> None:
+            turn_loop = asyncio.get_running_loop()
+            loader_slot.active = True
+            loader.start()
+            tui.request_render()
+
+            this_task = asyncio.current_task()
+            assert this_task is not None
+            turn_loop.add_signal_handler(signal.SIGINT, this_task.cancel)
+
+            buf = ""
+            slot: Text | None = None
+            try:
+                async for event in app_state.session.prompt(text):
+                    if isinstance(event, MessageStart):
+                        buf = ""
+                        slot = Text("")
+                        transcript.add_child(slot)
+                    elif isinstance(event, TextDelta):
+                        buf += event.text
+                        if slot is not None:
+                            slot.set_content(buf)
+                            slot.invalidate()
+                        tui.request_render()
+                    elif isinstance(event, MessageEnd):
+                        full = extract_text(event.message)
+                        if slot is not None and full.strip():
+                            transcript.replace_child(slot, Markdown(full, caps))
+                        slot = None
+                        # Task 3: a message can carry usage (tokens/cost) —
+                        # refresh the footer's own stats line now that the
+                        # session store has just persisted it.
+                        footer.invalidate()
+                        tui.request_render()
+                    elif isinstance(event, ToolCallEvent):
+                        # Maintainer side-by-side finding (task-19 acceptance,
+                        # pulled forward from phase-4): a styled ToolExecution
+                        # component (bold title + state-tinted background)
+                        # replaces the old plain "[tool] <name> <args>" Text
+                        # line. Keyed by tool_call.id so the matching
+                        # ToolResultEvent below can find it again.
+                        comp = ToolExecution(event.tool_call.name, event.tool_call.arguments)
+                        comp.set_expanded(tools_expanded)
+                        tool_components[event.tool_call.id] = comp
+                        transcript.add_child(comp)
+                        tui.request_render()
+                    elif isinstance(event, ToolResultEvent):
+                        # The component's own error-tinted background is now
+                        # the error indicator (matches upstream: there is no
+                        # separate red error line for tool-result errors,
+                        # tool-execution.ts's state background is the sole
+                        # indicator) — replaces the old separate red `_append`
+                        # for `is_error` tool results.
+                        tool_comp = tool_components.get(event.tool_call.id)
+                        if tool_comp is not None:
+                            tool_comp.set_result(event.result.content, event.result.is_error)
+                        tui.request_render()
+                    elif isinstance(event, ErrorEvent):
+                        _append(event.message, style=_RED)
+                    elif isinstance(event, AgentEnd):
+                        if event.reason != "done":
+                            _append(f"[end] {event.reason}")
+                        # Task 3: refresh the footer at the very end of the
+                        # turn too (covers the no-usage-on-MessageEnd corner
+                        # case, and is cheap/idempotent either way).
+                        footer.invalidate()
+                        tui.request_render()
+            except asyncio.CancelledError:
+                _append("[interrupted]", style=_YELLOW)
+            except Exception as exc:  # rendering/session-layer surprise must not crash the app loop
+                _append(f"[error] {type(exc).__name__}: {exc}", style=_RED)
+            finally:
+                with contextlib.suppress(ValueError):
+                    turn_loop.remove_signal_handler(signal.SIGINT)
+                loader.stop()
+                loader_slot.active = False
+                tui.request_render()
+
+        def _on_stdin_frame(frame: str) -> None:
+            # Ctrl+O ("app.tools.expand") is no longer intercepted here as a raw
+            # frame comparison (task-19 acceptance bug 2 fix: that only ever
+            # matched the legacy "\x0f" byte, silently missing the CSI-u
+            # encoding a real Kitty-capable terminal sends post-negotiation).
+            # It now falls through to `tui.handle_input(frame)` below like any
+            # other key, reaching `editor.handle_key` via the normal
+            # `parse_key` -> `key_id` -> binding-lookup pipeline, which
+            # dispatches it through `editor.on_app_action` (`_on_app_action`
+            # above) — see that function's docstring for the full trace.
+            if frame == "\x03":  # Ctrl+C
+                # Critical finding 1 (task-16 fix round 1): raw mode
+                # (engine/terminal.py) clears ISIG for the whole session, so a
+                # REAL terminal's Ctrl+C never arrives as a process signal —
+                # only as this stdin byte. If a turn is in flight, cancel it
+                # (routes through _run_turn's existing `asyncio.CancelledError`
+                # handler -> "[interrupted]"); otherwise fall back to
+                # editor.py's documented behavior of no-oping on Ctrl+C
+                # ("parent's job (exit/clear)") by clearing the draft buffer
+                # ourselves. `loop.add_signal_handler(signal.SIGINT, ...)` in
+                # `_run_turn` remains wired as a secondary path for a genuine
+                # *external* signal (e.g. `kill -INT <pid>` from another
+                # process) — not the primary Ctrl+C path anymore.
+                if turn_task is not None and not turn_task.done():
+                    turn_task.cancel()
+                else:
+                    editor.set_text("")
+                    tui.request_render()
+                return
+            if frame == "\x04" and editor.text == "":  # Ctrl+D, empty buffer: exit
+                _do_quit()
+                return
+            # Important finding 1 (task-16 fix round 1): TUI.handle_input now
+            # requests its own render after dispatching (upstream parity,
+            # tui.ts:827-834) — no separate request_render() call needed here
+            # anymore.
+            tui.handle_input(frame)
+
+        stdin_buffer = StdinBuffer(on_frame=_on_stdin_frame)
+
+        # Obligation (b): resize goes through term.on_resize only — never
+        # loop.add_signal_handler(signal.SIGWINCH, ...).
+        on_resize = getattr(term, "on_resize", None)
+        if callable(on_resize):
+            on_resize(tui.on_resize)
+
+        # Obligation (a): drain_pending() bytes MUST be fed before the live
+        # reader attaches (engine/terminal.py's own binding requirement).
+        drain_pending = getattr(term, "drain_pending", None)
+        if callable(drain_pending):
+            pending = drain_pending()
+            if isinstance(pending, bytes) and pending:
+                stdin_buffer.feed(pending)
+
         try:
-            data = os.read(fd, 4096)
-        except (BlockingIOError, InterruptedError):
-            return
-        except OSError:
-            data = b""
-        if data:
-            stdin_buffer.feed(data)
+            fd = sys.stdin.fileno()
+        except (AttributeError, OSError, ValueError):
+            fd = None
 
-    if fd is not None:
-        loop.add_reader(fd, _readable)
+        def _readable() -> None:
+            assert fd is not None
+            try:
+                data = os.read(fd, 4096)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                data = b""
+            if data:
+                stdin_buffer.feed(data)
 
-    tui.start()
-    try:
+        if fd is not None:
+            loop.add_reader(fd, _readable)
+
+        await git.start(on_change=tui.request_render)
+
+        tui.start()
         await quit_event.wait()
     finally:
+        await git.stop()
         if fd is not None:
             with contextlib.suppress(ValueError, OSError):
                 loop.remove_reader(fd)

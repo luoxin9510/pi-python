@@ -140,6 +140,32 @@ word movement is unaffected and follows the same rules as upstream.
 Unknown commands print an error and a `/help` hint instead of failing
 silently.
 
+### Footer
+
+A two-line status bar is always pinned to the bottom of the screen, below
+the editor:
+
+- **Line 1** — the working directory (abbreviated under `$HOME` as `~`,
+  e.g. `~/projects/pi-python`) followed by the current git branch in
+  parentheses, e.g. `~/projects/pi-python (main)` (detached HEAD shows
+  `(detached)`; outside a git repo, the branch segment is omitted
+  entirely). The branch is polled from `.git/HEAD` in the background and
+  updates live on checkout/switch, without needing a keypress.
+- **Line 2** — accumulated token usage for the current session
+  (`↑`/`↓` for input/output tokens, e.g. `↑1.2k ↓340`), accumulated cost
+  (e.g. `$0.012`), and the active model id. `/clear` starts a fresh session
+  with no usage yet, so this line's token/cost segments disappear (not just
+  reset to zero) until the next reply.
+
+Both lines are dim-styled and independently truncated (with a trailing
+`...`) to fit the terminal width if they'd otherwise overflow.
+
+Fields upstream pi's footer also shows — cache-read/write tokens, context
+window percentage used, the authenticated account (OAuth `sub`), the
+session's display name, and auto-compact status — aren't wired up yet; the
+SDK doesn't expose that data through to the TUI in this phase. They're a
+later-phase addition, not a deliberate omission from the design.
+
 ### Terminal capabilities
 
 The TUI detects true-color and [OSC 8 hyperlink](https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda)
