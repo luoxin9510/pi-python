@@ -634,6 +634,18 @@ class Editor:
         # default-off ``_kittyProtocolActive`` before negotiation completes.
         self.kitty_enabled: bool = False
 
+        # App-level action dispatch (task-19 acceptance bug 2 fix): mirrors
+        # upstream's ``CustomEditor.onAction`` registry
+        # (custom-editor.ts:23-27, ``actionHandlers: Map<AppKeybinding, ()
+        # => void>``) collapsed to a single callback, since this port only
+        # has one app-level action to dispatch so far
+        # (``"app.tools.expand"`` — see ``handle_key``). ``None`` by
+        # default so a standalone ``Editor`` (e.g. most of this test file)
+        # can still process every key without an app wired up; a pressed
+        # key bound to an ``"app.*"`` action then simply no-ops instead of
+        # raising.
+        self.on_app_action: Callable[[str], None] | None = None
+
         self._lines: list[str] = [""]
         self._cursor_line: int = 0
         self._cursor_col: int = 0
@@ -911,6 +923,23 @@ class Editor:
         """
         kb = self.bindings
         kid = key_id(e)
+
+        if kb.matches(kid, "app.tools.expand"):
+            # Task-19 acceptance bug 2 fix: this editor does not own
+            # "app.tools.expand" (toggling ToolExecution components in the
+            # transcript is an app-level concern — see ``app.py``'s module
+            # docstring), it merely recognizes the key like any other
+            # binding and forwards it to whatever app-level callback
+            # registered interest, mirroring upstream's
+            # ``CustomEditor.handleInput`` checking ``actionHandlers``
+            # before falling through to the parent ``Editor``
+            # (custom-editor.ts:66-71) and ``interactive-mode.ts:2513``'s
+            # ``this.defaultEditor.onAction("app.tools.expand", () =>
+            # this.toggleToolOutputExpansion())``. No-op if nothing is
+            # registered (e.g. a standalone ``Editor`` in a unit test).
+            if self.on_app_action is not None:
+                self.on_app_action("app.tools.expand")
+            return
 
         if kb.matches(kid, "tui.input.copy"):
             # Ctrl+C: parent's job (exit/clear) — nothing to do here.

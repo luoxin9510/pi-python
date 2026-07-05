@@ -27,6 +27,24 @@ phase-3 spec ruling, not a translation error — verified against upstream
 source before implementing (no upstream default table binds ``alt+enter``
 to anything).
 
+Declared deviation (task-19 acceptance bug 2 fix): ``"app.tools.expand":
+"ctrl+o"`` is added here even though it is not a ``tui.*`` editor action.
+Upstream keeps ``TUI_KEYBINDINGS`` (this file's actual source, editor-only)
+and the coding-agent-level ``KEYBINDINGS`` (``TUI_KEYBINDINGS`` merged with
+an ``app.*`` namespace — ``coding-agent/src/core/keybindings.ts:64-85``,
+including ``"app.tools.expand": { defaultKeys: "ctrl+o", ... }``) as two
+separate tables feeding one shared ``KeybindingsManager``. This port has no
+app-level bindings table yet and no user-override merge layer to justify
+building one for a single entry, so the one ``app.*`` action this port
+currently dispatches through the key pipeline (see ``components/editor.py``'s
+``on_app_action``) is folded directly into this table instead. Was
+previously wired as a raw ``frame == "\\x0f"`` string comparison in
+``app.py``'s ``_on_stdin_frame`` — silently inert on any terminal where
+Kitty keyboard-protocol negotiation succeeded, since Ctrl+O then arrives as
+CSI-u (``"\\x1b[111;5u"``), never the legacy byte. Routing it through
+``parse_key`` → ``key_id`` → this table fixes that: both encodings resolve
+to the same ``"ctrl+o"`` key id.
+
 Consumes Task 4's ``key_id(event) -> str`` output: a resolved binding's key
 list is meant to be compared against a pressed key's canonical ``key_id``
 string by a caller (e.g. a future Editor/Input component). Per Task 4's
@@ -80,6 +98,10 @@ DEFAULT_EDITOR_BINDINGS: dict[str, str | list[str]] = {
     "tui.select.pageDown": "pageDown",
     "tui.select.confirm": "enter",
     "tui.select.cancel": ["escape", "ctrl+c"],
+    # Deviation (task-19 acceptance bug 2): not a "tui.*" editor action —
+    # see the module docstring's "Declared deviation (task-19 acceptance
+    # bug 2 fix)" note above for why it lives here anyway.
+    "app.tools.expand": "ctrl+o",
 }
 
 

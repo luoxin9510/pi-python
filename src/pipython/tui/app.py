@@ -91,14 +91,27 @@ forward from phase-4 — see ``.superpowers/sdd/progress.md``'s "Task 19 验收
 追加发现 2" entry and ``components/tool_execution.py``'s module docstring):
 ``ToolCallEvent``/``ToolResultEvent`` now build/resolve a styled
 ``ToolExecution`` component (keyed by ``tool_call.id`` in
-``tool_components``) instead of a plain ``Text`` line, and Ctrl+O
-(``"\\x0f"``) is intercepted in ``_on_stdin_frame`` — the same layer that
-already special-cases Ctrl+C/Ctrl+D — toggling a global ``tools_expanded``
-flag applied to every live component (upstream's
-``toggleToolOutputExpansion``, ``interactive-mode.ts:3636``). This is an
-app-level concern, not an editor one, so it is *not* routed through
-``engine/keybindings.py``'s ``DEFAULT_EDITOR_BINDINGS`` table (which maps
-editor-internal actions only). The separate red-foreground line previously
+``tool_components``) instead of a plain ``Text`` line, toggling a global
+``tools_expanded`` flag applied to every live component (upstream's
+``toggleToolOutputExpansion``, ``interactive-mode.ts:3636``) on Ctrl+O.
+
+Acceptance bug 2 (post-Task-19, found on a real Kitty-capable terminal):
+Ctrl+O was originally intercepted via a raw ``frame == "\\x0f"`` string
+comparison in ``_on_stdin_frame`` — the same layer that already
+special-cases Ctrl+C/Ctrl+D — which only ever matches the legacy encoding
+and silently missed the CSI-u encoding (``"\\x1b[111;5u"``) a real terminal
+sends once Kitty keyboard-protocol negotiation succeeds. Fixed by routing
+Ctrl+O through the normal key pipeline instead: ``engine/keybindings.py``
+now carries ``"app.tools.expand": "ctrl+o"`` (a declared exception to that
+table's "editor actions only" scoping — see its own module docstring), and
+``components/editor.py``'s ``Editor.handle_key`` recognizes it like any
+other binding, dispatching through an injectable ``on_app_action(name:
+str)`` callback rather than the app pattern-matching the raw frame. This
+module registers ``editor.on_app_action = _on_app_action`` (defined
+alongside ``tools_expanded``/``tool_components`` below) instead of
+special-casing the byte in ``_on_stdin_frame``.
+
+The separate red-foreground line previously
 shown for a tool-result error is gone — the component's own error-tinted
 background is now the sole error indicator, matching upstream.
 """
@@ -330,6 +343,28 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
     tools_expanded = False
     tool_components: dict[str, ToolExecution] = {}
 
+    def _on_app_action(action: str) -> None:
+        # Task-19 acceptance bug 2 fix: this used to be a raw
+        # `frame == "\x0f"` string comparison inlined in
+        # `_on_stdin_frame` — silently inert on any terminal where Kitty
+        # keyboard-protocol negotiation succeeded, since Ctrl+O then
+        # arrives as CSI-u ("\x1b[111;5u"), never the legacy byte. Now
+        # registered as `editor.on_app_action` (components/editor.py):
+        # `Editor.handle_key` recognizes "app.tools.expand"
+        # (engine/keybindings.py) through the normal `parse_key` ->
+        # `key_id` -> binding-lookup pipeline, which normalizes both
+        # encodings identically, and calls this callback — the app-level
+        # concern (toggling every ToolExecution component in the
+        # transcript) stays here, not in the editor.
+        nonlocal tools_expanded
+        if action == "app.tools.expand":
+            tools_expanded = not tools_expanded
+            for tool_comp in tool_components.values():
+                tool_comp.set_expanded(tools_expanded)
+            tui.request_render()
+
+    editor.on_app_action = _on_app_action
+
     def _append(text: str, style: str = "", *, wrap: bool = True) -> None:
         transcript.add_child(Text(text, style=style, wrap=wrap))
         tui.request_render()
@@ -457,22 +492,15 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
             tui.request_render()
 
     def _on_stdin_frame(frame: str) -> None:
-        nonlocal tools_expanded
-        if frame == "\x0f":  # Ctrl+O ("app.tools.expand")
-            # Upstream wires this as `this.defaultEditor.onAction
-            # ("app.tools.expand", ...)` (interactive-mode.ts:2513) — an
-            # editor-level action binding. This port's `keybindings.py`/
-            # `DEFAULT_EDITOR_BINDINGS` maps *editor* actions only (cursor
-            # motion, kill-ring, etc.); toggling every ToolExecution
-            # component in the transcript is an app-level concern, not an
-            # editor one, so it is intercepted here — at the exact same
-            # layer this app already special-cases Ctrl+C/Ctrl+D — instead
-            # of being threaded through the editor's action-binding table.
-            tools_expanded = not tools_expanded
-            for tool_comp in tool_components.values():
-                tool_comp.set_expanded(tools_expanded)
-            tui.request_render()
-            return
+        # Ctrl+O ("app.tools.expand") is no longer intercepted here as a raw
+        # frame comparison (task-19 acceptance bug 2 fix: that only ever
+        # matched the legacy "\x0f" byte, silently missing the CSI-u
+        # encoding a real Kitty-capable terminal sends post-negotiation).
+        # It now falls through to `tui.handle_input(frame)` below like any
+        # other key, reaching `editor.handle_key` via the normal
+        # `parse_key` -> `key_id` -> binding-lookup pipeline, which
+        # dispatches it through `editor.on_app_action` (`_on_app_action`
+        # above) — see that function's docstring for the full trace.
         if frame == "\x03":  # Ctrl+C
             # Critical finding 1 (task-16 fix round 1): raw mode
             # (engine/terminal.py) clears ISIG for the whole session, so a

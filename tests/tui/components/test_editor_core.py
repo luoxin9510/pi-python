@@ -214,6 +214,70 @@ class TestKittyKeyReleaseDoesNotDoubleKeystrokes:
         assert editor.text == "hi"
 
 
+class TestAppActionDispatchThroughKeyPipeline:
+    """Acceptance bug 2: Ctrl+O ("app.tools.expand") had no effect on a real
+    Kitty-capable terminal. It used to be intercepted by the app layer via a
+    raw ``frame == "\\x0f"`` string comparison (``app.py``'s
+    ``_on_stdin_frame``) — that only ever matches the legacy encoding. Once
+    Kitty keyboard-protocol negotiation succeeds (``kitty_enabled=True``),
+    a real terminal encodes Ctrl+O as CSI-u (``"\\x1b[111;5u"``) instead, so
+    the raw check silently missed it; the frame then fell through to
+    ``Editor.handle_key``, which has no "ctrl+o" binding either, so nothing
+    happened at all.
+
+    Fixed by routing Ctrl+O through the normal key pipeline instead of a
+    raw-frame comparison: ``parse_key(frame, kitty)`` → ``key_id`` →
+    ``KeyBindings`` lookup (``"app.tools.expand": "ctrl+o"``,
+    ``engine/keybindings.py``). ``Editor.handle_key`` recognizes this
+    binding like every other action and forwards it through an injectable
+    ``on_app_action(name: str)`` callback — the app registers this instead
+    of pattern-matching the raw frame itself. Both encodings normalize to
+    the identical ``key_id`` via ``parse_key``, so this works uniformly for
+    legacy and Kitty framing alike."""
+
+    def test_legacy_ctrl_o_byte_triggers_app_action(self):
+        from pipython.tui.components.editor import Editor
+
+        editor = Editor()
+        editor.kitty_enabled = False
+        actions: list[str] = []
+        editor.on_app_action = actions.append
+
+        editor.handle_input("\x0f")
+
+        assert actions == ["app.tools.expand"]
+        assert editor.text == ""  # consumed as an action, not inserted as text
+
+    def test_kitty_csi_u_ctrl_o_triggers_app_action(self):
+        """The maintainer's actual reported bug: on a real Kitty-capable
+        terminal post-negotiation, Ctrl+O arrives as CSI-u, not the legacy
+        byte."""
+        from pipython.tui.components.editor import Editor
+
+        editor = Editor()
+        editor.kitty_enabled = True
+        actions: list[str] = []
+        editor.on_app_action = actions.append
+
+        editor.handle_input("\x1b[111;5u")
+
+        assert actions == ["app.tools.expand"]
+        assert editor.text == ""
+
+    def test_no_op_when_no_app_action_callback_registered(self):
+        """A standalone Editor with nothing wired up (e.g. every other test
+        in this file) must not raise just because Ctrl+O was pressed —
+        ``on_app_action`` defaults to ``None``."""
+        from pipython.tui.components.editor import Editor
+
+        editor = Editor()
+        editor.kitty_enabled = False
+
+        editor.handle_input("\x0f")  # must not raise
+
+        assert editor.text == ""
+
+
 class TestUnicodeTextEditingBehavior:
     """Unicode text editing behavior (upstream line 399)"""
 

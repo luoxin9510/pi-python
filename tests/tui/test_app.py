@@ -1062,6 +1062,46 @@ async def test_ctrl_o_toggles_tool_output_expand_collapse(tmp_path, stdin_pipe):
         assert "ctrl+o to collapse" in full_ops_text(term)
 
 
+async def test_ctrl_o_toggles_tool_output_expand_collapse_kitty_csi_u(tmp_path, stdin_pipe):
+    """Acceptance bug 2: identical scenario to
+    ``test_ctrl_o_toggles_tool_output_expand_collapse`` above, but with
+    ``term.kitty_enabled=True`` (obligation (c) threads this into
+    ``editor.kitty_enabled``) and Ctrl+O sent as a real Kitty-capable
+    terminal actually encodes it post-negotiation — CSI-u
+    (``"\\x1b[111;5u"``), not the legacy ``"\\x0f"`` byte. This was the
+    maintainer's actual reported bug: the app used to intercept Ctrl+O via
+    a raw ``frame == "\\x0f"`` comparison, which never matched this
+    encoding, so the keystroke silently did nothing on a real terminal.
+    Now routed through ``parse_key`` -> ``key_id`` -> ``KeyBindings``
+    (``"app.tools.expand": "ctrl+o"``) -> ``Editor.on_app_action``, which
+    normalizes both encodings identically."""
+    script = [
+        AssistantMessage(
+            content=[ToolCallContent(id="1", name="bash", arguments={"command": "seq 1 30"})]
+        ),
+        done("counted"),
+    ]
+    client = FakeClient(script=script)
+    term = FakeRealTerm(kitty_enabled=True)
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term):
+        send(stdin_pipe, "go")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "counted" in full_ops_text(term))
+        await wait_until(lambda: "more lines" in full_ops_text(term))
+
+        def _visible_lines() -> list[str]:
+            return [_visible_text(row).strip() for row in term.screen()]
+
+        assert "30" in screen_text(term)
+        assert "1" not in _visible_lines(), "expected line '1' hidden while collapsed"
+
+        send(stdin_pipe, b"\x1b[111;5u")  # Ctrl+O, Kitty CSI-u encoding
+
+        await wait_until(lambda: "1" in _visible_lines())
+        assert "ctrl+o to collapse" in full_ops_text(term)
+
+
 async def test_error_event_and_agent_end_error_reason_rendered(tmp_path, stdin_pipe):
     # Gap closure: the retired test_render.py's test_error_event_rendered_in_red
     # / test_agent_end_non_done_notice covered ErrorEvent (reddish text) and
