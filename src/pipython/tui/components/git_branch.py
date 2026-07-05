@@ -13,27 +13,39 @@ from pathlib import Path
 
 
 def find_git_head(cwd: Path) -> Path | None:
-    d = cwd.resolve()
-    while True:
-        git = d / ".git"
-        if git.is_dir():
-            return git / "HEAD"
-        if git.is_file():
-            content = git.read_text(errors="replace").strip()
-            if content.startswith("gitdir: "):
-                git_dir = (d / content[len("gitdir: ") :].strip()).resolve()
-                return git_dir / "HEAD"
-            return None
-        if d.parent == d:
-            return None
-        d = d.parent
+    try:
+        d = cwd.resolve()
+        while True:
+            git = d / ".git"
+            if git.is_dir():
+                return git / "HEAD"
+            if git.is_file():
+                content = git.read_text(errors="replace").strip()
+                if content.startswith("gitdir: "):
+                    git_dir = (d / content[len("gitdir: ") :].strip()).resolve()
+                    return git_dir / "HEAD"
+                return None
+            if d.parent == d:
+                return None
+            d = d.parent
+    except OSError:
+        # transient fs hiccup walking up (permission race, unmount, etc.) —
+        # treat like "not a git repo" instead of propagating (matches
+        # upstream's findGitPaths catch -> null).
+        return None
 
 
 def read_branch(cwd: Path) -> str | None:
-    head = find_git_head(cwd)
-    if head is None or not head.is_file():
+    try:
+        head = find_git_head(cwd)
+        if head is None or not head.is_file():
+            return None
+        content = head.read_text(errors="replace").strip()
+    except OSError:
+        # TOCTOU: HEAD (or the .git indirection file) can vanish or become
+        # unreadable between the checks above and the read — matches
+        # upstream's resolveGitBranchSync/Async catch -> null.
         return None
-    content = head.read_text(errors="replace").strip()
     if content.startswith("ref: refs/heads/"):
         branch = content[len("ref: refs/heads/") :]
         if branch != ".invalid":
@@ -85,7 +97,21 @@ class GitBranchProvider:
             if m == self._last_mtime:
                 continue
             self._last_mtime = m
-            new_branch = read_branch(self._cwd)
+            try:
+                # read_branch's rare .invalid-sentinel fallback shells out to
+                # git synchronously (subprocess.run, timeout=2s); offload to a
+                # worker thread so that rare stall never blocks this event
+                # loop (upstream keeps a matching sync/async split precisely
+                # to avoid this).
+                new_branch = await asyncio.get_running_loop().run_in_executor(
+                    None, read_branch, self._cwd
+                )
+            except OSError:
+                # read_branch already guards OSError internally and returns
+                # None instead of raising; this is belt-and-suspenders so a
+                # single bad read can never take down the background poll
+                # task.
+                continue
             if new_branch != self.current_branch:
                 self.current_branch = new_branch
                 on_change()
