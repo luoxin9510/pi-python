@@ -111,7 +111,8 @@ auto-compact 指示（SDK 无自动压缩）、xp 指示。
 2. **_format_tokens/_format_cwd 纯函数**：逐档边界（999/1000/9999/10000/
    999999/…）与 HOME 内外/worktree 路径。
 3. **GitBranchProvider**：真实 tmp git 仓库（`git init` + 建分支），
-   `read_branch` 返回分支名；detached HEAD 返回 None；非 git 目录返回 None；
+   `read_branch` 返回分支名；detached HEAD 返回 `"detached"`（显示 `(detached)`，
+   非 None）；非 git 目录返回 None；
    worktree（`.git` 文件）解析。轮询监听：切分支后回调触发（有界等待，注入
    短轮询间隔，不裸 sleep）。
 4. **app 接线测试**：FakeClient 两回合 + RecordingTerm，断言 footer 两行出现在
