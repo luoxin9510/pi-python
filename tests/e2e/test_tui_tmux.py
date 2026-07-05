@@ -20,11 +20,16 @@ Engine notes:
 - Ready probe: the TUI prints no ``pipython · <model>`` banner — its first
   frame is the editor's border row (``"─" * width``), so readiness is
   polled as a long ``─`` run.
-- Ctrl+C is asserted through the REAL byte path (Task 16 C1): raw mode
-  clears ISIG, so tmux ``send-keys C-c`` delivers the literal ``\\x03``
-  stdin byte (verified with an instrumented ``RealTerminal``+``StdinBuffer``
-  dump under this exact tmux: ``kitty_enabled=False``, ``frame='\\x03'``) —
-  exercising ``app._on_stdin_frame``'s byte branch, not a signal.
+- Esc/Ctrl+C are asserted through the REAL byte path (Task 16 C1, issue
+  #14): raw mode clears ISIG, so tmux ``send-keys Escape``/``C-c`` deliver
+  the literal ``\\x1b``/``\\x03`` stdin bytes (verified with an instrumented
+  ``RealTerminal``+``StdinBuffer`` dump under this exact tmux:
+  ``kitty_enabled=False``, ``frame='\\x03'``) — exercising
+  ``app._on_stdin_frame``'s byte branches, not a signal. Since issue #14,
+  Escape is the one that interrupts an in-flight turn (routed through the
+  key pipeline, ``"app.interrupt"``); Ctrl+C only clears the editor / double-
+  tap-exits — see ``test_esc_interrupts_and_continues`` and
+  ``test_ctrl_c_does_not_interrupt_but_double_tap_exits``.
 - IME/CURSOR_MARKER pinning is a manual acceptance item (spec §7.5) and is
   not automated here; what IS asserted is that the marker bytes never leak
   into terminal output (``_extract_cursor_position`` must strip them before
@@ -266,7 +271,20 @@ def test_hotkeys_and_session_commands(pane):
     pane.wait_for(r"Session Info")
 
 
-def test_ctrl_c_interrupts_and_continues(tmp_path):
+def test_esc_interrupts_and_continues(tmp_path):
+    """Issue #14 (Esc/Ctrl+C parity fix): this test used to be named
+    ``test_ctrl_c_interrupts_and_continues`` and drove the interrupt via
+    ``send_ctrl_c()`` — backwards relative to upstream (Esc aborts an
+    in-flight turn; Ctrl+C only clears the editor + double-tap-exits, see
+    ``test_ctrl_c_does_not_interrupt_but_double_tap_exits`` below). Renamed
+    and rewritten to drive the interrupt via a real Escape keypress instead,
+    exercising the same real byte path (Task 16 C1's tmux verification
+    notes still apply: raw mode has ISIG cleared, so ``send-keys Escape``
+    delivers the literal ``\\x1b`` stdin byte) all the way through
+    ``_on_stdin_frame`` -> ``tui.handle_input`` -> the focused editor's
+    ``handle_key`` -> ``"app.interrupt"`` (engine/keybindings.py) ->
+    ``editor.on_app_action`` -> ``app.py``'s ``_on_app_action`` ->
+    ``turn_task.cancel()``."""
     # 让工具真实卡住：脚本第 1 条调用 bash sleep；第 2 条是中断后下一轮的应答
     slow = tmp_path / "slow.json"
     slow.write_text(
@@ -281,14 +299,45 @@ def test_ctrl_c_interrupts_and_continues(tmp_path):
         # "$ <command>" (bash-execution.ts format), not the old
         # "[tool] bash ..." plain-text line.
         p2.wait_for(r"\$ sleep 30")
-        # 真字节路径（Task 16 C1）：raw mode 已清 ISIG，send-keys C-c 送达的是
-        # stdin 字节 \x03，走 _on_stdin_frame 的 turn_task.cancel() 分支
+        # Issue #14: Ctrl+C must NOT interrupt the turn anymore — send it
+        # first and confirm the tool call is still running before the real
+        # interrupt key (Escape) below.
         p2.send_ctrl_c()
+        time.sleep(0.5)  # give the (now turn-unaffected) Ctrl+C byte a moment to be processed
+        assert "[interrupted]" not in p2.capture()
+        assert "$ sleep 30" in p2.capture()  # the tool call is still running
+        # 真字节路径（Task 16 C1）：raw mode 已清 ISIG，send-keys Escape 送达的是
+        # stdin 字节 \x1b，走 "app.interrupt" -> `_on_app_action` -> turn_task.cancel()
+        _send_raw(p2, "Escape")
         p2.wait_for(r"\[interrupted\]")
         # 中断后可继续交互：下一轮 prompt 正常出应答
         p2.send("again")
         p2.wait_for(r"resumed fine")
         p2.send("/quit")
+        p2.wait_for(r"session: ")
+        p2.wait_dead()
+    finally:
+        p2.kill()
+
+
+def test_ctrl_c_does_not_interrupt_but_double_tap_exits(tmp_path):
+    """Issue #14: Ctrl+C's real production behavior now — a single Ctrl+C
+    clears the editor's draft buffer without touching an in-flight turn (see
+    ``test_esc_interrupts_and_continues`` above for the tool-call variant),
+    and a second Ctrl+C within 500ms quits the app (upstream's
+    double-tap-to-exit, ``interactive-mode.ts``'s ``handleCtrlC``)."""
+    p2 = _start_pane(tmp_path, TWO_TURN)
+    try:
+        _send_raw(p2, "an unsent draft")
+        p2.wait_for(r"an unsent draft")
+
+        p2.send_ctrl_c()  # first Ctrl+C: clears the draft, does not quit
+        time.sleep(0.3)
+        scr = p2.capture()
+        assert "an unsent draft" not in scr
+        assert p2.alive()
+
+        p2.send_ctrl_c()  # second Ctrl+C, well within 500ms: quits
         p2.wait_for(r"session: ")
         p2.wait_dead()
     finally:

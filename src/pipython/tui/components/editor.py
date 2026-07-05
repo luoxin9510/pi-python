@@ -291,6 +291,15 @@ RED->GREEN account):
   that method's own docstring for the specific existing-test conflict this
   would otherwise cause with the cooperative ``is_cancelled()`` polling
   contract.
+
+Issue #14 (Esc/Ctrl+C parity fix): a new ``"app.interrupt"`` binding
+(``engine/keybindings.py``, key ``"escape"``) is recognized by ``handle_key``
+exactly like ``"app.tools.expand"`` — forwarded via ``on_app_action`` rather
+than handled here, since interrupting the in-flight turn is app.py's
+concern. Placed *after* the autocomplete-menu-open block (whose own
+``"tui.select.cancel"`` branch is also bound to ``"escape"``) so an open
+menu still closes on Esc first, matching upstream's own escape priority;
+only reaches the new branch when no menu is showing.
 """
 
 from __future__ import annotations
@@ -1014,6 +1023,25 @@ class Editor:
                     else:
                         self._cancel_autocomplete()
                         return
+
+        if kb.matches(kid, "app.interrupt"):
+            # Issue #14 (Esc/Ctrl+C parity fix): mirrors "app.tools.expand"
+            # above — this editor does not own turn-interruption (that's an
+            # app-level concern, see app.py's `_on_app_action`), it merely
+            # recognizes the key and forwards it via `on_app_action`.
+            # Deliberately placed AFTER the autocomplete-menu-open block
+            # above: "escape" is also bound to "tui.select.cancel", and that
+            # block's own cancel branch already returned above when a menu
+            # is open, so this is only ever reached with no menu showing —
+            # Esc closes an open menu first, and only interrupts a turn
+            # when there's no menu to close (see keybindings.py's own
+            # "Declared deviation (issue #14 ...)" note for why sharing the
+            # "escape" key between the two bindings is intentional, not a
+            # conflict). No-op if nothing is registered (e.g. a standalone
+            # ``Editor`` in a unit test).
+            if self.on_app_action is not None:
+                self.on_app_action("app.interrupt")
+            return
 
         # Tab - trigger completion (editor.ts:713-717). Always consumed,
         # whether or not a provider is configured (module docstring

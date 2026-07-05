@@ -1025,6 +1025,56 @@ class TestAutocompleteKeyRerouting:
         assert editor.text == ""
         assert editor.focused is True, "closing the menu must leave the editor focused"
 
+    async def test_menu_open_escape_closes_menu_and_never_fires_app_interrupt(self) -> None:
+        """Issue #14 priority regression: "escape" is bound to both
+        "tui.select.cancel" (menu close, editor.ts:654-657) and the new
+        "app.interrupt" (engine/keybindings.py) -- ``Editor.handle_key``
+        must check the menu-open cancel branch *first* and return before
+        ever reaching the "app.interrupt" dispatch, so Esc closes an open
+        autocomplete menu instead of interrupting a turn. Registers
+        ``on_app_action`` as a recorder (mirroring how ``app.py`` wires it
+        for real) to prove it is never invoked while the menu is being
+        closed by Escape."""
+        editor = Editor()
+        tui = _make_wired_tui(editor)
+
+        actions: list[str] = []
+        editor.on_app_action = actions.append
+
+        async def get_suggestions(
+            lines, cursor_line, cursor_col, *, force=False, is_cancelled=lambda: False
+        ):
+            if not force:
+                return [], ""
+            return [
+                AutocompleteItem(value="one", label="one"),
+                AutocompleteItem(value="two", label="two"),
+            ], ""
+
+        editor.set_autocomplete_provider(_Provider(get_suggestions), tui)
+
+        tui.handle_input("\t")
+        await flush_autocomplete()
+        assert editor.is_showing_autocomplete() is True
+
+        tui.handle_input("\x1b")  # Escape: must close the menu, not interrupt
+        assert editor.is_showing_autocomplete() is False
+        assert actions == [], "app.interrupt must not fire while Escape is closing an open menu"
+
+    async def test_escape_fires_app_interrupt_when_no_menu_is_open(self) -> None:
+        """Complement of the priority regression above: with no autocomplete
+        menu open, Escape must reach the new "app.interrupt" branch and
+        forward it via ``on_app_action`` -- the mechanism ``app.py`` relies
+        on to cancel an in-flight turn (issue #14)."""
+        editor = Editor()
+        tui = _make_wired_tui(editor)
+
+        actions: list[str] = []
+        editor.on_app_action = actions.append
+
+        tui.handle_input("\x1b")  # Escape, no menu open
+        assert actions == ["app.interrupt"]
+
     async def test_apply_completion_writes_back_cursor_exactly(self) -> None:
         """None of the 18 ported cases assert ``editor.cursor`` after an
         autocomplete apply, only ``editor.text``. Since ``apply_completion``'s

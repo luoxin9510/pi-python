@@ -508,23 +508,33 @@ async def test_tool_result_error_tints_the_tool_component_error_background(tmp_p
 
 
 # =============================================================================
-# 5. Ctrl+C / SIGINT mid-turn -> cancel -> "[interrupted]"
+# 5. Esc / SIGINT mid-turn -> cancel -> "[interrupted]"
 #
-# Critical finding 1 (task-16 fix round 1): a REAL terminal's Ctrl+C never
-# arrives as a process signal (raw mode clears ISIG for the whole session,
-# engine/terminal.py) -- only as the ordinary stdin byte "\x03". The primary
-# test below drives *that* real path. A second, clearly-named test covers
-# the secondary path: a genuine external SIGINT (e.g. `kill -INT <pid>` from
-# another process), which run_app still supports via
-# `loop.add_signal_handler(signal.SIGINT, ...)` in `_run_turn`.
+# Issue #14 (Esc/Ctrl+C parity fix): this port used to route the *stdin-byte*
+# Ctrl+C ("\x03") to turn cancellation, backwards relative to upstream
+# (interactive-mode.ts's `handleCtrlC`/`onEscape`: Escape aborts an in-flight
+# turn, Ctrl+C only clears the editor + double-tap-exits -- see
+# `test_ctrl_c_stdin_byte_mid_turn_does_not_cancel_turn` and
+# `test_ctrl_c_double_tap_within_500ms_exits` further down). The primary test
+# below now drives Esc through the real production path: `_on_stdin_frame`
+# ("\x1b") -> `tui.handle_input` -> the focused `Editor.handle_key` ->
+# "app.interrupt" (engine/keybindings.py) -> `editor.on_app_action` ->
+# `_on_app_action` (app.py) -> `turn_task.cancel()`. A second, clearly-named
+# test covers the secondary path: a genuine external SIGINT (e.g. `kill -INT
+# <pid>` from another process), which run_app still supports via
+# `loop.add_signal_handler(signal.SIGINT, ...)` in `_run_turn`, unaffected by
+# this fix.
 # =============================================================================
 
 
-async def test_ctrl_c_stdin_byte_mid_turn_cancels_and_shows_interrupted(tmp_path, stdin_pipe):
-    """The real production path: Ctrl+C reaches `_on_stdin_frame` as the
-    stdin byte `"\\x03"`, exactly like any other scripted frame in this
-    file -- never as a signal. Must cancel the in-flight turn task the same
-    way `test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted`
+async def test_esc_stdin_byte_mid_turn_cancels_and_shows_interrupted(tmp_path, stdin_pipe):
+    """The real production path: Esc reaches `_on_stdin_frame` as the stdin
+    byte `"\\x1b"`, exactly like any other scripted frame in this file --
+    never as a signal -- and must route all the way through the key
+    pipeline (not a raw frame comparison in `_on_stdin_frame`: "\\x1b" is
+    also the common prefix of every other escape sequence) to cancel the
+    in-flight turn task, the same way
+    `test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted`
     (below) verifies for a genuine external signal."""
     client = SteppedFakeClient(
         script=[
@@ -538,7 +548,7 @@ async def test_ctrl_c_stdin_byte_mid_turn_cancels_and_shows_interrupted(tmp_path
         send(stdin_pipe, "\r")
         await wait_until(lambda: "partial" in full_ops_text(term))
 
-        send(stdin_pipe, b"\x03")  # real-terminal Ctrl+C: a stdin byte, not a signal
+        send(stdin_pipe, b"\x1b")  # Esc: a stdin byte, not a signal
 
         await wait_until(lambda: "[interrupted]" in full_ops_text(term))
         assert not task.done()  # app keeps running after an interrupted turn
@@ -569,6 +579,84 @@ async def test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted(tmp
 
         await wait_until(lambda: "[interrupted]" in full_ops_text(term))
         assert not task.done()  # app keeps running after an interrupted turn
+
+
+async def test_ctrl_c_stdin_byte_mid_turn_does_not_cancel_turn(tmp_path, stdin_pipe):
+    """Issue #14: the stdin-byte Ctrl+C ("\\x03") used to cancel an
+    in-flight turn (the old, backwards-from-upstream behavior this fix
+    corrects -- see `test_esc_stdin_byte_mid_turn_cancels_and_shows_interrupted`
+    above, which now owns that job). Ctrl+C mid-turn must instead be a no-op
+    for the turn: it never appears as "[interrupted]", and the turn is left
+    to run to completion untouched."""
+    client = SteppedFakeClient(
+        script=[
+            AssistantMessage(content=[TextContent(text="partial "), TextContent(text="more text")])
+        ]
+    )
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term) as task:
+        send(stdin_pipe, "go")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "partial" in full_ops_text(term))
+
+        send(stdin_pipe, b"\x03")  # Ctrl+C mid-turn: must not cancel it
+
+        # Give the (now-turn-unaffected) Ctrl+C byte a moment to have been
+        # processed, then let the turn keep streaming to completion --
+        # "[interrupted]" must never appear, and the turn must finish
+        # normally with its full text.
+        await wait_until(lambda: "more text" in full_ops_text(term))
+        assert "[interrupted]" not in full_ops_text(term)
+        assert not task.done()  # app keeps running (turn completed normally)
+
+
+# =============================================================================
+# 5c. Ctrl+C double-tap-to-exit (issue #14): a second Ctrl+C within 500ms of
+# the first quits the app; a single Ctrl+C (or two spaced more than 500ms
+# apart) never does -- it only clears the editor's draft buffer, matching
+# upstream's `handleCtrlC` (interactive-mode.ts:3361-3369).
+# =============================================================================
+
+
+async def test_ctrl_c_double_tap_within_500ms_exits(tmp_path, stdin_pipe):
+    client = FakeClient(script=[])
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term) as task:
+        send(stdin_pipe, "draft")
+        await wait_until(lambda: "draft" in screen_text(term))
+
+        send(stdin_pipe, b"\x03")  # first Ctrl+C: clears the buffer
+        await wait_until(lambda: "draft" not in screen_text(term))
+        assert not task.done()
+
+        send(stdin_pipe, b"\x03")  # second Ctrl+C, well within 500ms: exits
+        await wait_until(lambda: task.done(), timeout=3.0)
+        assert task.exception() is None
+        assert "session" in full_ops_text(term).lower()
+
+
+async def test_ctrl_c_twice_slowly_does_not_exit_but_resets_the_window(tmp_path, stdin_pipe):
+    """Two Ctrl+C presses spaced more than 500ms apart must NOT exit -- each
+    one is treated as a fresh "first tap" (clear the buffer, restart the
+    window), not accumulated. Guards against an implementation that quits on
+    *any* second Ctrl+C regardless of timing."""
+    client = FakeClient(script=[])
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term) as task:
+        send(stdin_pipe, "draft")
+        await wait_until(lambda: "draft" in screen_text(term))
+
+        send(stdin_pipe, b"\x03")  # first Ctrl+C
+        await wait_until(lambda: "draft" not in screen_text(term))
+
+        await asyncio.sleep(0.6)  # let the 500ms double-tap window expire
+
+        send(stdin_pipe, b"\x03")  # second Ctrl+C, well after the window: must not exit
+        await asyncio.sleep(0.2)  # give a (buggy) quit path a chance to fire
+        assert not task.done()
 
 
 # =============================================================================
