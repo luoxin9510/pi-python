@@ -250,6 +250,22 @@ def test_tree_command(pane):
     pane.wait_for(r"user: do something")  # user 消息摘要在树里
 
 
+def test_hotkeys_and_session_commands(pane):
+    # Phase-4 self-contained commands (task-2): /hotkeys renders the grouped
+    # key-help table (Navigation section + a _format_key-formatted binding),
+    # /session renders the "Session Info" stats block. Neither needs a prior
+    # turn — both work standalone against a fresh session. /hotkeys' table
+    # is long enough to scroll the "Navigation" section off the fixed
+    # 30-row pane before we poll, so this uses the full-scrollback poll
+    # helper (_wait_for_in_history), same as the Ctrl+O expand scenario
+    # above, instead of pane.wait_for (visible screen only).
+    pane.send("/hotkeys")
+    _wait_for_in_history(pane, r"Navigation")
+    _wait_for_in_history(pane, r"Ctrl\+B")  # formatted cursor-left binding
+    pane.send("/session")
+    pane.wait_for(r"Session Info")
+
+
 def test_ctrl_c_interrupts_and_continues(tmp_path):
     # 让工具真实卡住：脚本第 1 条调用 bash sleep；第 2 条是中断后下一轮的应答
     slow = tmp_path / "slow.json"
