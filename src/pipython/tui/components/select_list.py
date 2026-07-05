@@ -100,6 +100,9 @@ def _normalize_to_single_line(text: str) -> str:
 #     (line 30) -> rgb(128, 128, 128).
 # --------------------------------------------------------------------------
 
+# PHASE-4 REVISIT (theme port): these are hardcoded truecolor escapes. Upstream
+# theme.ts fgAnsi() has a 256-color fallback selected via getCapabilities(); when
+# terminal-capability detection is ported, source these from the theme layer.
 _ACCENT_FG = "\x1b[38;2;138;190;183m"  # dark.json accent "#8abeb7"
 _MUTED_FG = "\x1b[38;2;128;128;128m"  # dark.json muted/gray "#808080"
 _FG_RESET = "\x1b[39m"  # theme.ts:354 — foreground-only reset

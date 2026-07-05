@@ -33,7 +33,7 @@ __all__ = ["parse_osc11_response", "is_dark", "QUERY_BG"]
 # --------------------------------------------------------------------------
 
 # terminal-colors.ts:28 OSC11_BACKGROUND_COLOR_RESPONSE_PATTERN.
-_OSC11_RESPONSE_RE = re.compile(rb"^\x1b\]11;([^\x07\x1b]*)(?:\x07|\x1b\\)$", re.IGNORECASE)
+_OSC11_RESPONSE_RE = re.compile(rb"^\x1b\]11;([^\x07\x1b]*)(?:\x07|\x1b\\)\Z", re.IGNORECASE)
 
 _HEX6_RE = re.compile(r"^[0-9a-f]{6}$", re.IGNORECASE)
 _HEX12_RE = re.compile(r"^[0-9a-f]{12}$", re.IGNORECASE)

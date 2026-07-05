@@ -14,7 +14,7 @@ Deviations from upstream text.ts:
    port's constructor shape, not upstream's — that whole axis exists
    upstream to let ``Text`` fill a rectangular, possibly-backgrounded region
    inside a ``Box``; this port's ``Box`` (task-9's own, see ``box.py``)
-   handles padding/border itself instead.
+   handles padding itself instead.
 2. No per-line fill-to-width padding. Upstream unconditionally pads every
    wrapped line with trailing spaces out to the full render width
    (text.ts:82-86), even with no ``customBgFn`` set, because ``Text``'s

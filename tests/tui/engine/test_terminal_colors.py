@@ -12,7 +12,7 @@ from pipython.tui.engine.terminal_colors import (
 
 
 class TestParseOsc11Response:
-    """Tests for parse_osc11_response function.
+    r"""Tests for parse_osc11_response function.
 
     Upstream pattern (terminal-colors.ts line 28):
     OSC11_BACKGROUND_COLOR_RESPONSE_PATTERN = /^\x1b\]11;([^\x07\x1b]*)(?:\x07|\x1b\\)$/i
