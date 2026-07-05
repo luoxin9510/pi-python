@@ -1822,3 +1822,120 @@ class TestStickyColumn:
         editor.handle_input("\x1b[B")
 
         assert editor.cursor == (2, 5)
+
+
+class TestPageUpPageDown:
+    """PageUp/PageDown (issue #16 — previously dead keys: ``keys.py`` parsed
+    ``\\x1b[5~``/``\\x1b[6~`` into ``pageUp``/``pageDown`` KeyEvents, and
+    ``keybindings.py`` declared ``tui.editor.pageUp``/``pageDown``, but
+    ``Editor.handle_key`` had no branch matching either binding, so the
+    frame silently fell through to the bottom of ``handle_key`` and was
+    dropped). Mirrors upstream's ``pageScroll`` (editor.ts:1815-1826):
+    ``page_size = max(5, floor(terminal_rows * 0.3))``, and the cursor is
+    clamped to the first/last visual line rather than left unmoved when a
+    page's worth of scroll would overshoot the document."""
+
+    def _make_lines(self, count: int) -> list[str]:
+        return [f"line{i}" for i in range(count)]
+
+    def _move_cursor_to_line_0(self, editor) -> None:
+        # set_text() always leaves the cursor at the end (last line, last
+        # col) - walk it back up to the first line one visual line at a
+        # time via the real key-input path (not by poking private state).
+        while editor.cursor[0] > 0:
+            editor.handle_input("\x1b[A")  # Up
+        assert editor.cursor[0] == 0
+
+    def test_page_lines_formula_max_5_floor_rows_times_0_3(self):
+        """Direct unit test of the ``_page_lines`` helper's formula,
+        independent of any actual cursor movement."""
+        from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.tui import TUI
+
+        from engine.conftest import RecordingTerm
+
+        editor = Editor()
+        assert editor._tui is None
+        assert editor._page_lines() == 5, "no _tui yet -> rows=0 -> max(5, 0) == 5"
+
+        term = RecordingTerm()
+        term.rows = 100
+        editor._tui = TUI(term)
+        assert editor._page_lines() == 30, "max(5, floor(100 * 0.3)) == 30"
+
+        term.rows = 10
+        assert editor._page_lines() == 5, "max(5, floor(10 * 0.3)=3) == 5"
+
+    def test_page_down_moves_by_page_size_and_clamps_to_last_visual_line(self):
+        from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.tui import TUI
+
+        from engine.conftest import RecordingTerm
+
+        editor = Editor()
+        term = RecordingTerm()
+        term.rows = 40  # page_lines = max(5, int(40 * 0.3)) == 12
+        editor._tui = TUI(term)
+
+        lines = self._make_lines(30)
+        editor.set_text("\n".join(lines))
+        self._move_cursor_to_line_0(editor)
+
+        editor.handle_input("\x1b[6~")  # PageDown
+        assert editor.cursor[0] == 12
+
+        editor.handle_input("\x1b[6~")  # PageDown again
+        assert editor.cursor[0] == 24
+
+        # A third PageDown would overshoot past line 29 (24 + 12 == 36) -
+        # must clamp to the last visual line, not no-op and not go out of
+        # bounds.
+        editor.handle_input("\x1b[6~")
+        assert editor.cursor[0] == 29
+
+    def test_page_up_moves_by_page_size_and_clamps_to_first_visual_line(self):
+        from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.tui import TUI
+
+        from engine.conftest import RecordingTerm
+
+        editor = Editor()
+        term = RecordingTerm()
+        term.rows = 40  # page_lines == 12
+        editor._tui = TUI(term)
+
+        lines = self._make_lines(30)
+        editor.set_text("\n".join(lines))
+        # set_text leaves the cursor at the end (line 29) already.
+        assert editor.cursor[0] == 29
+
+        editor.handle_input("\x1b[5~")  # PageUp
+        assert editor.cursor[0] == 17
+
+        editor.handle_input("\x1b[5~")  # PageUp again
+        assert editor.cursor[0] == 5
+
+        # A third PageUp would undershoot past line 0 (5 - 12 == -7) - must
+        # clamp to the first visual line.
+        editor.handle_input("\x1b[5~")
+        assert editor.cursor[0] == 0
+
+    def test_falls_back_to_page_size_5_when_tui_is_none(self):
+        """No ``_tui`` wired up (e.g. a bare ``Editor()`` in a test, or an
+        app that never called ``set_autocomplete_provider``) -> page size
+        degrades to the ``max(5, floor(0 * 0.3))`` floor of 5, per the
+        module docstring's ``_page_lines`` deviation note."""
+        from pipython.tui.components.editor import Editor
+
+        editor = Editor()
+        assert editor._tui is None
+
+        lines = self._make_lines(10)
+        editor.set_text("\n".join(lines))
+        self._move_cursor_to_line_0(editor)
+
+        editor.handle_input("\x1b[6~")  # PageDown
+        assert editor.cursor[0] == 5
+
+        editor.handle_input("\x1b[5~")  # PageUp
+        assert editor.cursor[0] == 0

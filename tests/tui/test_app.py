@@ -508,23 +508,33 @@ async def test_tool_result_error_tints_the_tool_component_error_background(tmp_p
 
 
 # =============================================================================
-# 5. Ctrl+C / SIGINT mid-turn -> cancel -> "[interrupted]"
+# 5. Esc / SIGINT mid-turn -> cancel -> "[interrupted]"
 #
-# Critical finding 1 (task-16 fix round 1): a REAL terminal's Ctrl+C never
-# arrives as a process signal (raw mode clears ISIG for the whole session,
-# engine/terminal.py) -- only as the ordinary stdin byte "\x03". The primary
-# test below drives *that* real path. A second, clearly-named test covers
-# the secondary path: a genuine external SIGINT (e.g. `kill -INT <pid>` from
-# another process), which run_app still supports via
-# `loop.add_signal_handler(signal.SIGINT, ...)` in `_run_turn`.
+# Issue #14 (Esc/Ctrl+C parity fix): this port used to route the *stdin-byte*
+# Ctrl+C ("\x03") to turn cancellation, backwards relative to upstream
+# (interactive-mode.ts's `handleCtrlC`/`onEscape`: Escape aborts an in-flight
+# turn, Ctrl+C only clears the editor + double-tap-exits -- see
+# `test_ctrl_c_stdin_byte_mid_turn_does_not_cancel_turn` and
+# `test_ctrl_c_double_tap_within_500ms_exits` further down). The primary test
+# below now drives Esc through the real production path: `_on_stdin_frame`
+# ("\x1b") -> `tui.handle_input` -> the focused `Editor.handle_key` ->
+# "app.interrupt" (engine/keybindings.py) -> `editor.on_app_action` ->
+# `_on_app_action` (app.py) -> `turn_task.cancel()`. A second, clearly-named
+# test covers the secondary path: a genuine external SIGINT (e.g. `kill -INT
+# <pid>` from another process), which run_app still supports via
+# `loop.add_signal_handler(signal.SIGINT, ...)` in `_run_turn`, unaffected by
+# this fix.
 # =============================================================================
 
 
-async def test_ctrl_c_stdin_byte_mid_turn_cancels_and_shows_interrupted(tmp_path, stdin_pipe):
-    """The real production path: Ctrl+C reaches `_on_stdin_frame` as the
-    stdin byte `"\\x03"`, exactly like any other scripted frame in this
-    file -- never as a signal. Must cancel the in-flight turn task the same
-    way `test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted`
+async def test_esc_stdin_byte_mid_turn_cancels_and_shows_interrupted(tmp_path, stdin_pipe):
+    """The real production path: Esc reaches `_on_stdin_frame` as the stdin
+    byte `"\\x1b"`, exactly like any other scripted frame in this file --
+    never as a signal -- and must route all the way through the key
+    pipeline (not a raw frame comparison in `_on_stdin_frame`: "\\x1b" is
+    also the common prefix of every other escape sequence) to cancel the
+    in-flight turn task, the same way
+    `test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted`
     (below) verifies for a genuine external signal."""
     client = SteppedFakeClient(
         script=[
@@ -538,7 +548,7 @@ async def test_ctrl_c_stdin_byte_mid_turn_cancels_and_shows_interrupted(tmp_path
         send(stdin_pipe, "\r")
         await wait_until(lambda: "partial" in full_ops_text(term))
 
-        send(stdin_pipe, b"\x03")  # real-terminal Ctrl+C: a stdin byte, not a signal
+        send(stdin_pipe, b"\x1b")  # Esc: a stdin byte, not a signal
 
         await wait_until(lambda: "[interrupted]" in full_ops_text(term))
         assert not task.done()  # app keeps running after an interrupted turn
@@ -569,6 +579,237 @@ async def test_external_signal_sigint_mid_turn_cancels_and_shows_interrupted(tmp
 
         await wait_until(lambda: "[interrupted]" in full_ops_text(term))
         assert not task.done()  # app keeps running after an interrupted turn
+
+
+async def test_ctrl_c_stdin_byte_mid_turn_does_not_cancel_turn(tmp_path, stdin_pipe):
+    """Issue #14: the stdin-byte Ctrl+C ("\\x03") used to cancel an
+    in-flight turn (the old, backwards-from-upstream behavior this fix
+    corrects -- see `test_esc_stdin_byte_mid_turn_cancels_and_shows_interrupted`
+    above, which now owns that job). Ctrl+C mid-turn must instead be a no-op
+    for the turn: it never appears as "[interrupted]", and the turn is left
+    to run to completion untouched."""
+    client = SteppedFakeClient(
+        script=[
+            AssistantMessage(content=[TextContent(text="partial "), TextContent(text="more text")])
+        ]
+    )
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term) as task:
+        send(stdin_pipe, "go")
+        send(stdin_pipe, "\r")
+        await wait_until(lambda: "partial" in full_ops_text(term))
+
+        send(stdin_pipe, b"\x03")  # Ctrl+C mid-turn: must not cancel it
+
+        # Give the (now-turn-unaffected) Ctrl+C byte a moment to have been
+        # processed, then let the turn keep streaming to completion --
+        # "[interrupted]" must never appear, and the turn must finish
+        # normally with its full text.
+        await wait_until(lambda: "more text" in full_ops_text(term))
+        assert "[interrupted]" not in full_ops_text(term)
+        assert not task.done()  # app keeps running (turn completed normally)
+
+
+# =============================================================================
+# 5c. Ctrl+C double-tap-to-exit (issue #14): a second Ctrl+C within 500ms of
+# the first quits the app; a single Ctrl+C (or two spaced more than 500ms
+# apart) never does -- it only clears the editor's draft buffer, matching
+# upstream's `handleCtrlC` (interactive-mode.ts:3361-3369).
+# =============================================================================
+
+
+async def test_ctrl_c_double_tap_within_500ms_exits(tmp_path, stdin_pipe):
+    client = FakeClient(script=[])
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term) as task:
+        send(stdin_pipe, "draft")
+        await wait_until(lambda: "draft" in screen_text(term))
+
+        send(stdin_pipe, b"\x03")  # first Ctrl+C: clears the buffer
+        await wait_until(lambda: "draft" not in screen_text(term))
+        assert not task.done()
+
+        send(stdin_pipe, b"\x03")  # second Ctrl+C, well within 500ms: exits
+        await wait_until(lambda: task.done(), timeout=3.0)
+        assert task.exception() is None
+        assert "session" in full_ops_text(term).lower()
+
+
+async def test_ctrl_c_twice_slowly_does_not_exit_but_resets_the_window(tmp_path, stdin_pipe):
+    """Two Ctrl+C presses spaced more than 500ms apart must NOT exit -- each
+    one is treated as a fresh "first tap" (clear the buffer, restart the
+    window), not accumulated. Guards against an implementation that quits on
+    *any* second Ctrl+C regardless of timing."""
+    client = FakeClient(script=[])
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term) as task:
+        send(stdin_pipe, "draft")
+        await wait_until(lambda: "draft" in screen_text(term))
+
+        send(stdin_pipe, b"\x03")  # first Ctrl+C
+        await wait_until(lambda: "draft" not in screen_text(term))
+
+        await asyncio.sleep(0.6)  # let the 500ms double-tap window expire
+
+        send(stdin_pipe, b"\x03")  # second Ctrl+C, well after the window: must not exit
+        await asyncio.sleep(0.2)  # give a (buggy) quit path a chance to fire
+        assert not task.done()
+
+
+# =============================================================================
+# 5b. SIGTERM / SIGHUP -> quit_event.set() -> clean exit, terminal restored
+#     (issue #15). The TUI used to rely solely on `atexit.register(self.stop)`
+#     (its caller) to restore the terminal -- but SIGTERM/SIGHUP's default
+#     disposition is to terminate the process outright, atexit hooks and
+#     all, so `kill <pid>` (or a hung-up controlling terminal) left a REAL
+#     terminal stuck in raw mode with no cleanup at all. `_run` now installs
+#     `loop.add_signal_handler(signal.SIGTERM/SIGHUP, quit_event.set)` for
+#     its *entire* lifetime -- unlike the per-turn SIGINT handler in
+#     `_run_turn`, this must fire even while completely idle -- routing
+#     through the exact same clean-quit path (`await quit_event.wait()` ->
+#     `_run`'s finally -> `run_app`'s finally -> `real_term.stop()`) Ctrl+D
+#     already exercises (see `test_ctrl_d_empty_buffer_exits_with_session_banner`
+#     above).
+# =============================================================================
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+async def test_external_sigterm_sighup_quits_cleanly_even_when_idle(tmp_path, stdin_pipe, sig):
+    """No turn needs to be in flight -- unlike SIGINT (only wired inside
+    `_run_turn`, around a single turn), SIGTERM/SIGHUP must be wired for
+    `_run`'s entire lifetime so a signal sent while the app is sitting idle
+    at the prompt still triggers a clean quit."""
+    client = FakeClient(script=[])
+    term = FakeRealTerm()
+
+    async with running_app(model="fake/model", cwd=tmp_path, client=client, term=term) as task:
+        # Wait until `_run`'s setup has actually reached `tui.start()` (its
+        # own `request_render()` is the first thing that produces any
+        # output at all) -- the new handlers are registered earlier in that
+        # same setup, so this also guarantees they're already active.
+        await wait_until(lambda: bool(term.ops))
+
+        os.kill(os.getpid(), sig)
+
+        await wait_until(lambda: task.done(), timeout=3.0)
+        assert task.exception() is None, f"run_app must exit cleanly on {sig!r}, not raise"
+
+
+class _FakeStdinTTY:
+    """Like this module's `_FakeStdin`, but also answers `isatty()`
+    truthily so `run_app`'s owns_term branch (the real-terminal-required
+    check at app.py:281) proceeds instead of printing and returning --
+    needed only by `test_sigterm_restores_the_owned_real_terminal` below,
+    which is the one test in this file exercising that branch without a
+    real tty."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def isatty(self) -> bool:
+        return True
+
+
+class _TTYStdoutWrapper:
+    """Delegates everything to the real `sys.stdout` except `isatty()`,
+    which it forces `True` -- same rationale as `_FakeStdinTTY` above,
+    without disturbing pytest's own output capturing (which continues to
+    receive real writes via `__getattr__`)."""
+
+    def __init__(self, wrapped) -> None:
+        self._wrapped = wrapped
+
+    def isatty(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str):
+        return getattr(self._wrapped, name)
+
+
+class RecordingRealTerminal:
+    """Stub swapped in for `pipython.tui.app.RealTerminal` itself -- not the
+    injected `term=` fake every other test in this file uses -- so this one
+    test can observe the *actual* production chain issue #15 is about:
+    `run_app`'s own `real_term = RealTerminal(); real_term.start()` /
+    `finally: real_term.stop()` around `_run` (app.py:284-291), exercised
+    end-to-end with no real tty by monkeypatching the class the module
+    calls."""
+
+    def __init__(self) -> None:
+        self.kitty_enabled = False
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def write(self, data: str) -> None:
+        pass
+
+    @property
+    def columns(self) -> int:
+        return 80
+
+    @property
+    def rows(self) -> int:
+        return 24
+
+    def on_resize(self, cb) -> None:
+        pass
+
+    def drain_pending(self) -> bytes:
+        return b""
+
+
+async def test_sigterm_restores_the_owned_real_terminal(tmp_path, monkeypatch):
+    """The end-to-end regression test for issue #15 itself: with `term=None`
+    (the real CLI's own call shape), `run_app` constructs and owns a
+    `RealTerminal` -- it must still get `.stop()`'d when SIGTERM arrives,
+    exactly like a clean `/quit` or Ctrl+D would, instead of being left
+    stuck in raw mode by a process death that skips atexit entirely."""
+    r_fd, w_fd = os.pipe()
+    monkeypatch.setattr(sys, "stdin", _FakeStdinTTY(r_fd))
+    monkeypatch.setattr(sys, "stdout", _TTYStdoutWrapper(sys.stdout))
+
+    fake_terms: list[RecordingRealTerminal] = []
+
+    def _fake_real_terminal() -> RecordingRealTerminal:
+        inst = RecordingRealTerminal()
+        fake_terms.append(inst)
+        return inst
+
+    monkeypatch.setattr("pipython.tui.app.RealTerminal", _fake_real_terminal)
+
+    client = FakeClient(script=[])
+    task = asyncio.create_task(run_app(model="fake/model", cwd=tmp_path, client=client, term=None))
+    try:
+        await wait_until(lambda: bool(fake_terms and fake_terms[0].started))
+
+        os.kill(os.getpid(), signal.SIGTERM)
+
+        await wait_until(lambda: task.done(), timeout=3.0)
+        assert task.exception() is None
+        assert fake_terms[0].stopped, (
+            "run_app's owned RealTerminal must be .stop()'d on SIGTERM (issue #15)"
+        )
+    finally:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        with contextlib.suppress(OSError):
+            os.close(w_fd)
+        with contextlib.suppress(OSError):
+            os.close(r_fd)
 
 
 # =============================================================================

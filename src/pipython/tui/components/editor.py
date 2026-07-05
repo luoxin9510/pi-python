@@ -65,9 +65,15 @@ Deviations from upstream editor.ts:
    exactly 1 column for the cursor, matching upstream's ``paddingX === 0``
    branch, editor.ts:471), no border *color* (the border is the literal
    ``"─"`` repeated — upstream's ``theme.borderColor`` callback has nothing
-   to plug into here), and no vertical scrolling (``scrollOffset``/
-   ``maxVisibleLines`` derive from ``tui.terminal.rows``, which does not
-   exist on this component at all — every layout line is always rendered).
+   to plug into here), and no vertical *scrolling viewport* (``scrollOffset``/
+   ``maxVisibleLines`` — every layout line is always rendered; there is no
+   partial-scroll concept here). ``_tui.term.rows`` *is* readable, though:
+   ``set_autocomplete_provider`` (task-13) backfills ``self._tui`` with the
+   real ``TUI`` the app wired up, and ``_page_scroll``'s page-size
+   computation (``tui.editor.pageUp``/``pageDown``) reads
+   ``self._tui.term.rows`` through it — falling back to a page size of 5
+   when ``_tui`` is still ``None`` (e.g. in tests that construct a bare
+   ``Editor()``).
 2. **Cursor column is a plain Python string index into the logical line**,
    which this port treats as upstream's UTF-16-code-unit ``cursorCol``
    would for anything wider than one code unit: since Python strings are
@@ -285,6 +291,15 @@ RED->GREEN account):
   that method's own docstring for the specific existing-test conflict this
   would otherwise cause with the cooperative ``is_cancelled()`` polling
   contract.
+
+Issue #14 (Esc/Ctrl+C parity fix): a new ``"app.interrupt"`` binding
+(``engine/keybindings.py``, key ``"escape"``) is recognized by ``handle_key``
+exactly like ``"app.tools.expand"`` — forwarded via ``on_app_action`` rather
+than handled here, since interrupting the in-flight turn is app.py's
+concern. Placed *after* the autocomplete-menu-open block (whose own
+``"tui.select.cancel"`` branch is also bound to ``"escape"``) so an open
+menu still closes on Esc first, matching upstream's own escape priority;
+only reaches the new branch when no menu is showing.
 """
 
 from __future__ import annotations
@@ -1009,6 +1024,25 @@ class Editor:
                         self._cancel_autocomplete()
                         return
 
+        if kb.matches(kid, "app.interrupt"):
+            # Issue #14 (Esc/Ctrl+C parity fix): mirrors "app.tools.expand"
+            # above — this editor does not own turn-interruption (that's an
+            # app-level concern, see app.py's `_on_app_action`), it merely
+            # recognizes the key and forwards it via `on_app_action`.
+            # Deliberately placed AFTER the autocomplete-menu-open block
+            # above: "escape" is also bound to "tui.select.cancel", and that
+            # block's own cancel branch already returned above when a menu
+            # is open, so this is only ever reached with no menu showing —
+            # Esc closes an open menu first, and only interrupts a turn
+            # when there's no menu to close (see keybindings.py's own
+            # "Declared deviation (issue #14 ...)" note for why sharing the
+            # "escape" key between the two bindings is intentional, not a
+            # conflict). No-op if nothing is registered (e.g. a standalone
+            # ``Editor`` in a unit test).
+            if self.on_app_action is not None:
+                self.on_app_action("app.interrupt")
+            return
+
         # Tab - trigger completion (editor.ts:713-717). Always consumed,
         # whether or not a provider is configured (module docstring
         # deviation 12).
@@ -1095,6 +1129,14 @@ class Editor:
             return
         if kb.matches(kid, "tui.editor.cursorLeft"):
             self._move_cursor(0, -1)
+            return
+
+        # Page up/down - scroll by page and move cursor (editor.ts:840-850).
+        if kb.matches(kid, "tui.editor.pageUp"):
+            self._page_scroll(-1)
+            return
+        if kb.matches(kid, "tui.editor.pageDown"):
+            self._page_scroll(1)
             return
 
         if kb.matches(kid, "tui.editor.jumpForward"):
@@ -1844,6 +1886,35 @@ class Editor:
         # "set_autocomplete_provider" section.
         if self._autocomplete_state is not None:
             self._update_autocomplete()
+
+    def _page_lines(self) -> int:
+        """editor.ts:1816-1817 ``pageScroll``'s ``pageSize`` computation:
+        ``max(5, floor(terminalRows * 0.3))``. Falls back to the ``rows=0``
+        result (``5``) when this component has no ``_tui`` reference yet
+        (task-11 module docstring deviation 1 — the constructor takes no
+        ``tui`` argument; ``_tui`` is only populated once
+        ``set_autocomplete_provider`` wires one in)."""
+        rows = self._tui.term.rows if self._tui is not None else 0
+        return max(5, int(rows * 0.3))
+
+    def _page_scroll(self, direction: int) -> None:
+        """editor.ts:1815-1826 ``pageScroll``: move the cursor by a page's
+        worth of visual lines, clamped into the document's visual-line
+        range. Deliberately does *not* delegate to ``_move_cursor`` (whose
+        ``deltaLine`` branch is a no-op — not a clamp — whenever
+        ``current_visual_line + delta_line`` falls outside ``[0,
+        len(visual_lines))``, editor.py's ``_move_cursor`` above): a page
+        jump on a document shorter than one page must still land on the
+        first/last visual line, exactly as upstream's own
+        ``Math.max(0, Math.min(...))`` clamp does."""
+        self._last_action = None
+        page_size = self._page_lines()
+        visual_lines = self._build_visual_line_map(self._last_width)
+        current_visual_line = self._find_current_visual_line(visual_lines)
+        target_visual_line = max(
+            0, min(len(visual_lines) - 1, current_visual_line + direction * page_size)
+        )
+        self._move_to_visual_line(visual_lines, current_visual_line, target_visual_line)
 
     def _move_to_visual_line(
         self,

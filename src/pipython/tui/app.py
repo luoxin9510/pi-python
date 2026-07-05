@@ -52,13 +52,13 @@ review write-up):
 
 - **Real-terminal Ctrl+C.** Raw mode (``engine/terminal.py``) clears
   ``ISIG`` for the whole session, so a real terminal's Ctrl+C never arrives
-  as a process signal — only as the stdin byte ``"\\x03"``. ``_on_stdin_frame``
-  now cancels the in-flight ``turn_task`` on that byte when one is running
-  (routing through the existing ``asyncio.CancelledError`` → ``"[interrupted]"``
-  path in ``_run_turn``), and only falls back to clearing the editor's draft
-  buffer when no turn is running. ``loop.add_signal_handler(signal.SIGINT,
-  ...)`` (in ``_run_turn``) is kept as a secondary path for a real *external*
-  signal (e.g. another process sending ``SIGINT``), not the primary one.
+  as a process signal — only as the stdin byte ``"\\x03"``.
+  ``loop.add_signal_handler(signal.SIGINT, ...)`` (in ``_run_turn``) remains
+  wired as a secondary path for a real *external* signal (e.g. another
+  process sending ``SIGINT``), cancelling the in-flight ``turn_task`` the
+  same way a genuine ``SIGINT`` always did. **Superseded by issue #14 below**
+  for the primary (stdin-byte) Ctrl+C path: it no longer cancels the turn at
+  all — see that section for the current behavior and why.
 - **Render-on-input (upstream parity).** ``TUI.handle_input`` itself now
   requests a render after dispatching to the focused component (tui.ts:
   827-834) — the per-frame ``tui.request_render()`` workaround this module
@@ -114,6 +114,37 @@ special-casing the byte in ``_on_stdin_frame``.
 The separate red-foreground line previously
 shown for a tool-result error is gone — the component's own error-tinted
 background is now the sole error indicator, matching upstream.
+
+Issue #14 (Esc/Ctrl+C parity fix): this port had Esc and Ctrl+C's roles
+backwards relative to upstream (``interactive-mode.ts``) — Ctrl+C used to
+cancel the in-flight turn (Task 16 fix round 1 above) and Esc did nothing
+extra. Corrected here to match upstream exactly:
+
+- **Esc interrupts the in-flight turn.** Routed like Ctrl+O
+  (``"app.tools.expand"``) rather than a raw frame comparison in
+  ``_on_stdin_frame`` — a bare ``frame == "\\x1b"`` check there would be
+  wrong regardless, since ``"\\x1b"`` is the common prefix of every escape
+  sequence (arrow keys, CSI-u, ...), not a standalone Esc press.
+  ``engine/keybindings.py`` now carries ``"app.interrupt": "escape"``, and
+  ``components/editor.py``'s ``Editor.handle_key`` recognizes it (placed
+  *after* the existing autocomplete-menu-open ``"tui.select.cancel"``
+  reroute, which is also bound to ``"escape"`` — an open menu still closes
+  on Esc first; interrupt only fires when there's no menu to close),
+  dispatching through ``on_app_action`` exactly like Ctrl+O does. This
+  module's ``_on_app_action`` (below) now cancels ``turn_task`` on
+  ``"app.interrupt"`` — the same ``turn_task.cancel()`` call the old Ctrl+C
+  branch used to make, reusing the same ``_run_turn``
+  ``asyncio.CancelledError`` → ``"[interrupted]"`` path, just triggered by a
+  different key.
+- **Ctrl+C no longer touches the turn at all.** It always clears the
+  editor's draft buffer now (regardless of whether a turn is running), and
+  a second Ctrl+C within 500ms of the first quits the app (upstream's
+  double-tap-to-exit) — see ``_on_stdin_frame``'s ``"\\x03"`` branch and the
+  ``last_ctrl_c`` monotonic timestamp it compares against
+  (``loop.time()``, not wall-clock, for the same reason every other timing
+  seam in this module uses the event loop's clock). Ctrl+D on an empty
+  buffer is unchanged (still exits, per module docstring Task 16 fix round
+  1 elsewhere in this file).
 """
 
 from __future__ import annotations
@@ -341,6 +372,20 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
     turn_task: asyncio.Task[None] | None = None
     loop = asyncio.get_running_loop()
     fd: int | None = None
+    # Issue #14: monotonic timestamp (loop.time()) of the most recent Ctrl+C,
+    # or None until the first Ctrl+C. Not reset after use — a stale timestamp
+    # simply falls outside the 0.5s window on the next compare (see
+    # ``_on_stdin_frame``'s "\\x03" branch).
+    last_ctrl_c: float | None = None
+    # Issue #15: external-termination signals routed into quit_event so they
+    # unwind through the normal teardown (restoring the terminal). Built with
+    # getattr so a platform missing SIGHUP (Windows) just drops it, rather than
+    # raising AttributeError when the tuple is evaluated outside the suppress.
+    term_signals = tuple(
+        s
+        for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None))
+        if s is not None
+    )
 
     # From here through `await quit_event.wait()` is wrapped in one try so
     # that ANY setup failure below (detect_caps, add_reader, tui.start(),
@@ -392,6 +437,17 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
                 for tool_comp in tool_components.values():
                     tool_comp.set_expanded(tools_expanded)
                 tui.request_render()
+            elif action == "app.interrupt":
+                # Issue #14: Esc now owns turn-interruption (Ctrl+C no
+                # longer does — see `_on_stdin_frame`'s "\x03" branch and
+                # this module's docstring). Reuses the exact same
+                # `turn_task.cancel()` call the old Ctrl+C branch used to
+                # make: `_run_turn`'s `async for` raises
+                # `asyncio.CancelledError`, caught there and rendered as
+                # "[interrupted]" — no new cancellation mechanism. A no-op
+                # when no turn is running (nothing to interrupt).
+                if turn_task is not None and not turn_task.done():
+                    turn_task.cancel()
 
         editor.on_app_action = _on_app_action
 
@@ -540,22 +596,31 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
             # `parse_key` -> `key_id` -> binding-lookup pipeline, which
             # dispatches it through `editor.on_app_action` (`_on_app_action`
             # above) — see that function's docstring for the full trace.
+            nonlocal last_ctrl_c
             if frame == "\x03":  # Ctrl+C
-                # Critical finding 1 (task-16 fix round 1): raw mode
+                # Issue #14 (Esc/Ctrl+C parity fix): raw mode
                 # (engine/terminal.py) clears ISIG for the whole session, so a
                 # REAL terminal's Ctrl+C never arrives as a process signal —
-                # only as this stdin byte. If a turn is in flight, cancel it
-                # (routes through _run_turn's existing `asyncio.CancelledError`
-                # handler -> "[interrupted]"); otherwise fall back to
-                # editor.py's documented behavior of no-oping on Ctrl+C
-                # ("parent's job (exit/clear)") by clearing the draft buffer
-                # ourselves. `loop.add_signal_handler(signal.SIGINT, ...)` in
-                # `_run_turn` remains wired as a secondary path for a genuine
-                # *external* signal (e.g. `kill -INT <pid>` from another
-                # process) — not the primary Ctrl+C path anymore.
-                if turn_task is not None and not turn_task.done():
-                    turn_task.cancel()
+                # only as this stdin byte — but it no longer cancels an
+                # in-flight turn (Esc does that now, via "app.interrupt" ->
+                # `_on_app_action` above). Matches upstream/pi: Ctrl+C always
+                # clears the editor's draft buffer, and a second Ctrl+C
+                # within 500ms of the first quits the app (double-tap to
+                # exit) — `loop.time()` (monotonic) rather than wall-clock,
+                # consistent with this module's other timing seams.
+                # `loop.add_signal_handler(signal.SIGINT, ...)` in
+                # `_run_turn` is unaffected — a genuine *external* signal
+                # (e.g. `kill -INT <pid>` from another process) still
+                # cancels the turn exactly as before; this branch only
+                # concerns the stdin byte a real terminal's Ctrl+C sends.
+                # Upstream's `handleCtrlC` (interactive-mode.ts:3361-3369) is
+                # silent here — no hint text printed, just the clear +
+                # timestamp update — so this port doesn't invent one either.
+                now = loop.time()
+                if last_ctrl_c is not None and now - last_ctrl_c < 0.5:
+                    _do_quit()
                 else:
+                    last_ctrl_c = now
                     editor.set_text("")
                     tui.request_render()
                 return
@@ -575,6 +640,30 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
         on_resize = getattr(term, "on_resize", None)
         if callable(on_resize):
             on_resize(tui.on_resize)
+
+        # Issue #15: a bare `atexit.register(self.stop)` (this module's own
+        # caller, `run_app`'s `finally: real_term.stop()` below) never runs
+        # on SIGTERM/SIGHUP — their default disposition is to terminate the
+        # process outright, atexit hooks and all, so `kill <pid>` (or a
+        # hung-up controlling terminal) used to leave a REAL terminal stuck
+        # in raw mode: kitty keyboard flags, bracketed paste, and possibly a
+        # hidden cursor, all never undone. Routed through the very same
+        # `quit_event` a clean `/quit`/Ctrl+D already uses (rather than
+        # calling `term.stop()` directly here) so the *entire* existing
+        # clean-shutdown path — this try's own finally below, then
+        # `run_app`'s `finally: real_term.stop()` — runs exactly once, the
+        # same way, regardless of what triggered the quit. Unlike the
+        # per-turn `loop.add_signal_handler(signal.SIGINT, ...)` in
+        # `_run_turn` (registered/removed around a single turn), these two
+        # are wired for `_run`'s entire lifetime, so they fire even while
+        # idle. Deliberately NOT SIGWINCH (obligation (b) above — that's
+        # engine/terminal.py's own process-level `signal.signal` slot, never
+        # touched via asyncio here). Guarded for event loop policies that don't
+        # implement add_signal_handler at all (term_signals already dropped any
+        # signal absent on this platform).
+        for _sig in term_signals:
+            with contextlib.suppress(ValueError, NotImplementedError):
+                loop.add_signal_handler(_sig, quit_event.set)
 
         # Obligation (a): drain_pending() bytes MUST be fed before the live
         # reader attaches (engine/terminal.py's own binding requirement).
@@ -614,6 +703,9 @@ async def _run(*, model: str, cwd: Path, client: ModelClient | None, term: Termi
                 loop.remove_reader(fd)
         with contextlib.suppress(ValueError):
             loop.remove_signal_handler(signal.SIGINT)
+        for _sig in term_signals:
+            with contextlib.suppress(ValueError, NotImplementedError):
+                loop.remove_signal_handler(_sig)
         if turn_task is not None and not turn_task.done():
             turn_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

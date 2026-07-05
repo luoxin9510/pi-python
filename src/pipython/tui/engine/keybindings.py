@@ -45,6 +45,21 @@ CSI-u (``"\\x1b[111;5u"``), never the legacy byte. Routing it through
 ``parse_key`` → ``key_id`` → this table fixes that: both encodings resolve
 to the same ``"ctrl+o"`` key id.
 
+Declared deviation (issue #14, Esc/Ctrl+C parity fix): ``"app.interrupt":
+"escape"`` is added for the same reason and via the same mechanism as
+``"app.tools.expand"`` above — another ``app.*`` action folded into this
+editor-only table for lack of a separate app-level bindings table. Upstream
+(``interactive-mode.ts``) binds Escape to interrupt the in-flight turn while
+Ctrl+C is reserved for "clear editor / double-tap to exit" — this port used
+to have that backwards (Ctrl+C cancelled the turn, Escape did nothing extra
+here). ``"escape"`` is already bound to ``"tui.select.cancel"`` above (menu
+close); ``components/editor.py``'s ``handle_key`` checks the
+autocomplete-menu-open ``"tui.select.cancel"`` branch *first* and returns
+before ever reaching the ``"app.interrupt"`` check, so a menu open when Esc
+is pressed still closes the menu instead of interrupting a turn — the two
+bindings sharing the same key is intentional, not a conflict, since at most
+one of their guarding conditions is ever true for a given key press.
+
 Consumes Task 4's ``key_id(event) -> str`` output: a resolved binding's key
 list is meant to be compared against a pressed key's canonical ``key_id``
 string by a caller (e.g. a future Editor/Input component). Per Task 4's
@@ -102,6 +117,12 @@ DEFAULT_EDITOR_BINDINGS: dict[str, str | list[str]] = {
     # see the module docstring's "Declared deviation (task-19 acceptance
     # bug 2 fix)" note above for why it lives here anyway.
     "app.tools.expand": "ctrl+o",
+    # Deviation (issue #14): not a "tui.*" editor action — see the module
+    # docstring's "Declared deviation (issue #14, Esc/Ctrl+C parity fix)"
+    # note above. Shares the "escape" key with "tui.select.cancel" above by
+    # design (editor.py's handle_key checks the menu-open cancel branch
+    # first).
+    "app.interrupt": "escape",
 }
 
 
