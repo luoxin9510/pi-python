@@ -45,6 +45,25 @@ Declared deviations from the literal brief interface / upstream:
    engages when the modifier is unheld or shift-only (ctrl/alt already
    disqualify text decoding, so they still yield ``None`` for genuinely
    unrecognized combinations, matching upstream fidelity there).
+4. **``parse_key`` filters out Kitty key-release events (flag 2, "report
+   event types") by returning ``None``**, rather than porting upstream's
+   ``isKeyRelease(data)``/``wantsKeyRelease`` opt-in gate (keys.ts:520-577,
+   tui.ts:829) — this port's ``Component``/``TUI`` never gained a
+   ``wantsKeyRelease`` field (out of scope per ``tui.py`` module docstring
+   deviation 10) and no component anywhere opts into release events, so
+   filtering at the single ``parse_key`` choke point is behaviorally
+   equivalent for every caller this port has today. **Bug this fixes:**
+   the CSI-u event-type subfield (``;<modifier>:<event>u``, 1=press,
+   2=repeat, 3=release) was previously an unused capture group — every
+   physical keypress under Kitty flag 2 arrives as a press frame *and* a
+   release frame for the same key, and both parsed to an identical
+   ``KeyEvent`` and both got dispatched, so every keystroke typed/acted
+   twice on any real terminal where Kitty negotiation actually succeeded
+   (which it only started doing once the flush fix landed — see
+   ``terminal.py``'s ``start()``/``.superpowers/sdd/task-19-report.md``).
+   Repeat events are deliberately *not* filtered (they parse exactly like a
+   press, matching upstream) — only release. See ``_parse_kitty_sequence``
+   and ``parse_key``'s own docstrings for the full trace.
 """
 
 from __future__ import annotations
@@ -281,31 +300,75 @@ _FUNC_CODES = {
 }
 
 
+_EVENT_TYPE_PRESS = "press"
+_EVENT_TYPE_REPEAT = "repeat"
+_EVENT_TYPE_RELEASE = "release"
+
+
+def _parse_event_type(event_type_str: str | None) -> str:
+    """keys.ts:579-584 ``parseEventType``. Flag 2 ("report event types")
+    appends a ``:<event>`` subfield: 1 = press (also the default when the
+    subfield is absent — most terminals/modes never send it), 2 = repeat
+    (auto-repeat while a key is held; treated identically to a press — see
+    ``parse_key``), 3 = release."""
+    if not event_type_str:
+        return _EVENT_TYPE_PRESS
+    event_type = int(event_type_str)
+    if event_type == 2:
+        return _EVENT_TYPE_REPEAT
+    if event_type == 3:
+        return _EVENT_TYPE_RELEASE
+    return _EVENT_TYPE_PRESS
+
+
 @dataclass
 class _KittySeq:
     codepoint: int
     shifted_key: int | None
     base_layout_key: int | None
     modifier: int  # already 0-indexed (reported value - 1)
+    event_type: str = _EVENT_TYPE_PRESS
 
 
 def _parse_kitty_sequence(data: str) -> _KittySeq | None:
-    """keys.ts:587-651 ``parseKittySequence`` (event-type field is parsed
-    upstream for ``isKeyRelease``/``isKeyRepeat`` bookkeeping, which is out of
-    scope here — see brief interface; we simply ignore that group)."""
+    """keys.ts:587-651 ``parseKittySequence``.
+
+    Parses the CSI-u event-type subfield (flag 2, "report event types":
+    1=press, 2=repeat, 3=release) into ``_KittySeq.event_type``. Upstream
+    instead stashes this in a module-level ``_lastEventType`` global for its
+    separately-exported ``isKeyRelease(data)``/``isKeyRepeat(data)`` query
+    functions, which a caller consults *after* calling ``parseKey`` — the
+    only consumer in the upstream tree is ``TUI.handleInput``'s dispatch
+    gate (tui.ts:829: ``if (isKeyRelease(data) &&
+    !this.focusedComponent.wantsKeyRelease) return;``). This port's
+    ``Component``/``TUI`` (``tui.py``) never gained a ``wantsKeyRelease``
+    field — declared out of scope for task 7 (``tui.py`` module docstring
+    deviation 10) — and no component anywhere in this port opts into
+    key-release events, so there is no downstream gate left to perform that
+    filter. ``parse_key`` therefore performs the equivalent filtering
+    itself (see its docstring) rather than threading a second query function
+    through every caller for a distinction this port's callers never act on
+    differently. This was previously a dropped capture group entirely
+    (fix: see keys.py history) — with Kitty flag 2 active, every physical
+    keypress arrives as a press frame *and* a release frame for the same
+    key; without parsing (and filtering) the release, both frames produced
+    an identical ``KeyEvent`` and both got dispatched, typing/acting twice
+    per keystroke."""
     m = _CSI_U_RE.match(data)
     if m:
         codepoint = int(m.group(1))
         shifted_key = int(m.group(2)) if m.group(2) else None
         base_layout_key = int(m.group(3)) if m.group(3) else None
         mod_value = int(m.group(4)) if m.group(4) else 1
-        return _KittySeq(codepoint, shifted_key, base_layout_key, mod_value - 1)
+        event_type = _parse_event_type(m.group(5))
+        return _KittySeq(codepoint, shifted_key, base_layout_key, mod_value - 1, event_type)
 
     m = _ARROW_RE.match(data)
     if m:
         mod_value = int(m.group(1))
+        event_type = _parse_event_type(m.group(2))
         arrow_codes = {"A": ARROW_UP, "B": ARROW_DOWN, "C": ARROW_RIGHT, "D": ARROW_LEFT}
-        return _KittySeq(arrow_codes[m.group(3)], None, None, mod_value - 1)
+        return _KittySeq(arrow_codes[m.group(3)], None, None, mod_value - 1, event_type)
 
     m = _FUNC_RE.match(data)
     if m:
@@ -314,13 +377,15 @@ def _parse_kitty_sequence(data: str) -> _KittySeq | None:
         if codepoint is None:
             return None
         mod_value = int(m.group(2)) if m.group(2) else 1
-        return _KittySeq(codepoint, None, None, mod_value - 1)
+        event_type = _parse_event_type(m.group(3))
+        return _KittySeq(codepoint, None, None, mod_value - 1, event_type)
 
     m = _HOME_END_RE.match(data)
     if m:
         mod_value = int(m.group(1))
+        event_type = _parse_event_type(m.group(2))
         codepoint = FUNC_HOME if m.group(3) == "H" else FUNC_END
-        return _KittySeq(codepoint, None, None, mod_value - 1)
+        return _KittySeq(codepoint, None, None, mod_value - 1, event_type)
 
     return None
 
@@ -455,10 +520,25 @@ def parse_key(frame: str, kitty: bool) -> KeyEvent | None:
     unrecognized. ``kitty`` mirrors upstream's ``_kittyProtocolActive`` global
     (keys.ts:25-40), passed explicitly here for testability (see task-4-report
     RED assertion-shape mapping). Bracketed-paste frames must not reach this
-    function (caller's responsibility — see ``stdin_buffer.py``)."""
+    function (caller's responsibility — see ``stdin_buffer.py``).
+
+    **Kitty key-release events are filtered out (return ``None``)** — a
+    deliberate, port-adapted deviation from upstream's ``parseKey``, which
+    returns the *same* ``KeyEvent`` regardless of press/repeat/release and
+    instead leaves filtering to a caller that consults the separately
+    exported ``isKeyRelease(data)`` (keys.ts:1206-1259 vs. tui.ts:829). See
+    ``_parse_kitty_sequence``'s docstring for why this port has no
+    ``wantsKeyRelease``-gated dispatch layer to put that check in instead,
+    and does it here in ``parse_key`` — the single choke point every caller
+    in this port (``Editor.handle_input``, currently the only consumer)
+    already goes through. Repeat events are *not* filtered — matching
+    upstream, they parse identically to a press (auto-repeat while a key is
+    held should keep acting like repeated presses)."""
 
     kitty_seq = _parse_kitty_sequence(frame)
     if kitty_seq is not None:
+        if kitty_seq.event_type == "release":
+            return None
         mods = _split_modifier(kitty_seq.modifier)
         if mods is None:
             return None

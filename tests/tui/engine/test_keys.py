@@ -186,10 +186,25 @@ class TestKittyProtocolWithAlternateKeys:
     def test_should_handle_event_type_in_format(self):
         # Format with event type: CSI codepoint::base;modifier:event u
         # Cyrillic ctrl+c release event (event type 3)
+        #
+        # Acceptance-bug-1 correction: upstream source is
+        # `matchesKey(releaseEvent, "ctrl+c")` -> true (keys.test.ts:149-151)
+        # because upstream's parseKey/matchesKey never filter by event type
+        # at all -- release filtering is a *caller* concern, gated by
+        # `isKeyRelease(data) && !focusedComponent.wantsKeyRelease` at
+        # `TUI.handleInput` (tui.ts:829). This port's `Component`/`TUI`
+        # never gained a `wantsKeyRelease` field (out of scope per tui.py
+        # module docstring deviation 10), and no component here opts into
+        # release events, so `parse_key` itself is the single choke point
+        # that filters them (see its docstring) -- this was the actual
+        # real-terminal doubled-keystroke bug (every keypress under Kitty
+        # flag 2 arrives as press+release; both used to parse identically
+        # and both got dispatched). A release event therefore returns
+        # `None` here, not a `KeyEvent` -- the opposite of upstream's
+        # literal `matchesKey` return value for the same input.
         release_event = "\x1b[1089::99;5:3u"
         result = parse_key(release_event, kitty=True)
-        assert result is not None
-        assert key_id(result) == "ctrl+c"
+        assert result is None
 
     def test_should_handle_full_format_with_shifted_base_and_event_type(self):
         # Full format: CSI codepoint:shifted:base;modifier:event u
@@ -888,3 +903,105 @@ class TestPrintableTextDecoding:
         result = parse_key(" ", kitty=False)
         assert result is not None
         assert result.text == " "
+
+
+class TestKittyKeyReleaseFiltering:
+    """Acceptance bug 1 (real-terminal doubled keystrokes): Kitty flag 2
+    ("report event types") makes every physical keypress arrive as a
+    *press* frame followed by a *release* frame for the same key. Upstream
+    dispatches both through ``parseKey``/``matchesKey`` identically and
+    instead gates release events at ``TUI.handleInput``
+    (``isKeyRelease(data) && !focusedComponent.wantsKeyRelease`` —
+    tui.ts:829). This port has no ``wantsKeyRelease``-gated dispatch layer
+    (see ``tui.py`` module docstring deviation 10), so ``parse_key`` itself
+    filters release events by returning ``None`` — see its docstring.
+    Before this fix, the CSI-u event-type subfield was an unused capture
+    group and every keystroke typed/acted twice.
+    """
+
+    def test_release_of_plain_letter_returns_none(self):
+        # 'a', unmodified. Press: event=1 (or omitted). Release: event=3.
+        press = parse_key("\x1b[97;1:1u", kitty=True)
+        release = parse_key("\x1b[97;1:3u", kitty=True)
+        assert press is not None
+        assert key_id(press) == "a"
+        assert press.text == "a"
+        assert release is None
+
+    def test_release_with_omitted_event_subfield_defaults_to_press(self):
+        # No `:<event>` subfield at all -> upstream's parseEventType treats
+        # the absence as "press" (keys.ts:580 `if (!eventTypeStr) return
+        # "press"`), not as a release. Only an explicit `:3` is a release.
+        result = parse_key("\x1b[97;1u", kitty=True)
+        assert result is not None
+        assert key_id(result) == "a"
+
+    def test_release_of_ctrl_c_returns_none(self):
+        # The maintainer's reported doubling: Ctrl+C typed once must not
+        # dispatch twice (press + release).
+        press = parse_key("\x1b[99;5:1u", kitty=True)
+        release = parse_key("\x1b[99;5:3u", kitty=True)
+        assert press is not None
+        assert key_id(press) == "ctrl+c"
+        assert release is None
+
+    def test_release_of_arrow_key_returns_none(self):
+        press = parse_key("\x1b[1;1:1A", kitty=True)
+        release = parse_key("\x1b[1;1:3A", kitty=True)
+        assert press is not None
+        assert key_id(press) == "up"
+        assert release is None
+
+    def test_release_of_functional_key_returns_none(self):
+        # Delete key (`~` form, keys.ts _FUNC_CODES 3 -> delete).
+        press = parse_key("\x1b[3;1:1~", kitty=True)
+        release = parse_key("\x1b[3;1:3~", kitty=True)
+        assert press is not None
+        assert key_id(press) == "delete"
+        assert release is None
+
+    def test_release_of_home_end_key_returns_none(self):
+        press = parse_key("\x1b[1;1:1H", kitty=True)
+        release = parse_key("\x1b[1;1:3H", kitty=True)
+        assert press is not None
+        assert key_id(press) == "home"
+        assert release is None
+
+    def test_repeat_event_still_parses_like_a_press(self):
+        # event=2 (repeat, auto-repeat while a key is held) must NOT be
+        # filtered -- it should act exactly like a press.
+        repeat = parse_key("\x1b[97;1:2u", kitty=True)
+        assert repeat is not None
+        assert key_id(repeat) == "a"
+        assert repeat.text == "a"
+
+    def test_release_with_cyrillic_base_layout_key_still_returns_none(self):
+        # Combines flag-4 (alternate keys) with flag-2 (event type): a
+        # release event must be filtered regardless of what else the
+        # sequence encodes.
+        release = parse_key("\x1b[1089::99;5:3u", kitty=True)
+        assert release is None
+
+    def test_release_with_unsupported_modifier_bits_still_returns_none(self):
+        # Regression guard: an unsupported-modifier CSI-u sequence already
+        # returned None via `_split_modifier` before this fix. Confirm the
+        # new release check doesn't change that outcome when combined with
+        # an event-type subfield (order of checks must not matter).
+        result = parse_key("\x1b[99;9:3u", kitty=True)
+        assert result is None
+
+    def test_unrecognized_event_type_digit_falls_back_to_press(self):
+        # keys.ts:579-584 `parseEventType`: any digit other than 2 or 3
+        # (including e.g. 9, or a value a future kitty revision might add)
+        # falls back to "press", not release -- so it must NOT be filtered.
+        result = parse_key("\x1b[97;1:9u", kitty=True)
+        assert result is not None
+        assert key_id(result) == "a"
+
+    def test_modify_other_keys_sequences_have_no_event_type_and_are_unaffected(self):
+        # xterm modifyOtherKeys (fallback protocol when Kitty isn't
+        # negotiated) has no event-type field at all -- this fix must not
+        # touch that path.
+        result = parse_key("\x1b[27;5;99~", kitty=False)
+        assert result is not None
+        assert key_id(result) == "ctrl+c"

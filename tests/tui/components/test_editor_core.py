@@ -144,6 +144,76 @@ class TestKittyCSIuHandling:
         assert editor.text == "E"
 
 
+class TestKittyKeyReleaseDoesNotDoubleKeystrokes:
+    """Acceptance bug 1: on a real terminal with Kitty flag 2 ("report
+    event types") active, every physical keypress arrives as a press frame
+    *and* a release frame for the same key. End-to-end regression coverage
+    through ``Editor.handle_input`` (the actual reported symptom: single
+    keypresses producing doubled characters) — ``test_keys.py``'s
+    ``TestKittyKeyReleaseFiltering`` covers ``parse_key`` in isolation.
+    """
+
+    def test_press_and_release_pair_types_letter_once(self):
+        from pipython.tui.components.editor import Editor
+
+        editor = Editor()
+        editor.kitty_enabled = True
+        editor.handle_input("\x1b[97;1:1u")  # 'a' press
+        editor.handle_input("\x1b[97;1:3u")  # 'a' release
+        assert editor.text == "a"
+
+    def test_press_and_release_pair_for_full_word_types_once_each(self):
+        from pipython.tui.components.editor import Editor
+
+        editor = Editor()
+        editor.kitty_enabled = True
+        # "hi": each letter's press immediately followed by its release,
+        # exactly how a real Kitty-flag-2 terminal reports a keystroke.
+        for press, release in (
+            ("\x1b[104;1:1u", "\x1b[104;1:3u"),
+            ("\x1b[105;1:1u", "\x1b[105;1:3u"),
+        ):
+            editor.handle_input(press)
+            editor.handle_input(release)
+        assert editor.text == "hi"
+
+    def test_press_and_release_pair_for_arrow_moves_cursor_once(self):
+        from pipython.tui.components.editor import Editor
+
+        editor = Editor()
+        editor.kitty_enabled = True
+        editor.set_text("abc")
+        start_col = editor.cursor[1]
+        editor.handle_input("\x1b[1;1:1D")  # left press (Kitty CSI-u form)
+        editor.handle_input("\x1b[1;1:3D")  # left release -- must not move again
+        assert editor.cursor[1] == start_col - 1
+
+    def test_full_pipeline_stdin_buffer_to_parse_key_to_editor(self):
+        """Feeds raw Kitty press+release bytes through the real
+        ``StdinBuffer`` (frame splitting) into a real ``Editor`` (which
+        internally calls ``parse_key``), confirming the whole chain types
+        each keystroke exactly once -- not just the ``parse_key`` unit in
+        isolation."""
+        from pipython.tui.components.editor import Editor
+        from pipython.tui.engine.stdin_buffer import StdinBuffer
+
+        editor = Editor()
+        editor.kitty_enabled = True
+
+        frames: list[str] = []
+        buffer = StdinBuffer(on_frame=frames.append)
+        # 'h' press+release, then 'i' press+release, batched exactly as a
+        # real Kitty-flag-2 terminal would deliver a fast two-letter type.
+        buffer.feed(b"\x1b[104;1:1u\x1b[104;1:3u\x1b[105;1:1u\x1b[105;1:3u")
+
+        assert frames == ["\x1b[104;1:1u", "\x1b[104;1:3u", "\x1b[105;1:1u", "\x1b[105;1:3u"]
+
+        for frame in frames:
+            editor.handle_input(frame)
+
+        assert editor.text == "hi"
+
+
 class TestUnicodeTextEditingBehavior:
     """Unicode text editing behavior (upstream line 399)"""
 

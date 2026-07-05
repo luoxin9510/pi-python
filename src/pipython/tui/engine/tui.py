@@ -114,7 +114,16 @@ Declared deviations from upstream:
    ``getattr(component, "handle_input", None)`` (see ``TUI.handle_input``).
 10. **``Component.wantsKeyRelease`` (tui.ts:81) is not ported at all** — it
     is outside the task-7 brief's Produces list entirely (an input-dispatch
-    concern belonging to a later task), not omitted by oversight.
+    concern belonging to a later task), not omitted by oversight. Since no
+    ``wantsKeyRelease``-gated dispatch layer exists anywhere in this port,
+    Kitty key-release events (flag 2, "report event types") are instead
+    filtered at the single choke point every caller already goes through:
+    ``keys.py``'s ``parse_key`` returns ``None`` for a release event rather
+    than the ``KeyEvent`` upstream's ``parseKey`` would still produce — see
+    ``keys.py`` module docstring deviation 4 for the full trace (this is
+    what actually fixed the real-terminal doubled-keystroke bug: every
+    keypress under flag 2 arrives as press *and* release, and prior to that
+    fix both parsed identically and both got dispatched here).
 11. **Upstream's width-exceeds-terminal crash-log branch is not ported**
     (``if (!isImage && visibleWidth(line) > width) { ... }``, tui.ts:1519-1545)
     — the case where a rendered line is wider than the terminal writes a
